@@ -9,7 +9,12 @@ import pandas as pd
 import pytest
 
 from quant_agent.backtest.engine import compute_metrics, factor_ic, run_backtest
-from quant_agent.cli import ensure_sharpe_factor_columns, metrics_satisfy_constraint, sort_optimization_results
+from quant_agent.cli import (
+    candidate_pool_frame,
+    ensure_sharpe_factor_columns,
+    metrics_satisfy_constraint,
+    sort_optimization_results,
+)
 from quant_agent.config import StrategyConfig
 from quant_agent.data.provider import AkshareETFProvider, to_tencent_symbol
 from quant_agent.factors import compute_factors
@@ -130,6 +135,17 @@ def test_drawdown_lt_return_constraint_and_sorting() -> None:
     sorted_results = sort_optimization_results(results, "sortino", "drawdown-lt-return")
 
     assert sorted_results.iloc[0]["name"] == "valid_high"
+
+
+def test_candidate_pool_frame_adds_one_symbol() -> None:
+    base = pd.DataFrame([
+        {"symbol": "510300", "name": "base", "fund_size": pd.NA},
+    ])
+
+    pool = candidate_pool_frame(base, "159915", {"159915": "cyb"})
+
+    assert pool["symbol"].tolist() == ["510300", "159915"]
+    assert pool.loc[1, "name"] == "cyb"
 
 
 def test_strategy_selection_can_filter_by_universe() -> None:
