@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
+from datetime import date
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from quant_agent.backtest.engine import factor_ic, run_backtest
 from quant_agent.config import StrategyConfig
+from quant_agent.data.provider import AkshareETFProvider, to_tencent_symbol
 from quant_agent.factors import compute_factors
 from quant_agent.strategy.sector_rotation import select_sector_sharpe
 from quant_agent.strategy.selection import score_and_select
@@ -149,3 +153,54 @@ def test_factor_ic_uses_tradeable_next_open_forward_return() -> None:
 
     assert result["ic"] == pytest.approx(1.0)
     assert result["rank_ic"] == pytest.approx(1.0)
+
+
+def test_etf_provider_falls_back_to_tencent_with_qfq(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fund_etf_hist_em(**kwargs):
+        calls.append(("eastmoney", kwargs))
+        raise ConnectionError("eastmoney unavailable")
+
+    def stock_zh_a_hist_tx(**kwargs):
+        calls.append(("tencent", kwargs))
+        return pd.DataFrame({
+            "date": ["2024-01-02"],
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "amount": [1000],
+        })
+
+    fake_akshare = SimpleNamespace(
+        fund_etf_hist_em=fund_etf_hist_em,
+        stock_zh_a_hist_tx=stock_zh_a_hist_tx,
+    )
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    universe = pd.DataFrame([{"symbol": "159915", "name": "cyb"}])
+
+    daily = AkshareETFProvider(adjust="qfq").fetch_daily(
+        universe,
+        date(2024, 1, 1),
+        date(2024, 1, 31),
+    )
+
+    assert not daily.empty
+    assert daily.loc[0, "symbol"] == "159915"
+    assert daily.loc[0, "volume"] == 1000
+    assert calls[0][0] == "eastmoney"
+    assert calls[1] == (
+        "tencent",
+        {
+            "symbol": "sz159915",
+            "start_date": "20240101",
+            "end_date": "20240131",
+            "adjust": "qfq",
+        },
+    )
+
+
+def test_tencent_symbol_uses_shanghai_prefix_for_5_6_9_codes() -> None:
+    assert to_tencent_symbol("518880") == "sh518880"
+    assert to_tencent_symbol("159915") == "sz159915"
