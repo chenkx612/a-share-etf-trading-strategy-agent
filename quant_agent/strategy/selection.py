@@ -21,10 +21,14 @@ def score_and_select(
     config: StrategyConfig,
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
+    universe_symbols: set[str] | None = None,
 ) -> pd.DataFrame:
     if factors.empty:
         return pd.DataFrame()
     df = factors.copy()
+    df["symbol"] = df["symbol"].astype(str)
+    if universe_symbols is not None:
+        df = df[df["symbol"].isin({str(symbol) for symbol in universe_symbols})]
     df["date"] = pd.to_datetime(df["date"])
     if start is not None:
         df = df[df["date"] >= start]

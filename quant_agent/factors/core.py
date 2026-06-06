@@ -7,6 +7,7 @@ import pandas as pd
 FACTOR_COLUMNS = [
     "momentum_20",
     "sharpe_20",
+    "sharpe_25",
     "reversal_5",
     "volatility_20",
     "amount_mean_20",
@@ -18,12 +19,18 @@ def compute_factors(daily: pd.DataFrame) -> pd.DataFrame:
     if daily.empty:
         return daily.copy()
     df = daily.sort_values(["symbol", "date"]).copy()
+    for col in ["open", "high", "low", "close", "volume", "amount", "turnover"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     grouped = df.groupby("symbol", group_keys=False)
     df["ret_1"] = grouped["close"].pct_change()
     df["momentum_20"] = grouped["close"].pct_change(20)
     rolling_return_20 = grouped["close"].pct_change(20)
     rolling_vol_20 = grouped["ret_1"].transform(lambda x: x.rolling(20, min_periods=20).std())
     df["sharpe_20"] = rolling_return_20 / rolling_vol_20.replace(0, np.nan)
+    rolling_return_25 = grouped["close"].pct_change(25)
+    rolling_vol_25 = grouped["ret_1"].transform(lambda x: x.rolling(25, min_periods=25).std())
+    df["sharpe_25"] = rolling_return_25 / rolling_vol_25.replace(0, np.nan)
     df["reversal_5"] = -grouped["close"].pct_change(5)
     df["volatility_20"] = grouped["ret_1"].transform(lambda x: x.rolling(20, min_periods=10).std())
     df["amount_mean_20"] = grouped["amount"].transform(lambda x: x.rolling(20, min_periods=10).mean())

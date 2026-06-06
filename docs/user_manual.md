@@ -36,7 +36,7 @@ python3 -m quant_agent.cli --root workspaces/sharpe_single factor compute --star
 
 ## 1. 股票池设定与数据更新
 
-阶段一默认市场是 A 股 ETF，默认股票池规则是“规模大于 100 亿的 ETF”。系统优先通过 AKShare 获取 ETF 列表和日线行情。
+阶段一默认市场是 A 股 ETF，股票池和策略配置解耦。默认股票池是 `large-etf`，规则是“规模大于 100 亿的 ETF”；另有内置股票池 `sector-rotation`，来自行业轮动 ETF 配置。系统优先通过 AKShare 获取 ETF 列表和日线行情。
 
 ### 1.1 自动生成股票池
 
@@ -58,6 +58,18 @@ python3 -m quant_agent.cli data update --start 2024-01-01 --end 2024-12-31
 - `data/universe/etf_universe.*`：ETF 股票池。
 - `data/raw/etf_daily.*`：原始日线行情。
 - `data/processed/etf_daily.*`：标准化后的日线行情。
+- `data/universe/large_etf_universe.*`：默认内置股票池。
+
+指定内置行业轮动股票池：
+
+```bash
+python3 -m quant_agent.cli data update \
+  --universe-name sector-rotation \
+  --start 2024-01-01 \
+  --end 2024-12-31
+```
+
+`sector-rotation` 默认使用前复权 `qfq` 下载行情，以匹配 `~/quant` 的数据口径；如需覆盖可显式传入 `--adjust`。
 
 标准行情字段：
 
@@ -103,6 +115,7 @@ python3 -m quant_agent.cli data update --start 2024-01-01 --end 2026-05-31
 
 - `momentum_20`：近 20 日收益率，表示中短期动量。
 - `sharpe_20`：近 20 日收益率 / 近 20 日日收益波动率，表示简化夏普单因子。
+- `sharpe_25`：近 25 日收益率 / 近 25 日日收益波动率，供 `sector-sharpe` 使用。
 - `reversal_5`：近 5 日收益率取负，表示短期反转。
 - `volatility_20`：近 20 日日收益波动率。
 - `amount_mean_20`：近 20 日成交额均值。
@@ -165,7 +178,10 @@ df["momentum_60"] = grouped["close"].pct_change(60)
 }
 ```
 
-也可以使用简化夏普单因子策略。该配置参考 `~/quant/src/config.py` 中的行业轮动参数：持仓数量 `M=5`、因子窗口 `N=20`、交易费率 `0.0003`，因子为 `sharpe_20`，权重为 `1.0`。
+也可以使用两类夏普因子策略：
+
+- `sharpe-single`：当前项目的横截面打分版本，因子为 `sharpe_20`，按 z-score 后 Top N 选股，下一交易日生效。
+- `sector-sharpe`：在当前框架下尽量贴近 `~/quant` 中的行业轮动夏普策略，参数为 `M=5, N=25, K=100, corr_threshold=0.9, stop_loss_pct=0.1, fee_rate=0.0003`；使用原始 `sharpe_25` 排序、相关性过滤、上一信号资产单日止损剔除。回测仍使用当前项目统一的收盘信号、下一交易日目标权重生效逻辑。
 
 运行回测：
 
@@ -178,14 +194,28 @@ python3 -m quant_agent.cli backtest run \
   --run-id baseline_top10
 ```
 
-运行夏普单因子回测：
+运行当前项目夏普单因子回测：
 
 ```bash
 python3 -m quant_agent.cli backtest run \
   --strategy sharpe-single \
+  --universe-name sector-rotation \
   --start 2024-03-01 \
   --end 2024-12-31 \
   --run-id sharpe_single
+```
+
+`--strategy` 只决定因子权重、持仓数量和费率等策略参数；`--universe-name` 决定候选股票池。同一策略可以切换到 `large-etf` 或 `sector-rotation` 运行。
+
+在当前框架下运行行业轮动夏普策略：
+
+```bash
+python3 -m quant_agent.cli backtest run \
+  --strategy sector-sharpe \
+  --universe-name sector-rotation \
+  --start 2023-04-01 \
+  --end 2026-05-31 \
+  --run-id sector_sharpe
 ```
 
 主要产物：
@@ -296,7 +326,7 @@ python3 -m quant_agent.cli recommend today --date 2026-05-31 --top-n 10
 产物：
 
 ```text
-outputs/recommendations/2026-05-31.csv
+outputs/recommendations/2026-05-31_large-etf.csv
 ```
 
 推荐文件包含：
@@ -348,7 +378,10 @@ python3 -m quant_agent.cli recommend today --date 2024-12-31 --top-n 10
 夏普单因子推荐：
 
 ```bash
-python3 -m quant_agent.cli recommend today --strategy sharpe-single --date 2024-12-31
+python3 -m quant_agent.cli recommend today \
+  --strategy sector-sharpe \
+  --universe-name sector-rotation \
+  --date 2024-12-31
 ```
 
 上线前保留这些文件作为审计记录：
@@ -357,4 +390,4 @@ python3 -m quant_agent.cli recommend today --strategy sharpe-single --date 2024-
 - 因子结果：`outputs/factors/factors.*`
 - 回测报告：`outputs/reports/train_top10.md`、`outputs/reports/valid_top10.md`
 - 回测指标：`outputs/backtests/*/metrics.json`
-- 当日推荐：`outputs/recommendations/YYYY-MM-DD.csv`
+- 当日推荐：`outputs/recommendations/YYYY-MM-DD_<universe-name>.csv`

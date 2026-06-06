@@ -9,12 +9,18 @@ from pathlib import Path
 import pandas as pd
 
 from quant_agent.backtest.engine import factor_ic, run_backtest
-from quant_agent.config import StrategyConfig
+from quant_agent.config import (
+    LARGE_ETF_UNIVERSE_NAME,
+    StrategyConfig,
+    available_universe_names,
+    get_universe_config,
+)
 from quant_agent.data.provider import AkshareETFProvider, merge_incremental, validate_daily
 from quant_agent.factors import compute_factors
 from quant_agent.paths import ProjectPaths
 from quant_agent.reporting import build_markdown_report
 from quant_agent.storage import read_table, write_table
+from quant_agent.strategy.sector_rotation import select_sector_sharpe
 from quant_agent.strategy.selection import score_and_select, score_factors
 
 
@@ -27,7 +33,10 @@ def parse_float_list(value: str) -> list[float]:
 
 
 def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
-    if getattr(args, "strategy", "multifactor") == "sharpe-single":
+    strategy = getattr(args, "strategy", "multifactor")
+    if strategy == "sector-sharpe":
+        config = StrategyConfig.sector_sharpe_rotation()
+    elif strategy == "sharpe-single":
         config = StrategyConfig.sharpe_single_factor()
     else:
         config = StrategyConfig()
@@ -38,6 +47,60 @@ def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
     return config
 
 
+def universe_table_base(paths: ProjectPaths, universe_name: str) -> Path:
+    return paths.data_universe / f"{universe_name.replace('-', '_')}_universe"
+
+
+def resolve_data_universe(args: argparse.Namespace, paths: ProjectPaths) -> tuple[pd.DataFrame, str, bool]:
+    if args.universe and Path(args.universe).exists():
+        return pd.read_csv(args.universe), "custom", False
+
+    universe_config = get_universe_config(args.universe_name)
+    if universe_config.source == "static":
+        return universe_config.to_frame(), universe_config.name, False
+    if universe_config.source == "akshare_etf":
+        provider = AkshareETFProvider(adjust=effective_adjust(args))
+        if universe_config.min_fund_size_cny is None:
+            raise ValueError(f"Universe {universe_config.name!r} is missing min_fund_size_cny")
+        return provider.fetch_universe(universe_config.min_fund_size_cny), universe_config.name, True
+    raise ValueError(f"Unsupported universe source: {universe_config.source}")
+
+
+def effective_adjust(args: argparse.Namespace) -> str:
+    if getattr(args, "adjust", None) is not None:
+        return args.adjust
+    return get_universe_config(args.universe_name).default_adjust
+
+
+def load_strategy_universe(paths: ProjectPaths, universe_name: str) -> pd.DataFrame:
+    universe_config = get_universe_config(universe_name)
+    if universe_config.source == "static":
+        return universe_config.to_frame()
+    try:
+        return read_table(universe_table_base(paths, universe_name))
+    except FileNotFoundError:
+        if universe_name == LARGE_ETF_UNIVERSE_NAME:
+            return read_table(paths.data_universe / "etf_universe")
+        raise
+
+
+def universe_symbols(paths: ProjectPaths, universe_name: str) -> set[str]:
+    universe = load_strategy_universe(paths, universe_name)
+    return set(universe["symbol"].astype(str))
+
+
+def filter_factors_by_universe(factors: pd.DataFrame, paths: ProjectPaths, universe_name: str) -> pd.DataFrame:
+    symbols = universe_symbols(paths, universe_name)
+    return factors[factors["symbol"].astype(str).isin(symbols)].copy()
+
+
+def read_daily(paths: ProjectPaths) -> pd.DataFrame:
+    try:
+        return read_table(paths.data_processed / "etf_daily", parse_dates=["date"])
+    except FileNotFoundError:
+        return read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
+
+
 def parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -45,14 +108,12 @@ def parse_date(value: str) -> date:
 def command_data_update(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
-    config = StrategyConfig()
-    provider = AkshareETFProvider(adjust=args.adjust)
-    universe_path = paths.data_universe / "etf_universe"
-    if args.universe and Path(args.universe).exists():
-        universe = pd.read_csv(args.universe)
-    else:
-        universe = provider.fetch_universe(config.min_fund_size_cny)
-        write_table(universe, universe_path)
+    provider = AkshareETFProvider(adjust=effective_adjust(args))
+    universe, universe_name, write_compat = resolve_data_universe(args, paths)
+    universe_path = universe_table_base(paths, universe_name)
+    write_table(universe, universe_path)
+    if write_compat:
+        write_table(universe, paths.data_universe / "etf_universe")
     incoming = provider.fetch_daily(universe, parse_date(args.start), parse_date(args.end))
     try:
         existing = read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
@@ -73,10 +134,7 @@ def command_data_update(args: argparse.Namespace) -> None:
 def command_factor_compute(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
-    try:
-        daily = read_table(paths.data_processed / "etf_daily", parse_dates=["date"])
-    except FileNotFoundError:
-        daily = read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
+    daily = read_daily(paths)
     factors = compute_factors(daily)
     start = pd.Timestamp(args.start) if args.start else None
     end = pd.Timestamp(args.end) if args.end else None
@@ -92,18 +150,22 @@ def command_backtest_run(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
     config = build_strategy_config(args)
-    try:
-        daily = read_table(paths.data_processed / "etf_daily", parse_dates=["date"])
-    except FileNotFoundError:
-        daily = read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
+    daily = read_daily(paths)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
+    symbols = universe_symbols(paths, args.universe_name)
+    factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    selected = score_and_select(factors, config, start=start, end=end)
-    result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-    scored = score_factors(factors, config)
-    metrics = {**result.metrics, **factor_ic(scored)}
-    run_id = args.run_id or f"{args.start}_{args.end}_{args.strategy}_top{config.top_n}"
+    if args.strategy == "sector-sharpe":
+        selected = select_sector_sharpe(factors, config, start=start, end=end, universe_symbols=symbols)
+        result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+        metrics = result.metrics
+    else:
+        selected = score_and_select(factors, config, start=start, end=end)
+        result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+        scored = score_factors(factors, config)
+        metrics = {**result.metrics, **factor_ic(scored)}
+    run_id = args.run_id or f"{args.start}_{args.end}_{args.strategy}_{args.universe_name}_top{config.top_n}"
     run_dir = paths.outputs / "backtests" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     selected.to_csv(run_dir / "orders.csv", index=False)
@@ -119,11 +181,10 @@ def command_backtest_run(args: argparse.Namespace) -> None:
 def command_optimize_grid(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
-    try:
-        daily = read_table(paths.data_processed / "etf_daily", parse_dates=["date"])
-    except FileNotFoundError:
-        daily = read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
+    daily = read_daily(paths)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
+    symbols = universe_symbols(paths, args.universe_name)
+    factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
     rows = []
@@ -131,10 +192,15 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
         for fee_rate in parse_float_list(args.fee_rate):
             config_args = argparse.Namespace(strategy=args.strategy, top_n=top_n, fee_rate=fee_rate)
             config = build_strategy_config(config_args)
-            selected = score_and_select(factors, config, start=start, end=end)
-            result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-            scored = score_factors(factors, config)
-            metrics = {**result.metrics, **factor_ic(scored)}
+            if args.strategy == "sector-sharpe":
+                selected = select_sector_sharpe(factors, config, start=start, end=end, universe_symbols=symbols)
+                result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+                metrics = result.metrics
+            else:
+                selected = score_and_select(factors, config, start=start, end=end)
+                result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+                scored = score_factors(factors, config)
+                metrics = {**result.metrics, **factor_ic(scored)}
             rows.append({
                 "strategy": args.strategy,
                 "top_n": top_n,
@@ -147,7 +213,7 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     if args.objective not in results.columns:
         raise ValueError(f"Objective {args.objective!r} is not available in results")
     results = results.sort_values(args.objective, ascending=False, na_position="last").reset_index(drop=True)
-    run_id = args.run_id or f"{args.start}_{args.end}_{args.strategy}_grid"
+    run_id = args.run_id or f"{args.start}_{args.end}_{args.strategy}_{args.universe_name}_grid"
     run_dir = paths.outputs / "optimizations" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     results.to_csv(run_dir / "results.csv", index=False)
@@ -175,10 +241,15 @@ def command_recommend_today(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
     config = build_strategy_config(args)
-    factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
     target_date = pd.Timestamp(args.date)
-    selected = score_and_select(factors, config, start=target_date, end=target_date)
-    out = paths.outputs / "recommendations" / f"{args.date}.csv"
+    factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
+    symbols = universe_symbols(paths, args.universe_name)
+    factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
+    if args.strategy == "sector-sharpe":
+        selected = select_sector_sharpe(factors, config, start=target_date, end=target_date, universe_symbols=symbols)
+    else:
+        selected = score_and_select(factors, config, start=target_date, end=target_date)
+    out = paths.outputs / "recommendations" / f"{args.date}_{args.universe_name}.csv"
     selected.to_csv(out, index=False)
     print(f"wrote {len(selected)} recommendations to {out}")
 
@@ -194,7 +265,8 @@ def build_parser() -> argparse.ArgumentParser:
     data_update.add_argument("--start", required=True)
     data_update.add_argument("--end", required=True)
     data_update.add_argument("--universe")
-    data_update.add_argument("--adjust", default="")
+    data_update.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
+    data_update.add_argument("--adjust")
     data_update.set_defaults(func=command_data_update)
 
     factor = sub.add_parser("factor")
@@ -209,7 +281,8 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_run = backtest_sub.add_parser("run")
     backtest_run.add_argument("--start", required=True)
     backtest_run.add_argument("--end", required=True)
-    backtest_run.add_argument("--strategy", choices=["multifactor", "sharpe-single"], default="multifactor")
+    backtest_run.add_argument("--strategy", choices=["multifactor", "sharpe-single", "sector-sharpe"], default="multifactor")
+    backtest_run.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
     backtest_run.add_argument("--top-n", type=int)
     backtest_run.add_argument("--fee-rate", type=float)
     backtest_run.add_argument("--run-id")
@@ -220,7 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid = optimize_sub.add_parser("grid")
     optimize_grid.add_argument("--start", required=True)
     optimize_grid.add_argument("--end", required=True)
-    optimize_grid.add_argument("--strategy", choices=["multifactor", "sharpe-single"], default="sharpe-single")
+    optimize_grid.add_argument("--strategy", choices=["multifactor", "sharpe-single", "sector-sharpe"], default="sharpe-single")
+    optimize_grid.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
     optimize_grid.add_argument("--top-n", default="3,5,10")
     optimize_grid.add_argument("--fee-rate", default="0.0003,0.001")
     optimize_grid.add_argument("--objective", default="sharpe")
@@ -232,7 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_sub = recommend.add_subparsers(dest="command", required=True)
     recommend_today = recommend_sub.add_parser("today")
     recommend_today.add_argument("--date", required=True)
-    recommend_today.add_argument("--strategy", choices=["multifactor", "sharpe-single"], default="multifactor")
+    recommend_today.add_argument("--strategy", choices=["multifactor", "sharpe-single", "sector-sharpe"], default="multifactor")
+    recommend_today.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
     recommend_today.add_argument("--top-n", type=int)
     recommend_today.add_argument("--fee-rate", type=float)
     recommend_today.set_defaults(func=command_recommend_today)
