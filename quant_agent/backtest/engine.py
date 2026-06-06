@@ -22,20 +22,20 @@ def run_backtest(
     selected: pd.DataFrame,
     fee_rate: float = 0.001,
 ) -> BacktestResult:
-    prices = daily.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
+    prices = daily.pivot(index="date", columns="symbol", values="open").sort_index().ffill()
     target_weights = selected_to_weight_matrix(selected)
     if prices.empty or target_weights.empty:
         empty = pd.DataFrame()
         return BacktestResult(empty, empty, empty, {})
 
-    returns = prices.pct_change().fillna(0.0)
+    open_to_next_open_returns = (prices.shift(-1) / prices - 1.0).fillna(0.0)
     target_weights = target_weights.reindex(prices.index).ffill().fillna(0.0)
     target_weights = target_weights.reindex(columns=prices.columns, fill_value=0.0)
 
-    # Signals are generated after close and applied on the next trading day.
+    # Signals are generated after close, traded at the next open, then held to the following open.
     trade_weights = target_weights.shift(1).fillna(0.0)
     turnover = trade_weights.diff().abs().sum(axis=1).fillna(trade_weights.abs().sum(axis=1))
-    gross_returns = (trade_weights * returns).sum(axis=1)
+    gross_returns = (trade_weights * open_to_next_open_returns).sum(axis=1)
     costs = turnover * fee_rate
     net_returns = gross_returns - costs
     equity = (1.0 + net_returns).cumprod()
@@ -75,11 +75,12 @@ def compute_metrics(daily_returns: pd.DataFrame) -> dict[str, float]:
 
 
 def factor_ic(factors: pd.DataFrame, score_col: str = "score") -> dict[str, float]:
-    if factors.empty or score_col not in factors.columns:
+    if factors.empty or score_col not in factors.columns or "open" not in factors.columns:
         return {"ic": np.nan, "rank_ic": np.nan}
     df = factors.sort_values(["symbol", "date"]).copy()
-    next_close = df.groupby("symbol")["close"].shift(-1)
-    df["forward_return"] = next_close / df["close"] - 1.0
+    next_open = df.groupby("symbol")["open"].shift(-1)
+    exit_open = df.groupby("symbol")["open"].shift(-2)
+    df["forward_return"] = exit_open / next_open - 1.0
     pairs = df.dropna(subset=[score_col, "forward_return"])
     if pairs.empty:
         return {"ic": np.nan, "rank_ic": np.nan}

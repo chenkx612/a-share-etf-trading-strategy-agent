@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pandas as pd
+import pytest
 
-from quant_agent.backtest.engine import run_backtest
+from quant_agent.backtest.engine import factor_ic, run_backtest
 from quant_agent.config import StrategyConfig
 from quant_agent.factors import compute_factors
 from quant_agent.strategy.sector_rotation import select_sector_sharpe
@@ -101,3 +102,47 @@ def test_sector_sharpe_rotation_runs_in_framework_backtest() -> None:
     assert not result.equity_curve.empty
     assert "total_return" in result.metrics
     assert result.positions["weight"].gt(0).all()
+
+
+def test_backtest_trades_at_next_open_and_uses_open_to_open_returns() -> None:
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    daily = pd.DataFrame({
+        "date": dates,
+        "symbol": ["510300"] * 3,
+        "name": ["ETF510300"] * 3,
+        "open": [100.0, 110.0, 121.0],
+        "high": [1000.0, 1000.0, 1000.0],
+        "low": [1.0, 1.0, 1.0],
+        "close": [1000.0, 100.0, 1000.0],
+        "volume": [1000, 1000, 1000],
+        "amount": [100000.0, 110000.0, 121000.0],
+        "turnover": [1.0, 1.0, 1.0],
+    })
+    selected = pd.DataFrame({
+        "date": [dates[0]],
+        "symbol": ["510300"],
+        "target_weight": [1.0],
+    })
+
+    result = run_backtest(daily, selected, fee_rate=0.0)
+
+    returns = result.daily_returns.set_index("date")["gross_return"]
+    assert returns.loc[dates[0]] == 0.0
+    assert returns.loc[dates[1]] == pytest.approx(0.1)
+    assert returns.loc[dates[2]] == 0.0
+
+
+def test_factor_ic_uses_tradeable_next_open_forward_return() -> None:
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    factors = pd.DataFrame({
+        "date": [dates[0], dates[1], dates[2], dates[0], dates[1], dates[2]],
+        "symbol": ["510300", "510300", "510300", "510500", "510500", "510500"],
+        "score": [2.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        "open": [10.0, 10.0, 20.0, 10.0, 10.0, 5.0],
+        "close": [10.0, 1.0, 1.0, 10.0, 100.0, 100.0],
+    })
+
+    result = factor_ic(factors)
+
+    assert result["ic"] == pytest.approx(1.0)
+    assert result["rank_ic"] == pytest.approx(1.0)

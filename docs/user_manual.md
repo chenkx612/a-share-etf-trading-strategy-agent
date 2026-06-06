@@ -163,7 +163,7 @@ df["momentum_60"] = grouped["close"].pct_change(60)
 - 按因子权重合成 `score`。
 - 选择综合分最高的 Top N。
 - Top N 等权配置。
-- 收盘后产生目标权重，下一交易日调仓。
+- 夜间产生目标权重，下一交易日开盘按开盘价调仓。
 - 默认交易成本 `0.1%`。
 
 默认权重定义在 `quant_agent/config.py`：
@@ -180,8 +180,8 @@ df["momentum_60"] = grouped["close"].pct_change(60)
 
 也可以使用两类夏普因子策略：
 
-- `sharpe-single`：当前项目的横截面打分版本，因子为 `sharpe_20`，按 z-score 后 Top N 选股，下一交易日生效。
-- `sector-sharpe`：在当前框架下尽量贴近 `~/quant` 中的行业轮动夏普策略，参数为 `M=5, N=25, K=100, corr_threshold=0.9, stop_loss_pct=0.1, fee_rate=0.0003`；使用原始 `sharpe_25` 排序、相关性过滤、上一信号资产单日止损剔除。回测仍使用当前项目统一的收盘信号、下一交易日目标权重生效逻辑。
+- `sharpe-single`：当前项目的横截面打分版本，因子为 `sharpe_20`，按 z-score 后 Top N 选股，下一交易日开盘成交。
+- `sector-sharpe`：在当前框架下尽量贴近 `~/quant` 中的行业轮动夏普策略，参数为 `M=5, N=25, K=100, corr_threshold=0.9, stop_loss_pct=0.1, fee_rate=0.0003`；使用原始 `sharpe_25` 排序、相关性过滤、上一信号资产单日止损剔除。回测使用当前项目统一的夜间信号、下一交易日开盘成交逻辑。
 
 运行回测：
 
