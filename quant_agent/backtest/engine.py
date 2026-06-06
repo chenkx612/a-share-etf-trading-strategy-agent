@@ -158,12 +158,16 @@ def compute_metrics(daily_returns: pd.DataFrame) -> dict[str, float]:
     annual_return = float(equity.iloc[-1] ** (252 / max(len(equity), 1)) - 1.0)
     annual_vol = float(ret.std(ddof=0) * math.sqrt(252))
     sharpe = float(annual_return / annual_vol) if annual_vol else 0.0
+    downside = ret[ret < 0.0]
+    downside_vol = float(downside.std(ddof=0) * math.sqrt(252)) if not downside.empty else 0.0
+    sortino = float(annual_return / downside_vol) if downside_vol else 0.0
     drawdown = equity / equity.cummax() - 1.0
     return {
         "total_return": total_return,
         "annual_return": annual_return,
         "annual_volatility": annual_vol,
         "sharpe": sharpe,
+        "sortino": sortino,
         "max_drawdown": float(drawdown.min()),
         "avg_turnover": float(daily_returns["turnover"].mean()),
     }

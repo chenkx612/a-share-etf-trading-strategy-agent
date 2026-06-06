@@ -116,11 +116,12 @@ class StrategyConfig:
         cls,
         top_n: int = SHARPE_SINGLE_TOP_N,
         fee_rate: float = SHARPE_SINGLE_FEE_RATE,
+        sharpe_window: int = SHARPE_SINGLE_WINDOW,
     ) -> "StrategyConfig":
         return cls(
             top_n=top_n,
             fee_rate=fee_rate,
-            factor_weights={f"sharpe_{SHARPE_SINGLE_WINDOW}": 1.0},
+            factor_weights={f"sharpe_{sharpe_window}": 1.0},
         )
 
     @classmethod
@@ -128,11 +129,12 @@ class StrategyConfig:
         cls,
         top_n: int = SECTOR_SHARPE_TOP_N,
         fee_rate: float = SECTOR_SHARPE_FEE_RATE,
+        sharpe_window: int = SECTOR_SHARPE_FACTOR_WINDOW,
     ) -> "StrategyConfig":
         return cls(
             top_n=top_n,
             fee_rate=fee_rate,
-            factor_weights={f"sharpe_{SECTOR_SHARPE_FACTOR_WINDOW}": 1.0},
+            factor_weights={f"sharpe_{sharpe_window}": 1.0},
         )
 
     @classmethod
@@ -140,9 +142,10 @@ class StrategyConfig:
         cls,
         top_n: int = SECTOR_FACTOR_THRESHOLD_TOP_N,
         fee_rate: float = SECTOR_FACTOR_THRESHOLD_FEE_RATE,
+        sharpe_window: int = SECTOR_FACTOR_THRESHOLD_WINDOW,
     ) -> "StrategyConfig":
         return cls(
             top_n=top_n,
             fee_rate=fee_rate,
-            factor_weights={f"sharpe_{SECTOR_FACTOR_THRESHOLD_WINDOW}": 1.0},
+            factor_weights={f"sharpe_{sharpe_window}": 1.0},
         )

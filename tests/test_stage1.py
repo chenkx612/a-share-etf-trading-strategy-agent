@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from quant_agent.backtest.engine import factor_ic, run_backtest
+from quant_agent.backtest.engine import compute_metrics, factor_ic, run_backtest
+from quant_agent.cli import ensure_sharpe_factor_columns, metrics_satisfy_constraint, sort_optimization_results
 from quant_agent.config import StrategyConfig
 from quant_agent.data.provider import AkshareETFProvider, to_tencent_symbol
 from quant_agent.factors import compute_factors
@@ -70,6 +71,65 @@ def test_sharpe_single_factor_config_selects_by_sharpe() -> None:
     assert not selected.empty
     assert selected.groupby("date")["symbol"].count().eq(1).all()
     assert selected["score"].notna().all()
+
+
+def test_compute_factors_supports_parameterized_sharpe_windows() -> None:
+    daily = sample_daily()
+    factors = compute_factors(daily, sharpe_windows=[10, 30])
+
+    assert "sharpe_10" in factors.columns
+    assert "sharpe_30" in factors.columns
+    assert "sharpe_25" not in factors.columns
+    assert factors["sharpe_10"].notna().any()
+
+
+def test_strategy_config_uses_custom_sharpe_window() -> None:
+    config = StrategyConfig.sharpe_single_factor(top_n=1, sharpe_window=30)
+
+    assert config.factor_weights == {"sharpe_30": 1.0}
+
+
+def test_missing_sharpe_factor_columns_are_computed_from_daily() -> None:
+    daily = sample_daily()
+    factors = compute_factors(daily, sharpe_windows=[20]).drop(columns=["sharpe_20"])
+
+    enriched = ensure_sharpe_factor_columns(factors, daily, [20, 30])
+
+    assert "sharpe_20" in enriched.columns
+    assert "sharpe_30" in enriched.columns
+    assert enriched["sharpe_20"].notna().any()
+
+
+def test_metrics_include_sortino() -> None:
+    daily_returns = pd.DataFrame({
+        "net_return": [0.02, -0.01, 0.03, -0.005],
+        "turnover": [0.1, 0.2, 0.1, 0.2],
+    })
+
+    metrics = compute_metrics(daily_returns)
+
+    assert "sortino" in metrics
+    assert metrics["sortino"] > 0
+
+
+def test_drawdown_lt_return_constraint_and_sorting() -> None:
+    assert metrics_satisfy_constraint(
+        {"annual_return": 0.2, "max_drawdown": -0.1},
+        "drawdown-lt-return",
+    )
+    assert not metrics_satisfy_constraint(
+        {"annual_return": 0.05, "max_drawdown": -0.1},
+        "drawdown-lt-return",
+    )
+    results = pd.DataFrame([
+        {"name": "invalid_high", "sortino": 5.0, "valid": False},
+        {"name": "valid_low", "sortino": 1.0, "valid": True},
+        {"name": "valid_high", "sortino": 2.0, "valid": True},
+    ])
+
+    sorted_results = sort_optimization_results(results, "sortino", "drawdown-lt-return")
+
+    assert sorted_results.iloc[0]["name"] == "valid_high"
 
 
 def test_strategy_selection_can_filter_by_universe() -> None:

@@ -116,6 +116,7 @@ python3 -m quant_agent.cli data update --start 2024-01-01 --end 2026-05-31
 - `momentum_20`：近 20 日收益率，表示中短期动量。
 - `sharpe_20`：近 20 日收益率 / 近 20 日日收益波动率，表示简化夏普单因子。
 - `sharpe_25`：近 25 日收益率 / 近 25 日日收益波动率，供 `sector-sharpe` 使用。
+- `sharpe_N`：可通过 `--sharpe-window` 增加或替换窗口，例如 `20,25,60,120`。
 - `reversal_5`：近 5 日收益率取负，表示短期反转。
 - `volatility_20`：近 20 日日收益波动率。
 - `amount_mean_20`：近 20 日成交额均值。
@@ -125,6 +126,15 @@ python3 -m quant_agent.cli data update --start 2024-01-01 --end 2026-05-31
 
 ```bash
 python3 -m quant_agent.cli factor compute --start 2024-01-01 --end 2024-12-31
+```
+
+计算多个 Sharpe 参数窗口：
+
+```bash
+python3 -m quant_agent.cli factor compute \
+  --start 2024-01-01 \
+  --end 2024-12-31 \
+  --sharpe-window 20,25,60,120
 ```
 
 主要产物：
@@ -180,8 +190,8 @@ df["momentum_60"] = grouped["close"].pct_change(60)
 
 也可以使用两类夏普因子策略：
 
-- `sharpe-single`：当前项目的横截面打分版本，因子为 `sharpe_20`，按 z-score 后 Top N 选股，下一交易日开盘成交。
-- `sector-sharpe`：在当前框架下尽量贴近 `~/quant` 中的行业轮动夏普策略，参数为 `M=5, N=25, K=100, corr_threshold=0.9, stop_loss_pct=0.1, fee_rate=0.0003`；使用原始 `sharpe_25` 排序、相关性过滤、上一信号资产单日止损剔除。回测使用当前项目统一的夜间信号、下一交易日开盘成交逻辑。
+- `sharpe-single`：当前项目的横截面打分版本，默认因子为 `sharpe_20`，按 z-score 后 Top N 选股，下一交易日开盘成交；可用 `--sharpe-window` 改为其他窗口。
+- `sector-sharpe`：在当前框架下尽量贴近 `~/quant` 中的行业轮动夏普策略，默认参数为 `M=5, N=25, K=100, corr_threshold=0.9, stop_loss_pct=0.1, fee_rate=0.0003`；使用原始 `sharpe_25` 排序、相关性过滤、上一信号资产单日止损剔除。回测使用当前项目统一的夜间信号、下一交易日开盘成交逻辑。
 - `sector-factor-threshold`：在 `sector-sharpe` 基础上增加因子下限过滤，默认 `factor_lower_bound=0.0`；只有 `sharpe_25 > factor_lower_bound` 的资产才会入选。仓位按固定槽位 `1 / top_n` 分配，不足 `top_n` 只时剩余资金留现金；若当天没有资产过线，下一交易日开盘清仓。
 
 运行回测：
@@ -251,6 +261,7 @@ python3 -m quant_agent.cli report build --run-id baseline_top10
 - 总收益和年化收益。
 - 最大回撤。
 - 夏普比率。
+- Sortino 比率。
 - 平均换手率。
 - IC 和 RankIC。
 - 最新推荐是否集中在少数主题或流动性较差 ETF。
@@ -266,6 +277,7 @@ python3 -m quant_agent.cli report build --run-id baseline_top10
 - `top_n`：持仓数量，例如 5、10、15、20。
 - `fee_rate`：交易成本，例如 0.0005、0.001、0.002。
 - `factor_lower_bound`：因子下限，仅用于 `sector-factor-threshold`，例如 -0.5、0.0、0.5。
+- `corr_window`：行业轮动相关性窗口，例如 60、100、120。
 - `corr_threshold`：行业轮动相关性过滤阈值，例如 0.8、0.9、0.95。
 - `stop_loss_pct`：行业轮动单日止损阈值，例如 0.06、0.08、0.10。
 - 因子权重：例如提高动量权重、降低换手率权重。
@@ -282,6 +294,7 @@ python3 -m quant_agent.cli optimize grid \
   --end 2024-12-31 \
   --top-n 3,5,10 \
   --fee-rate 0.0003,0.001 \
+  --sharpe-window 20,25,60,120 \
   --objective sharpe \
   --run-id sharpe_grid
 ```
@@ -294,12 +307,15 @@ python3 -m quant_agent.cli optimize grid \
   --universe-name sector-rotation \
   --start 2024-03-01 \
   --end 2024-12-31 \
-  --top-n 3,5 \
-  --factor-lower-bound -0.5,0.0,0.5 \
-  --corr-threshold 0.8,0.9 \
-  --stop-loss-pct 0.08,0.1 \
-  --objective sharpe \
-  --run-id sector_factor_threshold_grid
+  --top-n 4,5,6 \
+  --sharpe-window 15,20,25,30,35 \
+  --factor-lower-bound -1.0,-0.5,0.0,0.5,1.0 \
+  --corr-window 100 \
+  --corr-threshold 0.9 \
+  --stop-loss-pct 0.1 \
+  --objective sortino \
+  --constraint drawdown-lt-return \
+  --run-id sector_factor_threshold_constrained
 ```
 
 对比：
