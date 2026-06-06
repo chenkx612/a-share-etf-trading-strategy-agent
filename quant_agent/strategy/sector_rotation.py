@@ -3,6 +3,10 @@ from __future__ import annotations
 import pandas as pd
 
 from quant_agent.config import (
+    SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD,
+    SECTOR_FACTOR_THRESHOLD_CORR_WINDOW,
+    SECTOR_FACTOR_THRESHOLD_LOWER_BOUND,
+    SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT,
     SECTOR_SHARPE_CORR_THRESHOLD,
     SECTOR_SHARPE_CORR_WINDOW,
     SECTOR_SHARPE_STOP_LOSS_PCT,
@@ -19,6 +23,9 @@ def select_sector_sharpe(
     corr_window: int = SECTOR_SHARPE_CORR_WINDOW,
     corr_threshold: float = SECTOR_SHARPE_CORR_THRESHOLD,
     stop_loss_pct: float = SECTOR_SHARPE_STOP_LOSS_PCT,
+    factor_lower_bound: float | None = None,
+    fixed_slot_weight: bool = False,
+    include_empty_signals: bool = False,
 ) -> pd.DataFrame:
     if factors.empty:
         return pd.DataFrame(columns=["date", "symbol", "name", "score", "target_weight"])
@@ -37,8 +44,10 @@ def select_sector_sharpe(
     rolling_corr = daily_rets.rolling(corr_window).corr()
 
     rows: list[dict[str, object]] = []
+    signal_dates: list[pd.Timestamp] = []
     prev_selected: list[str] = []
     names = df.drop_duplicates("symbol").set_index("symbol")["name"].to_dict()
+    available_symbols = sorted(df["symbol"].unique().tolist())
 
     score_frame = df.pivot(index="date", columns="symbol", values=score_col).sort_index()
     for date in score_frame.index:
@@ -46,6 +55,7 @@ def select_sector_sharpe(
             continue
         if end is not None and date > end:
             continue
+        signal_dates.append(date)
 
         stopped_assets = {
             asset
@@ -53,6 +63,8 @@ def select_sector_sharpe(
             if asset in daily_rets.columns and daily_rets.loc[date, asset] < -stop_loss_pct
         }
         day_scores = score_frame.loc[date].dropna().drop(stopped_assets, errors="ignore")
+        if factor_lower_bound is not None:
+            day_scores = day_scores[day_scores > factor_lower_bound]
         if day_scores.empty:
             prev_selected = []
             continue
@@ -71,7 +83,7 @@ def select_sector_sharpe(
             selected.append(str(asset))
 
         if selected:
-            weight = 1.0 / len(selected)
+            weight = 1.0 / config.top_n if fixed_slot_weight else 1.0 / len(selected)
             for asset in selected:
                 rows.append({
                     "date": date,
@@ -82,7 +94,37 @@ def select_sector_sharpe(
                 })
         prev_selected = selected
 
-    return pd.DataFrame(rows, columns=["date", "symbol", "name", "score", "target_weight"])
+    selected = pd.DataFrame(rows, columns=["date", "symbol", "name", "score", "target_weight"])
+    if include_empty_signals:
+        selected.attrs["signal_dates"] = signal_dates
+        selected.attrs["universe_symbols"] = available_symbols
+    return selected
+
+
+def select_sector_factor_threshold(
+    factors: pd.DataFrame,
+    config: StrategyConfig,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    universe_symbols: set[str] | None = None,
+    corr_window: int = SECTOR_FACTOR_THRESHOLD_CORR_WINDOW,
+    corr_threshold: float = SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD,
+    stop_loss_pct: float = SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT,
+    factor_lower_bound: float = SECTOR_FACTOR_THRESHOLD_LOWER_BOUND,
+) -> pd.DataFrame:
+    return select_sector_sharpe(
+        factors,
+        config,
+        start=start,
+        end=end,
+        universe_symbols=universe_symbols,
+        corr_window=corr_window,
+        corr_threshold=corr_threshold,
+        stop_loss_pct=stop_loss_pct,
+        factor_lower_bound=factor_lower_bound,
+        fixed_slot_weight=True,
+        include_empty_signals=True,
+    )
 
 
 def _too_correlated(

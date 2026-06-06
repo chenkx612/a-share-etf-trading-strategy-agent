@@ -182,6 +182,7 @@ df["momentum_60"] = grouped["close"].pct_change(60)
 
 - `sharpe-single`：当前项目的横截面打分版本，因子为 `sharpe_20`，按 z-score 后 Top N 选股，下一交易日开盘成交。
 - `sector-sharpe`：在当前框架下尽量贴近 `~/quant` 中的行业轮动夏普策略，参数为 `M=5, N=25, K=100, corr_threshold=0.9, stop_loss_pct=0.1, fee_rate=0.0003`；使用原始 `sharpe_25` 排序、相关性过滤、上一信号资产单日止损剔除。回测使用当前项目统一的夜间信号、下一交易日开盘成交逻辑。
+- `sector-factor-threshold`：在 `sector-sharpe` 基础上增加因子下限过滤，默认 `factor_lower_bound=0.0`；只有 `sharpe_25 > factor_lower_bound` 的资产才会入选。仓位按固定槽位 `1 / top_n` 分配，不足 `top_n` 只时剩余资金留现金；若当天没有资产过线，下一交易日开盘清仓。
 
 运行回测：
 
@@ -218,6 +219,18 @@ python3 -m quant_agent.cli backtest run \
   --run-id sector_sharpe
 ```
 
+运行因子下限行业轮动策略：
+
+```bash
+python3 -m quant_agent.cli backtest run \
+  --strategy sector-factor-threshold \
+  --universe-name sector-rotation \
+  --start 2023-04-01 \
+  --end 2026-05-31 \
+  --factor-lower-bound 0.0 \
+  --run-id sector_factor_threshold
+```
+
 主要产物：
 
 - `outputs/backtests/baseline_top10/orders.csv`：每日选股和目标权重。
@@ -252,6 +265,9 @@ python3 -m quant_agent.cli report build --run-id baseline_top10
 
 - `top_n`：持仓数量，例如 5、10、15、20。
 - `fee_rate`：交易成本，例如 0.0005、0.001、0.002。
+- `factor_lower_bound`：因子下限，仅用于 `sector-factor-threshold`，例如 -0.5、0.0、0.5。
+- `corr_threshold`：行业轮动相关性过滤阈值，例如 0.8、0.9、0.95。
+- `stop_loss_pct`：行业轮动单日止损阈值，例如 0.06、0.08、0.10。
 - 因子权重：例如提高动量权重、降低换手率权重。
 - 因子窗口：例如 `momentum_20` 改成 20/60 日组合。
 
@@ -268,6 +284,22 @@ python3 -m quant_agent.cli optimize grid \
   --fee-rate 0.0003,0.001 \
   --objective sharpe \
   --run-id sharpe_grid
+```
+
+优化因子下限行业轮动策略：
+
+```bash
+python3 -m quant_agent.cli optimize grid \
+  --strategy sector-factor-threshold \
+  --universe-name sector-rotation \
+  --start 2024-03-01 \
+  --end 2024-12-31 \
+  --top-n 3,5 \
+  --factor-lower-bound -0.5,0.0,0.5 \
+  --corr-threshold 0.8,0.9 \
+  --stop-loss-pct 0.08,0.1 \
+  --objective sharpe \
+  --run-id sector_factor_threshold_grid
 ```
 
 对比：

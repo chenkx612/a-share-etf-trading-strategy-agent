@@ -11,6 +11,11 @@ import pandas as pd
 from quant_agent.backtest.engine import factor_ic, run_backtest
 from quant_agent.config import (
     LARGE_ETF_UNIVERSE_NAME,
+    SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD,
+    SECTOR_FACTOR_THRESHOLD_LOWER_BOUND,
+    SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT,
+    SECTOR_SHARPE_CORR_THRESHOLD,
+    SECTOR_SHARPE_STOP_LOSS_PCT,
     StrategyConfig,
     available_universe_names,
     get_universe_config,
@@ -20,8 +25,11 @@ from quant_agent.factors import compute_factors
 from quant_agent.paths import ProjectPaths
 from quant_agent.reporting import build_markdown_report
 from quant_agent.storage import read_table, write_table
-from quant_agent.strategy.sector_rotation import select_sector_sharpe
+from quant_agent.strategy.sector_rotation import select_sector_factor_threshold, select_sector_sharpe
 from quant_agent.strategy.selection import score_and_select, score_factors
+
+
+STRATEGY_CHOICES = ["multifactor", "sharpe-single", "sector-sharpe", "sector-factor-threshold"]
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -34,7 +42,9 @@ def parse_float_list(value: str) -> list[float]:
 
 def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
     strategy = getattr(args, "strategy", "multifactor")
-    if strategy == "sector-sharpe":
+    if strategy == "sector-factor-threshold":
+        config = StrategyConfig.sector_factor_threshold_rotation()
+    elif strategy == "sector-sharpe":
         config = StrategyConfig.sector_sharpe_rotation()
     elif strategy == "sharpe-single":
         config = StrategyConfig.sharpe_single_factor()
@@ -45,6 +55,53 @@ def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
     if getattr(args, "fee_rate", None) is not None:
         config = replace(config, fee_rate=args.fee_rate)
     return config
+
+
+def select_for_strategy(
+    strategy: str,
+    factors: pd.DataFrame,
+    config: StrategyConfig,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    universe_symbols_: set[str],
+    factor_lower_bound: float | None = None,
+    corr_threshold: float | None = None,
+    stop_loss_pct: float | None = None,
+) -> tuple[pd.DataFrame, bool]:
+    if strategy == "sector-factor-threshold":
+        return (
+            select_sector_factor_threshold(
+                factors,
+                config,
+                start=start,
+                end=end,
+                universe_symbols=universe_symbols_,
+                corr_threshold=(
+                    SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD if corr_threshold is None else corr_threshold
+                ),
+                stop_loss_pct=(
+                    SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
+                ),
+                factor_lower_bound=(
+                    SECTOR_FACTOR_THRESHOLD_LOWER_BOUND if factor_lower_bound is None else factor_lower_bound
+                ),
+            ),
+            True,
+        )
+    if strategy == "sector-sharpe":
+        return (
+            select_sector_sharpe(
+                factors,
+                config,
+                start=start,
+                end=end,
+                universe_symbols=universe_symbols_,
+                corr_threshold=SECTOR_SHARPE_CORR_THRESHOLD if corr_threshold is None else corr_threshold,
+                stop_loss_pct=SECTOR_SHARPE_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct,
+            ),
+            True,
+        )
+    return score_and_select(factors, config, start=start, end=end), False
 
 
 def universe_table_base(paths: ProjectPaths, universe_name: str) -> Path:
@@ -156,13 +213,21 @@ def command_backtest_run(args: argparse.Namespace) -> None:
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    if args.strategy == "sector-sharpe":
-        selected = select_sector_sharpe(factors, config, start=start, end=end, universe_symbols=symbols)
-        result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+    selected, sector_rotation = select_for_strategy(
+        args.strategy,
+        factors,
+        config,
+        start,
+        end,
+        symbols,
+        factor_lower_bound=getattr(args, "factor_lower_bound", None),
+        corr_threshold=getattr(args, "corr_threshold", None),
+        stop_loss_pct=getattr(args, "stop_loss_pct", None),
+    )
+    result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+    if sector_rotation:
         metrics = result.metrics
     else:
-        selected = score_and_select(factors, config, start=start, end=end)
-        result = run_backtest(daily, selected, fee_rate=config.fee_rate)
         scored = score_factors(factors, config)
         metrics = {**result.metrics, **factor_ic(scored)}
     run_id = args.run_id or f"{args.start}_{args.end}_{args.strategy}_{args.universe_name}_top{config.top_n}"
@@ -190,23 +255,48 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     rows = []
     for top_n in parse_int_list(args.top_n):
         for fee_rate in parse_float_list(args.fee_rate):
-            config_args = argparse.Namespace(strategy=args.strategy, top_n=top_n, fee_rate=fee_rate)
-            config = build_strategy_config(config_args)
-            if args.strategy == "sector-sharpe":
-                selected = select_sector_sharpe(factors, config, start=start, end=end, universe_symbols=symbols)
-                result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-                metrics = result.metrics
-            else:
-                selected = score_and_select(factors, config, start=start, end=end)
-                result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-                scored = score_factors(factors, config)
-                metrics = {**result.metrics, **factor_ic(scored)}
-            rows.append({
-                "strategy": args.strategy,
-                "top_n": top_n,
-                "fee_rate": fee_rate,
-                **metrics,
-            })
+            factor_lower_bounds = [None]
+            corr_thresholds = [None]
+            stop_loss_pcts = [None]
+            if args.strategy == "sector-factor-threshold":
+                factor_lower_bounds = parse_float_list(args.factor_lower_bound)
+                corr_thresholds = parse_float_list(args.corr_threshold)
+                stop_loss_pcts = parse_float_list(args.stop_loss_pct)
+            elif args.strategy == "sector-sharpe":
+                corr_thresholds = parse_float_list(args.corr_threshold)
+                stop_loss_pcts = parse_float_list(args.stop_loss_pct)
+
+            for factor_lower_bound in factor_lower_bounds:
+                for corr_threshold in corr_thresholds:
+                    for stop_loss_pct in stop_loss_pcts:
+                        config_args = argparse.Namespace(strategy=args.strategy, top_n=top_n, fee_rate=fee_rate)
+                        config = build_strategy_config(config_args)
+                        selected, sector_rotation = select_for_strategy(
+                            args.strategy,
+                            factors,
+                            config,
+                            start,
+                            end,
+                            symbols,
+                            factor_lower_bound=factor_lower_bound,
+                            corr_threshold=corr_threshold,
+                            stop_loss_pct=stop_loss_pct,
+                        )
+                        result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+                        if sector_rotation:
+                            metrics = result.metrics
+                        else:
+                            scored = score_factors(factors, config)
+                            metrics = {**result.metrics, **factor_ic(scored)}
+                        rows.append({
+                            "strategy": args.strategy,
+                            "top_n": top_n,
+                            "fee_rate": fee_rate,
+                            "factor_lower_bound": factor_lower_bound,
+                            "corr_threshold": corr_threshold,
+                            "stop_loss_pct": stop_loss_pct,
+                            **metrics,
+                        })
     results = pd.DataFrame(rows)
     if results.empty:
         raise ValueError("No optimization results generated")
@@ -245,10 +335,17 @@ def command_recommend_today(args: argparse.Namespace) -> None:
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
     symbols = universe_symbols(paths, args.universe_name)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
-    if args.strategy == "sector-sharpe":
-        selected = select_sector_sharpe(factors, config, start=target_date, end=target_date, universe_symbols=symbols)
-    else:
-        selected = score_and_select(factors, config, start=target_date, end=target_date)
+    selected, _ = select_for_strategy(
+        args.strategy,
+        factors,
+        config,
+        target_date,
+        target_date,
+        symbols,
+        factor_lower_bound=getattr(args, "factor_lower_bound", None),
+        corr_threshold=getattr(args, "corr_threshold", None),
+        stop_loss_pct=getattr(args, "stop_loss_pct", None),
+    )
     out = paths.outputs / "recommendations" / f"{args.date}_{args.universe_name}.csv"
     selected.to_csv(out, index=False)
     print(f"wrote {len(selected)} recommendations to {out}")
@@ -281,10 +378,13 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_run = backtest_sub.add_parser("run")
     backtest_run.add_argument("--start", required=True)
     backtest_run.add_argument("--end", required=True)
-    backtest_run.add_argument("--strategy", choices=["multifactor", "sharpe-single", "sector-sharpe"], default="multifactor")
+    backtest_run.add_argument("--strategy", choices=STRATEGY_CHOICES, default="multifactor")
     backtest_run.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
     backtest_run.add_argument("--top-n", type=int)
     backtest_run.add_argument("--fee-rate", type=float)
+    backtest_run.add_argument("--factor-lower-bound", type=float)
+    backtest_run.add_argument("--corr-threshold", type=float)
+    backtest_run.add_argument("--stop-loss-pct", type=float)
     backtest_run.add_argument("--run-id")
     backtest_run.set_defaults(func=command_backtest_run)
 
@@ -293,10 +393,13 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid = optimize_sub.add_parser("grid")
     optimize_grid.add_argument("--start", required=True)
     optimize_grid.add_argument("--end", required=True)
-    optimize_grid.add_argument("--strategy", choices=["multifactor", "sharpe-single", "sector-sharpe"], default="sharpe-single")
+    optimize_grid.add_argument("--strategy", choices=STRATEGY_CHOICES, default="sharpe-single")
     optimize_grid.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
     optimize_grid.add_argument("--top-n", default="3,5,10")
     optimize_grid.add_argument("--fee-rate", default="0.0003,0.001")
+    optimize_grid.add_argument("--factor-lower-bound", default="-0.5,0.0,0.5")
+    optimize_grid.add_argument("--corr-threshold", default="0.8,0.9")
+    optimize_grid.add_argument("--stop-loss-pct", default="0.08,0.1")
     optimize_grid.add_argument("--objective", default="sharpe")
     optimize_grid.add_argument("--run-id")
     optimize_grid.add_argument("--show", type=int, default=5)
@@ -306,10 +409,13 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_sub = recommend.add_subparsers(dest="command", required=True)
     recommend_today = recommend_sub.add_parser("today")
     recommend_today.add_argument("--date", required=True)
-    recommend_today.add_argument("--strategy", choices=["multifactor", "sharpe-single", "sector-sharpe"], default="multifactor")
+    recommend_today.add_argument("--strategy", choices=STRATEGY_CHOICES, default="multifactor")
     recommend_today.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
     recommend_today.add_argument("--top-n", type=int)
     recommend_today.add_argument("--fee-rate", type=float)
+    recommend_today.add_argument("--factor-lower-bound", type=float)
+    recommend_today.add_argument("--corr-threshold", type=float)
+    recommend_today.add_argument("--stop-loss-pct", type=float)
     recommend_today.set_defaults(func=command_recommend_today)
 
     report = sub.add_parser("report")

@@ -12,7 +12,7 @@ from quant_agent.backtest.engine import factor_ic, run_backtest
 from quant_agent.config import StrategyConfig
 from quant_agent.data.provider import AkshareETFProvider, to_tencent_symbol
 from quant_agent.factors import compute_factors
-from quant_agent.strategy.sector_rotation import select_sector_sharpe
+from quant_agent.strategy.sector_rotation import select_sector_factor_threshold, select_sector_sharpe
 from quant_agent.strategy.selection import score_and_select
 
 
@@ -106,6 +106,51 @@ def test_sector_sharpe_rotation_runs_in_framework_backtest() -> None:
     assert not result.equity_curve.empty
     assert "total_return" in result.metrics
     assert result.positions["weight"].gt(0).all()
+
+
+def test_sector_factor_threshold_leaves_cash_and_can_liquidate() -> None:
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    daily = pd.DataFrame([
+        {
+            "date": day,
+            "symbol": symbol,
+            "name": f"ETF{symbol}",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1000,
+            "amount": 100000.0,
+            "turnover": 1.0,
+        }
+        for day in dates
+        for symbol in ["510300", "510500"]
+    ])
+    factors = daily[daily["date"] < dates[-1]].copy()
+    factors["sharpe_25"] = [
+        1.0, 0.5,
+        0.8, -0.2,
+        -0.1, -0.3,
+    ]
+    config = StrategyConfig.sector_factor_threshold_rotation(top_n=2)
+
+    selected = select_sector_factor_threshold(
+        factors,
+        config,
+        start=dates[0],
+        end=dates[2],
+        universe_symbols={"510300", "510500"},
+        corr_window=1,
+        factor_lower_bound=0.0,
+    )
+
+    weights_by_date = selected.groupby("date")["target_weight"].sum()
+    assert weights_by_date.loc[dates[0]] == pytest.approx(1.0)
+    assert weights_by_date.loc[dates[1]] == pytest.approx(0.5)
+    assert dates[2] not in weights_by_date.index
+
+    result = run_backtest(daily, selected, fee_rate=0.0)
+    assert dates[3] not in set(result.positions["date"])
 
 
 def test_backtest_trades_at_next_open_and_uses_open_to_open_returns() -> None:

@@ -9,7 +9,9 @@ python3 -m quant_agent.cli data update --start 2024-01-01 --end 2024-12-31
 python3 -m quant_agent.cli factor compute --start 2024-01-01 --end 2024-12-31
 python3 -m quant_agent.cli backtest run --start 2024-03-01 --end 2024-12-31 --top-n 10
 python3 -m quant_agent.cli backtest run --strategy sharpe-single --start 2024-03-01 --end 2024-12-31
+python3 -m quant_agent.cli backtest run --strategy sector-factor-threshold --universe-name sector-rotation --start 2024-03-01 --end 2024-12-31 --factor-lower-bound 0.0
 python3 -m quant_agent.cli optimize grid --strategy sharpe-single --start 2024-03-01 --end 2024-12-31 --top-n 3,5,10
+python3 -m quant_agent.cli optimize grid --strategy sector-factor-threshold --universe-name sector-rotation --start 2024-03-01 --end 2024-12-31 --factor-lower-bound -0.5,0.0,0.5
 python3 -m quant_agent.cli recommend today --date 2024-12-31 --top-n 10
 ```
 

@@ -16,6 +16,14 @@ SECTOR_SHARPE_CORR_THRESHOLD = 0.9
 SECTOR_SHARPE_STOP_LOSS_PCT = 0.1
 SECTOR_SHARPE_FEE_RATE = 0.0003
 
+SECTOR_FACTOR_THRESHOLD_TOP_N = 5
+SECTOR_FACTOR_THRESHOLD_WINDOW = 25
+SECTOR_FACTOR_THRESHOLD_LOWER_BOUND = 0.0
+SECTOR_FACTOR_THRESHOLD_CORR_WINDOW = 100
+SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD = 0.9
+SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT = 0.1
+SECTOR_FACTOR_THRESHOLD_FEE_RATE = 0.0003
+
 
 @dataclass(frozen=True)
 class UniverseConfig:
@@ -125,4 +133,16 @@ class StrategyConfig:
             top_n=top_n,
             fee_rate=fee_rate,
             factor_weights={f"sharpe_{SECTOR_SHARPE_FACTOR_WINDOW}": 1.0},
+        )
+
+    @classmethod
+    def sector_factor_threshold_rotation(
+        cls,
+        top_n: int = SECTOR_FACTOR_THRESHOLD_TOP_N,
+        fee_rate: float = SECTOR_FACTOR_THRESHOLD_FEE_RATE,
+    ) -> "StrategyConfig":
+        return cls(
+            top_n=top_n,
+            fee_rate=fee_rate,
+            factor_weights={f"sharpe_{SECTOR_FACTOR_THRESHOLD_WINDOW}": 1.0},
         )
