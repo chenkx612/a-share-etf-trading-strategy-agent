@@ -128,8 +128,11 @@ def test_backtest_trades_at_next_open_and_uses_open_to_open_returns() -> None:
 
     returns = result.daily_returns.set_index("date")["gross_return"]
     assert returns.loc[dates[0]] == 0.0
-    assert returns.loc[dates[1]] == pytest.approx(0.1)
+    assert returns.loc[dates[1]] == pytest.approx(0.099)
     assert returns.loc[dates[2]] == 0.0
+    positions = result.positions.set_index("date")
+    assert positions.loc[dates[1], "shares"] == 9000
+    assert positions["shares"].mod(100).eq(0).all()
 
 
 def test_factor_ic_uses_tradeable_next_open_forward_return() -> None:
