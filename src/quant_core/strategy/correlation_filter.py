@@ -2,27 +2,27 @@ from __future__ import annotations
 
 import pandas as pd
 
-from quant_agent.config import (
-    SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD,
-    SECTOR_FACTOR_THRESHOLD_CORR_WINDOW,
-    SECTOR_FACTOR_THRESHOLD_LOWER_BOUND,
-    SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT,
-    SECTOR_SHARPE_CORR_THRESHOLD,
-    SECTOR_SHARPE_CORR_WINDOW,
-    SECTOR_SHARPE_STOP_LOSS_PCT,
+from quant_core.config import (
+    RANKED_THRESHOLD_CORR_THRESHOLD,
+    RANKED_THRESHOLD_CORR_WINDOW,
+    RANKED_THRESHOLD_LOWER_BOUND,
+    RANKED_THRESHOLD_STOP_LOSS_PCT,
+    RANKED_CORR_CORR_THRESHOLD,
+    RANKED_CORR_CORR_WINDOW,
+    RANKED_CORR_STOP_LOSS_PCT,
     StrategyConfig,
 )
 
 
-def select_sector_sharpe(
+def select_ranked_correlation_filter(
     factors: pd.DataFrame,
     config: StrategyConfig,
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     universe_symbols: set[str] | None = None,
-    corr_window: int = SECTOR_SHARPE_CORR_WINDOW,
-    corr_threshold: float = SECTOR_SHARPE_CORR_THRESHOLD,
-    stop_loss_pct: float = SECTOR_SHARPE_STOP_LOSS_PCT,
+    corr_window: int = RANKED_CORR_CORR_WINDOW,
+    corr_threshold: float = RANKED_CORR_CORR_THRESHOLD,
+    stop_loss_pct: float = RANKED_CORR_STOP_LOSS_PCT,
     factor_lower_bound: float | None = None,
     fixed_slot_weight: bool = False,
     include_empty_signals: bool = False,
@@ -101,18 +101,18 @@ def select_sector_sharpe(
     return selected
 
 
-def select_sector_factor_threshold(
+def select_ranked_threshold_filter(
     factors: pd.DataFrame,
     config: StrategyConfig,
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     universe_symbols: set[str] | None = None,
-    corr_window: int = SECTOR_FACTOR_THRESHOLD_CORR_WINDOW,
-    corr_threshold: float = SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD,
-    stop_loss_pct: float = SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT,
-    factor_lower_bound: float = SECTOR_FACTOR_THRESHOLD_LOWER_BOUND,
+    corr_window: int = RANKED_THRESHOLD_CORR_WINDOW,
+    corr_threshold: float = RANKED_THRESHOLD_CORR_THRESHOLD,
+    stop_loss_pct: float = RANKED_THRESHOLD_STOP_LOSS_PCT,
+    factor_lower_bound: float = RANKED_THRESHOLD_LOWER_BOUND,
 ) -> pd.DataFrame:
-    return select_sector_sharpe(
+    return select_ranked_correlation_filter(
         factors,
         config,
         start=start,

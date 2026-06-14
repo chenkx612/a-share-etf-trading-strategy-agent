@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from quant_agent.config import StrategyConfig
-from quant_agent.factors.core import cross_sectional_zscore
+from quant_core.config import StrategyConfig
+from quant_core.factors.core import cross_sectional_zscore
 
 
 def score_factors(factors: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:

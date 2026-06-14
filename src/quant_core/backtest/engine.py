@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from quant_agent.strategy.selection import selected_to_weight_matrix
+from quant_core.strategy.selection import selected_to_weight_matrix
 
 
 @dataclass(frozen=True)

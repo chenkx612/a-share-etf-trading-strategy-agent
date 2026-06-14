@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import sys
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+import quant_core.data.universe as universe_module
+import quant_core.cli as cli_module
+from quant_core.data.etf_spot import normalize_spot_frame
+from quant_core.data.provider import AkshareETFProvider
+from quant_core.data.universe import (
+    fetch_daily_if_stale,
+    resolve_complete_universe_date,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SKILL_SCRIPT_DIR = REPO_ROOT / ".claude" / "skills" / "etf-pool-automation" / "scripts"
+
+
+def load_skill_script(script_name: str):
+    spec = importlib.util.spec_from_file_location(script_name, SKILL_SCRIPT_DIR / f"{script_name}.py")
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[script_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_resolve_complete_universe_date_requires_complete_universe() -> None:
+    universe = pd.DataFrame([
+        {"symbol": "510300", "name": "a"},
+        {"symbol": "510500", "name": "b"},
+    ])
+    daily = pd.DataFrame([
+        {"date": "2026-06-11", "symbol": "510300"},
+        {"date": "2026-06-11", "symbol": "510500"},
+        {"date": "2026-06-12", "symbol": "510300"},
+    ])
+
+    recommendation_date = resolve_complete_universe_date(
+        daily,
+        universe,
+        "2026-06-12",
+    )
+
+    assert recommendation_date == "2026-06-11"
+
+
+def test_resolve_complete_universe_date_fails_when_no_complete_date() -> None:
+    universe = pd.DataFrame([
+        {"symbol": "510300", "name": "a"},
+        {"symbol": "510500", "name": "b"},
+    ])
+    daily = pd.DataFrame([
+        {"date": "2026-06-12", "symbol": "510300"},
+    ])
+
+    with pytest.raises(RuntimeError, match="No complete recommendation date"):
+        resolve_complete_universe_date(
+            daily,
+            universe,
+            "2026-06-12",
+        )
+
+
+def test_normalize_spot_frame_maps_provider_columns() -> None:
+    spot = pd.DataFrame([
+        {"代码": "510300", "名称": "沪深300ETF", "涨跌幅": "1.2", "总市值": 20_000_000_000, "最新价": "4.1"},
+        {"代码": "512760", "名称": "芯片ETF", "涨跌幅": "3.5", "总市值": 30_000_000_000, "最新价": "1.0"},
+    ])
+
+    frame = normalize_spot_frame(spot, trade_date="2026-06-12")
+
+    assert frame["symbol"].tolist() == ["510300", "512760"]
+    assert frame["return_pct"].tolist() == [1.2, 3.5]
+    assert frame["fund_size"].tolist() == [20_000_000_000, 30_000_000_000]
+    assert frame["data_date"].tolist() == ["2026-06-12", "2026-06-12"]
+
+
+def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    selector = load_skill_script("select_etf_candidates")
+
+    assert runner.DEFAULT_ROOT == ".claude/skills/etf-pool-automation/outputs"
+    assert selector.DEFAULT_BASE_POOL == REPO_ROOT / ".claude" / "skills" / "etf-pool-automation" / "references" / "sector_rotation_universe.csv"
+    assert runner.run_dir(Path(runner.DEFAULT_ROOT), "current") == Path(".claude/skills/etf-pool-automation/outputs")
+    assert runner.run_dir(Path(runner.DEFAULT_ROOT), "reviewed") == Path(
+        ".claude/skills/etf-pool-automation/outputs/reviewed"
+    )
+
+
+def test_runner_requires_reviewed_candidates_for_full_automation() -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+
+    with pytest.raises(SystemExit, match="Full automation requires reviewed candidates"):
+        runner.require_reviewed_candidates(argparse.Namespace(candidates=None))
+
+    runner.require_reviewed_candidates(argparse.Namespace(candidates="510300,510500,512100"))
+
+
+def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    pd.DataFrame([
+        {
+            "symbol": "512760",
+            "name": "芯片ETF",
+            "fund_size": 20_000_000_000,
+            "date": "2026-06-12",
+            "latest_price": 1.0,
+            "return_pct": 3.0,
+            "theme": "semiconductor",
+            "in_base_pool": False,
+        },
+        {
+            "symbol": "515050",
+            "name": "5GETF",
+            "fund_size": 15_000_000_000,
+            "date": "2026-06-12",
+            "latest_price": 1.0,
+            "return_pct": 2.0,
+            "theme": "other",
+            "in_base_pool": "False",
+        },
+        {
+            "symbol": "512800",
+            "name": "银行ETF",
+            "fund_size": 30_000_000_000,
+            "date": "2026-06-12",
+            "latest_price": 1.0,
+            "return_pct": 1.0,
+            "theme": "finance",
+            "in_base_pool": False,
+        },
+    ]).to_csv(tmp_path / "candidate_shortlist.csv", index=False)
+    pd.DataFrame([
+        {"symbol": "512760"},
+        {"symbol": "512800"},
+        {"symbol": "159915"},
+    ]).to_csv(tmp_path / "candidate_selected.csv", index=False)
+    monkeypatch.setattr(
+        runner,
+        "load_base_pool",
+        lambda: pd.DataFrame([{"symbol": "159915", "name": "cyb", "fund_size": pd.NA}]),
+    )
+
+    state = runner.prepare_reviewed_candidates(
+        argparse.Namespace(
+            candidates="512760,515050,512800",
+            date="2026-06-12",
+            data_root=".",
+        ),
+        tmp_path,
+    )
+
+    assert state["payload"]["candidate_arg"] == "512760,515050,512800"
+    assert state["payload"]["manual_override"] is True
+    assert state["selected"]["symbol"].tolist() == ["512760", "515050", "512800"]
+    assert state["expanded"]["symbol"].tolist() == ["159915", "512760", "515050", "512800"]
+
+
+def test_data_update_does_not_create_outputs_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    universe_dir = tmp_path / "universes"
+    universe_dir.mkdir()
+    universe_path = universe_dir / "sector_rotation_universe.csv"
+    pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}]).to_csv(
+        universe_path,
+        index=False,
+    )
+    daily = pd.DataFrame([
+        {
+            "date": pd.Timestamp("2026-06-12"),
+            "symbol": "510300",
+            "name": "沪深300ETF",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "amount": 1,
+            "turnover": 1,
+        }
+    ])
+
+    class DummyProvider:
+        def __init__(self, adjust: str) -> None:
+            self.adjust = adjust
+
+        def fetch_daily(self, *args: object, **kwargs: object) -> pd.DataFrame:
+            raise AssertionError("fetch_daily should be supplied to the stale-fetch helper only")
+
+    monkeypatch.setattr(cli_module, "AkshareETFProvider", DummyProvider)
+    monkeypatch.setattr(
+        cli_module,
+        "fetch_daily_if_stale",
+        lambda *args, **kwargs: (daily, date(2026, 6, 12)),
+    )
+
+    cli_module.command_data_update(
+        argparse.Namespace(
+            root=str(tmp_path),
+            start="2026-06-12",
+            end="2026-06-12",
+            universe=str(universe_path),
+            universe_name="sector-rotation",
+            min_fund_size=None,
+            adjust=None,
+        )
+    )
+
+    assert not (tmp_path / "outputs").exists()
+    data_files = list((tmp_path / "data").iterdir())
+    assert len(data_files) == 1
+    assert data_files[0].stem == "etf_daily"
+
+
+def test_recommendation_outputs_are_copied_directly_to_automation_dir(tmp_path: Path) -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    rec_root = tmp_path / "workspace"
+    automation_dir = tmp_path / "outputs"
+    recommendation_dir = rec_root / "outputs" / "recommendations"
+    factors_dir = rec_root / "outputs" / "factors"
+    recommendation_dir.mkdir(parents=True)
+    factors_dir.mkdir(parents=True)
+    automation_dir.mkdir(parents=True)
+    pd.DataFrame([{"date": "2026-06-12", "symbol": "510300", "score": 1.0}]).to_csv(
+        recommendation_dir / "2026-06-12_sector-rotation.csv",
+        index=False,
+    )
+    pd.DataFrame([{"date": "2026-06-12", "symbol": "510300", "momentum_20": 0.1}]).to_csv(
+        factors_dir / "factors.csv",
+        index=False,
+    )
+
+    destination = runner.copy_recommend_outputs(rec_root, automation_dir, "2026-06-12")
+
+    assert destination == automation_dir / "recommendation_2026-06-12_sector-rotation.csv"
+    assert destination.exists()
+    assert not (automation_dir / "recommendation_factors.csv").exists()
+    assert not (automation_dir / "outputs").exists()
+    assert not (automation_dir / "data").exists()
+
+
+def test_apply_recommendations_use_temporary_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    automation_dir = tmp_path / "automation"
+    data_root = tmp_path / "repo-root"
+    rec_root = tmp_path / "recommend-workspace"
+    automation_dir.mkdir()
+    data_root.mkdir()
+    (automation_dir / "best.json").write_text(
+        """{
+  "top_n": 4,
+  "fee_rate": 0.0003,
+  "sharpe_window": 20,
+  "factor_lower_bound": 0.0,
+  "corr_window": 100,
+  "corr_threshold": 0.9,
+  "stop_loss_pct": 0.1
+}""",
+        encoding="utf-8",
+    )
+    roots: list[str] = []
+
+    def fake_prepare_recommend_workspace(actual_data_root: Path, actual_automation_dir: Path) -> Path:
+        assert actual_data_root == data_root
+        assert actual_automation_dir == automation_dir
+        rec_root.mkdir()
+        return rec_root
+
+    def fake_factor_compute(args: argparse.Namespace) -> None:
+        roots.append(args.root)
+
+    def fake_recommend_today(args: argparse.Namespace) -> None:
+        roots.append(args.root)
+        assert args.universe == str(automation_dir / "selected_universe.csv")
+        recommendation_dir = Path(args.root) / "outputs" / "recommendations"
+        recommendation_dir.mkdir(parents=True)
+        pd.DataFrame([{"date": args.date, "symbol": "510300", "score": 1.0}]).to_csv(
+            recommendation_dir / f"{args.date}_sector-rotation.csv",
+            index=False,
+        )
+
+    monkeypatch.setattr(runner, "prepare_recommend_workspace", fake_prepare_recommend_workspace)
+    monkeypatch.setattr(runner, "command_factor_compute", fake_factor_compute)
+    monkeypatch.setattr(runner, "command_recommend_today", fake_recommend_today)
+
+    destination = runner.generate_recommendations(
+        argparse.Namespace(
+            data_root=str(data_root),
+            apply=True,
+            start="2026-01-01",
+        ),
+        automation_dir,
+        "2026-06-12",
+    )
+
+    assert destination == automation_dir / "recommendation_2026-06-12_sector-rotation.csv"
+    assert roots == [str(rec_root), str(rec_root)]
+    assert not (data_root / "outputs").exists()
+
+
+def test_cleanup_intermediate_outputs_keeps_only_summary_recommendation_and_apply_backup(tmp_path: Path) -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    for filename in [
+        "automation_summary.json",
+        "recommendation_2026-06-12_sector-rotation.csv",
+        "universe_before.csv",
+        "candidate_selected.json",
+        "candidate_selected.csv",
+        "candidate_shortlist.csv",
+        "expanded_refresh_universe.csv",
+        "all_results.csv",
+        "evaluations.csv",
+        "best.json",
+        "selected_universe.csv",
+        "base_universe.csv",
+        "add_510300_universe.csv",
+    ]:
+        (tmp_path / filename).write_text("", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+
+    runner.cleanup_intermediate_outputs(tmp_path)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "automation_summary.json",
+        "recommendation_2026-06-12_sector-rotation.csv",
+        "universe_before.csv",
+    ]
+
+
+def test_fetch_daily_if_stale_skips_when_latest_trade_date_is_covered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    provider = AkshareETFProvider(adjust="qfq")
+    universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
+    existing = pd.DataFrame([
+        {
+            "date": pd.Timestamp("2026-06-12"),
+            "symbol": "510300",
+            "name": "沪深300ETF",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "amount": 1,
+            "turnover": 1,
+        }
+    ])
+    calls = []
+
+    def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        calls.append((single, start, end))
+        return pd.DataFrame()
+
+    incoming, target_trade_date = fetch_daily_if_stale(
+        provider,
+        universe,
+        date(2026, 6, 12),
+        date(2026, 6, 14),
+        existing=existing,
+        fetch_one=fetch_one,
+    )
+
+    assert incoming.empty
+    assert target_trade_date == date(2026, 6, 12)
+    assert calls == []
+
+
+def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_date_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    provider = AkshareETFProvider(adjust="qfq")
+    universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
+    existing = pd.DataFrame([
+        {
+            "date": pd.Timestamp("2026-06-11"),
+            "symbol": "510300",
+            "name": "沪深300ETF",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "amount": 1,
+            "turnover": 1,
+        }
+    ])
+    calls = []
+
+    def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        calls.append((start, end))
+        return pd.DataFrame([
+            {
+                "date": pd.Timestamp("2026-06-12"),
+                "symbol": "510300",
+                "name": "沪深300ETF",
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "amount": 1,
+                "turnover": 1,
+            }
+        ])
+
+    incoming, target_trade_date = fetch_daily_if_stale(
+        provider,
+        universe,
+        date(2010, 1, 1),
+        date(2026, 6, 14),
+        existing=existing,
+        fetch_one=fetch_one,
+    )
+
+    assert not incoming.empty
+    assert target_trade_date == date(2026, 6, 12)
+    assert calls == [(date(2021, 6, 14), date(2026, 6, 14))]
+
+
+def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    provider = AkshareETFProvider(adjust="qfq")
+    universe = pd.DataFrame([
+        {"symbol": "510300", "name": "沪深300ETF"},
+        {"symbol": "510500", "name": "中证500ETF"},
+    ])
+    existing = pd.DataFrame([
+        {
+            "date": pd.Timestamp("2026-06-12"),
+            "symbol": "510500",
+            "name": "中证500ETF",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "amount": 1,
+            "turnover": 1,
+        }
+    ])
+    fetched_symbols = []
+
+    def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        fetched_symbols.extend(single["symbol"].astype(str).tolist())
+        return pd.DataFrame([
+            {
+                "date": pd.Timestamp("2026-06-12"),
+                "symbol": "510300",
+                "name": "沪深300ETF",
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "amount": 1,
+                "turnover": 1,
+            }
+        ])
+
+    incoming, target_trade_date = fetch_daily_if_stale(
+        provider,
+        universe,
+        date(2026, 1, 1),
+        date(2026, 6, 14),
+        existing=existing,
+        fetch_one=fetch_one,
+    )
+
+    assert target_trade_date == date(2026, 6, 12)
+    assert fetched_symbols == ["510300"]
+    assert incoming["symbol"].tolist() == ["510300"]
+
+
+def test_fetch_daily_if_stale_refuses_partial_provider_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    provider = AkshareETFProvider(adjust="qfq")
+    universe = pd.DataFrame([
+        {"symbol": "510300", "name": "沪深300ETF"},
+        {"symbol": "510500", "name": "中证500ETF"},
+    ])
+
+    def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        return pd.DataFrame([
+            {
+                "date": pd.Timestamp("2026-06-12"),
+                "symbol": "510300",
+                "name": "沪深300ETF",
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1,
+                "amount": 1,
+                "turnover": 1,
+            }
+        ])
+
+    with pytest.raises(RuntimeError, match="missing symbols=\\['510500'\\]"):
+        fetch_daily_if_stale(
+            provider,
+            universe,
+            date(2026, 1, 1),
+            date(2026, 6, 14),
+            existing=None,
+            fetch_one=fetch_one,
+        )

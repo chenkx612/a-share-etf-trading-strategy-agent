@@ -9,19 +9,19 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
-import requests
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[4]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-from quant_agent.config import SECTOR_ROTATION_UNIVERSE_NAME, get_universe_config  # noqa: E402
-from quant_agent.paths import ProjectPaths  # noqa: E402
-from quant_agent.storage import read_table  # noqa: E402
+from quant_core.data.etf_spot import fetch_spot, normalize_spot_frame  # noqa: E402
+from quant_core.data.universe import expanded_universe as build_expanded_universe  # noqa: E402
 
 
 DEFAULT_MIN_FUND_SIZE_CNY = 10_000_000_000
+DEFAULT_BASE_POOL = Path(__file__).resolve().parents[1] / "references" / "sector_rotation_universe.csv"
 
 THEME_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("semiconductor", ("半导体", "芯片", "集成电路", "科创芯片", "科创半导体")),
@@ -41,12 +41,6 @@ THEME_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("bond_cash", ("债", "货币", "现金", "添利", "短融")),
     ("commodity", ("黄金", "白银", "豆粕", "商品")),
 ]
-
-TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
-QUOTE_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://gu.qq.com/",
-}
 
 
 @dataclass(frozen=True)
@@ -69,13 +63,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-fund-size", type=float, default=DEFAULT_MIN_FUND_SIZE_CNY)
     parser.add_argument("--top-shortlist", type=int, default=30)
     parser.add_argument("--count", type=int, default=3)
-    parser.add_argument("--root", default="workspaces/sector_rotation")
+    parser.add_argument("--base-universe", default=str(DEFAULT_BASE_POOL))
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--candidates",
         help="Optional comma-separated symbol override after semantic de-duplication review.",
     )
     return parser.parse_args()
+
+
+def load_base_pool(base_universe: str) -> pd.DataFrame:
+    frame = pd.read_csv(base_universe)
+    frame["symbol"] = frame["symbol"].astype(str)
+    return frame
+
+
+def base_pool_symbols(base_universe: str) -> set[str]:
+    return set(load_base_pool(base_universe)["symbol"].astype(str))
 
 
 def theme_for(name: str) -> str:
@@ -86,117 +90,17 @@ def theme_for(name: str) -> str:
     return "other"
 
 
-def load_base_pool(root: str) -> pd.DataFrame:
-    paths = ProjectPaths(Path(root))
-    try:
-        frame = read_table(paths.data_universe / "sector_rotation_universe")
-    except FileNotFoundError:
-        config = get_universe_config(SECTOR_ROTATION_UNIVERSE_NAME)
-        frame = config.to_frame()
-    frame = frame.copy()
-    frame["symbol"] = frame["symbol"].astype(str)
-    return frame
-
-
-def base_pool_symbols(root: str) -> set[str]:
-    return set(load_base_pool(root)["symbol"].astype(str))
-
-
-def tencent_symbol(symbol: str) -> str:
-    return f"sh{symbol}" if symbol.startswith(("5", "6", "9")) else f"sz{symbol}"
-
-
-def tencent_query_symbol(symbol: str) -> str:
-    return tencent_symbol(symbol)
-
-
-def parse_tencent_quote(line: str) -> dict[str, object] | None:
-    if '="' not in line:
+def to_json_number(value: object) -> float | None:
+    if pd.isna(value):
         return None
-    payload = line.split('="', 1)[1].rstrip('";\n')
-    parts = payload.split("~")
-    if len(parts) <= 73:
-        return None
-    timestamp = parts[30]
-    return {
-        "代码": parts[2],
-        "名称": parts[1],
-        "最新价": parts[3],
-        "涨跌幅": parts[32],
-        "总市值": parts[72],
-        "流通市值": parts[73],
-        "数据日期": timestamp[:8] if len(timestamp) >= 8 else "",
-    }
-
-
-def fetch_spot_with_tencent() -> pd.DataFrame:
-    import akshare as ak
-
-    ths = ak.fund_etf_spot_ths()
-    symbols = ths["基金代码"].astype(str).drop_duplicates().tolist()
-    rows: list[dict[str, object]] = []
-    batch_size = 80
-    for start in range(0, len(symbols), batch_size):
-        batch = symbols[start : start + batch_size]
-        query = ",".join(tencent_query_symbol(symbol) for symbol in batch)
-        response = requests.get(f"{TENCENT_QUOTE_URL}{query}", headers=QUOTE_HEADERS, timeout=20)
-        response.raise_for_status()
-        for line in response.text.strip().splitlines():
-            parsed = parse_tencent_quote(line)
-            if parsed is not None:
-                rows.append(parsed)
-    if not rows:
-        raise RuntimeError("Tencent quote fallback returned no ETF rows")
-    return pd.DataFrame(rows)
-
-
-def fetch_spot() -> pd.DataFrame:
-    import akshare as ak
-
-    try:
-        return ak.fund_etf_spot_em()
-    except Exception as exc:
-        print(f"AKShare fund_etf_spot_em failed; falling back to Tencent quote API: {exc}", file=sys.stderr)
-        return fetch_spot_with_tencent()
+    return float(value)
 
 
 def candidate_rows(args: argparse.Namespace) -> list[CandidateRow]:
-    spot = fetch_spot()
-    column_map = {
-        "代码": "symbol",
-        "名称": "name",
-        "最新价": "latest_price",
-        "涨跌幅": "return_pct",
-        "总市值": "total_market_value",
-        "流通市值": "float_market_value",
-        "数据日期": "data_date",
-    }
-    frame = spot.rename(columns={k: v for k, v in column_map.items() if k in spot.columns}).copy()
-    required = {"symbol", "name", "return_pct"}
-    missing = required - set(frame.columns)
-    if missing:
-        raise RuntimeError(f"AKShare ETF spot data missing columns: {sorted(missing)}")
-
-    frame["symbol"] = frame["symbol"].astype(str)
-    frame["return_pct"] = pd.to_numeric(frame["return_pct"], errors="coerce")
-    if "latest_price" in frame.columns:
-        frame["latest_price"] = pd.to_numeric(frame["latest_price"], errors="coerce")
-    else:
-        frame["latest_price"] = pd.NA
-    if "total_market_value" in frame.columns:
-        frame["fund_size"] = pd.to_numeric(frame["total_market_value"], errors="coerce")
-    elif "float_market_value" in frame.columns:
-        frame["fund_size"] = pd.to_numeric(frame["float_market_value"], errors="coerce")
-    else:
-        raise RuntimeError("AKShare ETF spot data missing market value column")
-
+    frame = normalize_spot_frame(fetch_spot(), args.date)
     frame = frame[(frame["fund_size"] >= args.min_fund_size) & frame["return_pct"].notna()].copy()
     frame["theme"] = frame["name"].astype(str).map(theme_for)
-    if "data_date" not in frame.columns:
-        frame["data_date"] = args.date
-    frame["data_date"] = frame["data_date"].fillna(args.date).astype(str)
-
-    base_symbols = base_pool_symbols(args.root)
+    base_symbols = base_pool_symbols(args.base_universe)
 
     rows: list[CandidateRow] = []
     for item in frame.itertuples(index=False):
@@ -214,12 +118,6 @@ def candidate_rows(args: argparse.Namespace) -> list[CandidateRow]:
             )
         )
     return sorted(rows, key=lambda row: row.return_pct, reverse=True)
-
-
-def to_json_number(value: object) -> float | None:
-    if pd.isna(value):
-        return None
-    return float(value)
 
 
 def select_diversified(rows: list[CandidateRow], count: int) -> list[CandidateRow]:
@@ -266,17 +164,13 @@ def resolve_selected(args: argparse.Namespace, rows: list[CandidateRow]) -> list
     return [by_symbol[symbol] for symbol in symbols]
 
 
-def expanded_universe(root: str, selected: list[CandidateRow]) -> pd.DataFrame:
-    base = load_base_pool(root)
-    base_symbols = set(base["symbol"].astype(str))
-    additions = [
+def expanded_universe(base_universe: str, selected: list[CandidateRow]) -> pd.DataFrame:
+    base = load_base_pool(base_universe)
+    additions = pd.DataFrame([
         {"symbol": row.symbol, "name": row.name, "fund_size": row.fund_size}
         for row in selected
-        if row.symbol not in base_symbols
-    ]
-    if not additions:
-        return base.reset_index(drop=True)
-    return pd.concat([base, pd.DataFrame(additions)], ignore_index=True)
+    ])
+    return build_expanded_universe(base, additions)
 
 
 def write_outputs(args: argparse.Namespace, rows: list[CandidateRow]) -> None:
@@ -290,7 +184,7 @@ def write_outputs(args: argparse.Namespace, rows: list[CandidateRow]) -> None:
 
     shortlist_frame = pd.DataFrame([asdict(row) for row in shortlist])
     selected_frame = pd.DataFrame([asdict(row) for row in selected])
-    expanded = expanded_universe(args.root, selected)
+    expanded = expanded_universe(args.base_universe, selected)
     shortlist_frame.to_csv(output_dir / "candidate_shortlist.csv", index=False)
     selected_frame.to_csv(output_dir / "candidate_selected.csv", index=False)
     expanded.to_csv(output_dir / "expanded_refresh_universe.csv", index=False)

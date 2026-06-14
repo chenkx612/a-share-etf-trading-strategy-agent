@@ -21,8 +21,11 @@ dependencies = [
 dev = ["pytest>=8"]
 
 [project.scripts]
-quant-agent = "quant_agent.cli:main"
+quant-agent = "quant_core.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["quant_agent*"]
+where = ["src"]
+include = ["quant_core*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

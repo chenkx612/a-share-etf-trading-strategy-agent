@@ -75,6 +75,23 @@ class AkshareETFProvider:
             return pd.DataFrame(columns=STANDARD_COLUMNS)
         return pd.concat(frames, ignore_index=True).sort_values(["date", "symbol"])
 
+    def fetch_daily_tencent(
+        self,
+        universe: pd.DataFrame,
+        start: date,
+        end: date,
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for row in universe.itertuples(index=False):
+            symbol = str(row.symbol)
+            name = str(row.name)
+            frame = self._fetch_daily_tencent(symbol, name, start, end)
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return pd.DataFrame(columns=STANDARD_COLUMNS)
+        return pd.concat(frames, ignore_index=True).sort_values(["date", "symbol"])
+
     def _fetch_daily_eastmoney(
         self,
         symbol: str,

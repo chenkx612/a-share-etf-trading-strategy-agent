@@ -8,18 +8,17 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from quant_agent.backtest.engine import compute_metrics, factor_ic, run_backtest
-from quant_agent.cli import (
-    candidate_pool_frame,
+from quant_core.backtest.engine import compute_metrics, factor_ic, run_backtest
+from quant_core.cli import (
     ensure_sharpe_factor_columns,
     metrics_satisfy_constraint,
     sort_optimization_results,
 )
-from quant_agent.config import StrategyConfig
-from quant_agent.data.provider import AkshareETFProvider, to_tencent_symbol
-from quant_agent.factors import compute_factors
-from quant_agent.strategy.sector_rotation import select_sector_factor_threshold, select_sector_sharpe
-from quant_agent.strategy.selection import score_and_select
+from quant_core.config import StrategyConfig
+from quant_core.data.provider import AkshareETFProvider, to_tencent_symbol
+from quant_core.factors import compute_factors
+from quant_core.strategy.correlation_filter import select_ranked_threshold_filter, select_ranked_correlation_filter
+from quant_core.strategy.selection import score_and_select
 
 
 def sample_daily() -> pd.DataFrame:
@@ -137,17 +136,6 @@ def test_drawdown_lt_return_constraint_and_sorting() -> None:
     assert sorted_results.iloc[0]["name"] == "valid_high"
 
 
-def test_candidate_pool_frame_adds_one_symbol() -> None:
-    base = pd.DataFrame([
-        {"symbol": "510300", "name": "base", "fund_size": pd.NA},
-    ])
-
-    pool = candidate_pool_frame(base, "159915", {"159915": "cyb"})
-
-    assert pool["symbol"].tolist() == ["510300", "159915"]
-    assert pool.loc[1, "name"] == "cyb"
-
-
 def test_strategy_selection_can_filter_by_universe() -> None:
     daily = sample_daily()
     factors = compute_factors(daily)
@@ -163,11 +151,11 @@ def test_strategy_selection_can_filter_by_universe() -> None:
     assert selected.groupby("date")["target_weight"].sum().round(6).eq(1.0).all()
 
 
-def test_sector_sharpe_rotation_runs_in_framework_backtest() -> None:
+def test_ranked_correlation_filter_runs_in_framework_backtest() -> None:
     daily = sample_daily()
     factors = compute_factors(daily)
-    config = replace(StrategyConfig.sector_sharpe_rotation(), top_n=2)
-    selected = select_sector_sharpe(
+    config = replace(StrategyConfig.ranked_correlation_filter(), top_n=2)
+    selected = select_ranked_correlation_filter(
         factors,
         config,
         start=pd.Timestamp("2024-01-25"),
@@ -184,7 +172,7 @@ def test_sector_sharpe_rotation_runs_in_framework_backtest() -> None:
     assert result.positions["weight"].gt(0).all()
 
 
-def test_sector_factor_threshold_leaves_cash_and_can_liquidate() -> None:
+def test_ranked_threshold_filter_leaves_cash_and_can_liquidate() -> None:
     dates = pd.date_range("2024-01-01", periods=4, freq="D")
     daily = pd.DataFrame([
         {
@@ -208,9 +196,9 @@ def test_sector_factor_threshold_leaves_cash_and_can_liquidate() -> None:
         0.8, -0.2,
         -0.1, -0.3,
     ]
-    config = StrategyConfig.sector_factor_threshold_rotation(top_n=2)
+    config = StrategyConfig.ranked_threshold_filter(top_n=2)
 
-    selected = select_sector_factor_threshold(
+    selected = select_ranked_threshold_filter(
         factors,
         config,
         start=dates[0],

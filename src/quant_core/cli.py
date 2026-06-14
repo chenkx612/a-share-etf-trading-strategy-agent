@@ -9,31 +9,30 @@ from typing import Iterable
 
 import pandas as pd
 
-from quant_agent.backtest.engine import factor_ic, run_backtest
-from quant_agent.config import (
-    LARGE_ETF_UNIVERSE_NAME,
-    SECTOR_FACTOR_THRESHOLD_CORR_WINDOW,
-    SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD,
-    SECTOR_FACTOR_THRESHOLD_LOWER_BOUND,
-    SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT,
-    SECTOR_SHARPE_CORR_WINDOW,
-    SECTOR_SHARPE_CORR_THRESHOLD,
-    SECTOR_SHARPE_STOP_LOSS_PCT,
-    SECTOR_ROTATION_UNIVERSE_NAME,
+from quant_core.backtest.engine import factor_ic, run_backtest
+from quant_core.config import (
+    RANKED_THRESHOLD_CORR_WINDOW,
+    RANKED_THRESHOLD_CORR_THRESHOLD,
+    RANKED_THRESHOLD_LOWER_BOUND,
+    RANKED_THRESHOLD_STOP_LOSS_PCT,
+    RANKED_CORR_CORR_WINDOW,
+    RANKED_CORR_CORR_THRESHOLD,
+    RANKED_CORR_STOP_LOSS_PCT,
     StrategyConfig,
-    available_universe_names,
-    get_universe_config,
 )
-from quant_agent.data.provider import AkshareETFProvider, merge_incremental, validate_daily
-from quant_agent.factors import compute_factors, normalize_sharpe_windows
-from quant_agent.paths import ProjectPaths
-from quant_agent.reporting import build_markdown_report
-from quant_agent.storage import read_table, write_table
-from quant_agent.strategy.sector_rotation import select_sector_factor_threshold, select_sector_sharpe
-from quant_agent.strategy.selection import score_and_select, score_factors
+from quant_core.data.provider import AkshareETFProvider, merge_incremental, validate_daily
+from quant_core.data.universe import (
+    fetch_daily_if_stale,
+)
+from quant_core.factors import compute_factors, normalize_sharpe_windows
+from quant_core.paths import ProjectPaths
+from quant_core.reporting import build_markdown_report
+from quant_core.storage import read_table, write_table
+from quant_core.strategy.correlation_filter import select_ranked_threshold_filter, select_ranked_correlation_filter
+from quant_core.strategy.selection import score_and_select, score_factors
 
 
-STRATEGY_CHOICES = ["multifactor", "sharpe-single", "sector-sharpe", "sector-factor-threshold"]
+STRATEGY_CHOICES = ["multifactor", "sharpe-single", "ranked-corr", "ranked-threshold-corr"]
 OPTIMIZATION_CONSTRAINT_CHOICES = ["none", "drawdown-lt-return"]
 
 
@@ -54,7 +53,7 @@ def parse_sharpe_windows(value: str) -> list[int]:
 
 
 def strategy_uses_sharpe_window(strategy: str) -> bool:
-    return strategy in {"sharpe-single", "sector-sharpe", "sector-factor-threshold"}
+    return strategy in {"sharpe-single", "ranked-corr", "ranked-threshold-corr"}
 
 
 def metrics_satisfy_constraint(metrics: dict[str, float], constraint: str) -> bool:
@@ -108,7 +107,7 @@ def optimization_grid_results(
                                     sharpe_window=sharpe_window,
                                 )
                                 config = build_strategy_config(config_args)
-                                selected, sector_rotation = select_for_strategy(
+                                selected, correlation_filter = select_for_strategy(
                                     strategy,
                                     factors,
                                     config,
@@ -121,7 +120,7 @@ def optimization_grid_results(
                                     stop_loss_pct=stop_loss_pct,
                                 )
                                 result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-                                if sector_rotation:
+                                if correlation_filter:
                                     metrics = result.metrics
                                 else:
                                     scored = score_factors(factors, config)
@@ -152,12 +151,12 @@ def best_optimization_row(results: pd.DataFrame, objective: str, constraint: str
 def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
     strategy = getattr(args, "strategy", "multifactor")
     sharpe_window = getattr(args, "sharpe_window", None)
-    if strategy == "sector-factor-threshold":
-        config = StrategyConfig.sector_factor_threshold_rotation(
+    if strategy == "ranked-threshold-corr":
+        config = StrategyConfig.ranked_threshold_filter(
             **({"sharpe_window": sharpe_window} if sharpe_window is not None else {})
         )
-    elif strategy == "sector-sharpe":
-        config = StrategyConfig.sector_sharpe_rotation(
+    elif strategy == "ranked-corr":
+        config = StrategyConfig.ranked_correlation_filter(
             **({"sharpe_window": sharpe_window} if sharpe_window is not None else {})
         )
     elif strategy == "sharpe-single":
@@ -212,100 +211,81 @@ def select_for_strategy(
     corr_threshold: float | None = None,
     stop_loss_pct: float | None = None,
 ) -> tuple[pd.DataFrame, bool]:
-    if strategy == "sector-factor-threshold":
+    if strategy == "ranked-threshold-corr":
         return (
-            select_sector_factor_threshold(
+            select_ranked_threshold_filter(
                 factors,
                 config,
                 start=start,
                 end=end,
                 universe_symbols=universe_symbols_,
-                corr_window=SECTOR_FACTOR_THRESHOLD_CORR_WINDOW if corr_window is None else corr_window,
+                corr_window=RANKED_THRESHOLD_CORR_WINDOW if corr_window is None else corr_window,
                 corr_threshold=(
-                    SECTOR_FACTOR_THRESHOLD_CORR_THRESHOLD if corr_threshold is None else corr_threshold
+                    RANKED_THRESHOLD_CORR_THRESHOLD if corr_threshold is None else corr_threshold
                 ),
                 stop_loss_pct=(
-                    SECTOR_FACTOR_THRESHOLD_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
+                    RANKED_THRESHOLD_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
                 ),
                 factor_lower_bound=(
-                    SECTOR_FACTOR_THRESHOLD_LOWER_BOUND if factor_lower_bound is None else factor_lower_bound
+                    RANKED_THRESHOLD_LOWER_BOUND if factor_lower_bound is None else factor_lower_bound
                 ),
             ),
             True,
         )
-    if strategy == "sector-sharpe":
+    if strategy == "ranked-corr":
         return (
-            select_sector_sharpe(
+            select_ranked_correlation_filter(
                 factors,
                 config,
                 start=start,
                 end=end,
                 universe_symbols=universe_symbols_,
-                corr_window=SECTOR_SHARPE_CORR_WINDOW if corr_window is None else corr_window,
-                corr_threshold=SECTOR_SHARPE_CORR_THRESHOLD if corr_threshold is None else corr_threshold,
-                stop_loss_pct=SECTOR_SHARPE_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct,
+                corr_window=RANKED_CORR_CORR_WINDOW if corr_window is None else corr_window,
+                corr_threshold=RANKED_CORR_CORR_THRESHOLD if corr_threshold is None else corr_threshold,
+                stop_loss_pct=RANKED_CORR_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct,
             ),
             True,
         )
     return score_and_select(factors, config, start=start, end=end), False
 
 
-def universe_table_base(paths: ProjectPaths, universe_name: str) -> Path:
-    return paths.data_universe / f"{universe_name.replace('-', '_')}_universe"
+def load_universe_file(path: Path) -> pd.DataFrame:
+    universe = pd.read_csv(path)
+    universe = universe.copy()
+    universe["symbol"] = universe["symbol"].astype(str)
+    return universe
 
 
-def resolve_data_universe(args: argparse.Namespace, paths: ProjectPaths) -> tuple[pd.DataFrame, str, bool]:
+def resolve_data_universe(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     if args.universe and Path(args.universe).exists():
-        return pd.read_csv(args.universe), "custom", False
-
-    universe_config = get_universe_config(args.universe_name)
-    if universe_config.source == "static":
-        return universe_config.to_frame(), universe_config.name, False
-    if universe_config.source == "akshare_etf":
+        return load_universe_file(Path(args.universe)), args.universe_name
+    if getattr(args, "min_fund_size", None) is not None:
         provider = AkshareETFProvider(adjust=effective_adjust(args))
-        if universe_config.min_fund_size_cny is None:
-            raise ValueError(f"Universe {universe_config.name!r} is missing min_fund_size_cny")
-        return provider.fetch_universe(universe_config.min_fund_size_cny), universe_config.name, True
-    raise ValueError(f"Unsupported universe source: {universe_config.source}")
+        return provider.fetch_universe(args.min_fund_size), args.universe_name
+    raise FileNotFoundError("No universe was provided. Pass --universe PATH or --min-fund-size VALUE.")
 
 
 def effective_adjust(args: argparse.Namespace) -> str:
-    if getattr(args, "adjust", None) is not None:
-        return args.adjust
-    return get_universe_config(args.universe_name).default_adjust
+    return getattr(args, "adjust", None) or ""
 
 
-def load_strategy_universe(paths: ProjectPaths, universe_name: str) -> pd.DataFrame:
-    universe_config = get_universe_config(universe_name)
-    try:
-        return read_table(universe_table_base(paths, universe_name))
-    except FileNotFoundError:
-        pass
-    if universe_config.source == "static":
-        return universe_config.to_frame()
-    try:
-        return read_table(universe_table_base(paths, universe_name))
-    except FileNotFoundError:
-        if universe_name == LARGE_ETF_UNIVERSE_NAME:
-            return read_table(paths.data_universe / "etf_universe")
-        raise
+def load_strategy_universe(args: argparse.Namespace) -> pd.DataFrame:
+    if not getattr(args, "universe", None):
+        raise FileNotFoundError("No universe was provided. Pass --universe PATH.")
+    return load_universe_file(Path(args.universe))
 
 
-def universe_symbols(paths: ProjectPaths, universe_name: str) -> set[str]:
-    universe = load_strategy_universe(paths, universe_name)
+def universe_symbols(universe: pd.DataFrame) -> set[str]:
     return set(universe["symbol"].astype(str))
 
 
-def filter_factors_by_universe(factors: pd.DataFrame, paths: ProjectPaths, universe_name: str) -> pd.DataFrame:
-    symbols = universe_symbols(paths, universe_name)
+def filter_factors_by_universe(factors: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
+    symbols = universe_symbols(universe)
     return factors[factors["symbol"].astype(str).isin(symbols)].copy()
 
 
 def read_daily(paths: ProjectPaths) -> pd.DataFrame:
-    try:
-        return read_table(paths.data_processed / "etf_daily", parse_dates=["date"])
-    except FileNotFoundError:
-        return read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
+    return read_table(paths.data_daily, parse_dates=["date"])
 
 
 def parse_date(value: str) -> date:
@@ -314,24 +294,27 @@ def parse_date(value: str) -> date:
 
 def command_data_update(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
-    paths.ensure()
+    paths.ensure_data()
     provider = AkshareETFProvider(adjust=effective_adjust(args))
-    universe, universe_name, write_compat = resolve_data_universe(args, paths)
-    universe_path = universe_table_base(paths, universe_name)
-    write_table(universe, universe_path)
-    if write_compat:
-        write_table(universe, paths.data_universe / "etf_universe")
-    incoming = provider.fetch_daily(universe, parse_date(args.start), parse_date(args.end))
+    universe, _universe_name = resolve_data_universe(args)
     try:
-        existing = read_table(paths.data_raw / "etf_daily", parse_dates=["date"])
+        existing = read_daily(paths)
     except FileNotFoundError:
         existing = None
+    incoming, target_trade_date = fetch_daily_if_stale(
+        provider,
+        universe,
+        parse_date(args.start),
+        parse_date(args.end),
+        existing=existing,
+        fetch_one=provider.fetch_daily,
+        log=print,
+    )
     daily = merge_incremental(existing, incoming)
     problems = validate_daily(daily)
-    raw_path = write_table(daily, paths.data_raw / "etf_daily")
-    processed_path = write_table(daily, paths.data_processed / "etf_daily")
-    print(f"wrote {len(daily)} rows to {raw_path}")
-    print(f"wrote {len(daily)} standardized rows to {processed_path}")
+    daily_path = write_table(daily, paths.data_daily)
+    print(f"wrote {len(daily)} rows to {daily_path}")
+    print(f"latest trade date target: {target_trade_date}")
     if problems:
         print("data warnings:")
         for problem in problems:
@@ -361,11 +344,12 @@ def command_backtest_run(args: argparse.Namespace) -> None:
     daily = read_daily(paths)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
     factors = ensure_sharpe_factor_columns(factors, daily, config_sharpe_windows(config))
-    symbols = universe_symbols(paths, args.universe_name)
+    universe = load_strategy_universe(args)
+    symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    selected, sector_rotation = select_for_strategy(
+    selected, correlation_filter = select_for_strategy(
         args.strategy,
         factors,
         config,
@@ -378,7 +362,7 @@ def command_backtest_run(args: argparse.Namespace) -> None:
         stop_loss_pct=getattr(args, "stop_loss_pct", None),
     )
     result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-    if sector_rotation:
+    if correlation_filter:
         metrics = result.metrics
     else:
         scored = score_factors(factors, config)
@@ -408,7 +392,8 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     )
     if sharpe_windows:
         factors = ensure_sharpe_factor_columns(factors, daily, sharpe_windows)
-    symbols = universe_symbols(paths, args.universe_name)
+    universe = load_strategy_universe(args)
+    symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
@@ -416,12 +401,12 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     corr_windows = [None]
     corr_thresholds = [None]
     stop_loss_pcts = [None]
-    if args.strategy == "sector-factor-threshold":
+    if args.strategy == "ranked-threshold-corr":
         factor_lower_bounds = parse_float_list(args.factor_lower_bound)
         corr_windows = parse_int_list(args.corr_window)
         corr_thresholds = parse_float_list(args.corr_threshold)
         stop_loss_pcts = parse_float_list(args.stop_loss_pct)
-    elif args.strategy == "sector-sharpe":
+    elif args.strategy == "ranked-corr":
         corr_windows = parse_int_list(args.corr_window)
         corr_thresholds = parse_float_list(args.corr_threshold)
         stop_loss_pcts = parse_float_list(args.stop_loss_pct)
@@ -458,117 +443,6 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     print(results.head(min(len(results), args.show)).to_string(index=False))
 
 
-def latest_symbol_names(daily: pd.DataFrame) -> dict[str, str]:
-    if daily.empty or "name" not in daily.columns:
-        return {}
-    df = daily.copy()
-    df["symbol"] = df["symbol"].astype(str)
-    df = df.sort_values("date").dropna(subset=["name"]).drop_duplicates("symbol", keep="last")
-    return df.set_index("symbol")["name"].astype(str).to_dict()
-
-
-def candidate_pool_frame(base_universe: pd.DataFrame, candidate_symbol: str | None, names: dict[str, str]) -> pd.DataFrame:
-    out = base_universe.copy()
-    out["symbol"] = out["symbol"].astype(str)
-    if candidate_symbol is None or candidate_symbol in set(out["symbol"]):
-        return out.reset_index(drop=True)
-    row = {
-        "symbol": candidate_symbol,
-        "name": names.get(candidate_symbol, candidate_symbol),
-        "fund_size": pd.NA,
-    }
-    return pd.concat([out, pd.DataFrame([row])], ignore_index=True)
-
-
-def command_automation_etf_pool(args: argparse.Namespace) -> None:
-    paths = ProjectPaths(Path(args.root))
-    paths.ensure()
-    daily = read_daily(paths)
-    daily["symbol"] = daily["symbol"].astype(str)
-    candidates = parse_symbol_list(args.candidates)
-    if len(candidates) != 3:
-        raise ValueError("Exactly three candidate ETF symbols are required")
-
-    available_symbols = set(daily["symbol"].astype(str))
-    missing = [symbol for symbol in candidates if symbol not in available_symbols]
-    if missing:
-        raise ValueError(f"Candidate symbols are missing from local daily data: {missing}")
-
-    base_universe = load_strategy_universe(paths, args.universe_name)
-    base_universe["symbol"] = base_universe["symbol"].astype(str)
-    names = latest_symbol_names(daily)
-    sharpe_windows = parse_sharpe_windows(args.sharpe_window)
-    factors = compute_factors(daily, sharpe_windows=sharpe_windows)
-    start = pd.Timestamp(args.start)
-    end = pd.Timestamp(args.end)
-
-    run_id = args.run_id or f"{args.date}_etf_pool"
-    run_dir = paths.outputs / "automations" / "etf_pool" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    all_results = []
-    evaluations = []
-    candidate_specs: list[tuple[str, str | None]] = [("base", None)]
-    candidate_specs.extend((f"add_{symbol}", symbol) for symbol in candidates)
-
-    for pool_label, candidate_symbol in candidate_specs:
-        pool = candidate_pool_frame(base_universe, candidate_symbol, names)
-        symbols = set(pool["symbol"].astype(str))
-        pool_factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
-        results = optimization_grid_results(
-            strategy="sector-factor-threshold",
-            daily=daily,
-            factors=pool_factors,
-            symbols=symbols,
-            start=start,
-            end=end,
-            top_ns=parse_int_list(args.top_n),
-            fee_rates=parse_float_list(args.fee_rate),
-            sharpe_windows=sharpe_windows,
-            factor_lower_bounds=parse_float_list(args.factor_lower_bound),
-            corr_windows=parse_int_list(args.corr_window),
-            corr_thresholds=parse_float_list(args.corr_threshold),
-            stop_loss_pcts=parse_float_list(args.stop_loss_pct),
-            constraint=args.constraint,
-        )
-        if results.empty:
-            raise ValueError(f"No optimization results generated for pool {pool_label}")
-        results = sort_optimization_results(results, args.objective, args.constraint)
-        results.insert(0, "pool_label", pool_label)
-        results.insert(1, "added_symbol", candidate_symbol)
-        all_results.append(results)
-
-        best = results.iloc[0].to_dict()
-        best["pool_size"] = len(pool)
-        evaluations.append(best)
-        pool.to_csv(run_dir / f"{pool_label}_universe.csv", index=False)
-
-    evaluation_frame = pd.DataFrame(evaluations)
-    evaluation_frame = sort_optimization_results(evaluation_frame, args.objective, args.constraint)
-    details = pd.concat(all_results, ignore_index=True)
-    details.to_csv(run_dir / "all_results.csv", index=False)
-    evaluation_frame.to_csv(run_dir / "evaluations.csv", index=False)
-
-    best = evaluation_frame.iloc[0].to_dict()
-    selected_label = str(best["pool_label"])
-    selected_candidate = best.get("added_symbol")
-    selected_candidate = None if pd.isna(selected_candidate) else str(selected_candidate)
-    selected_universe = candidate_pool_frame(base_universe, selected_candidate, names)
-    selected_universe.to_csv(run_dir / "selected_universe.csv", index=False)
-    (run_dir / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
-
-    if args.apply:
-        current_path = write_table(base_universe, run_dir / "universe_before")
-        selected_path = write_table(selected_universe, universe_table_base(paths, args.universe_name))
-        print(f"backed up previous universe to {current_path}")
-        print(f"updated universe to {selected_path}")
-
-    print(f"wrote ETF pool automation outputs to {run_dir}")
-    if args.constraint != "none" and not bool(best["valid"]):
-        print(f"no pool satisfied constraint: {args.constraint}")
-    print(evaluation_frame.head(min(len(evaluation_frame), args.show)).to_string(index=False))
-
-
 def command_report_build(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
@@ -592,7 +466,8 @@ def command_recommend_today(args: argparse.Namespace) -> None:
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
     daily = read_daily(paths)
     factors = ensure_sharpe_factor_columns(factors, daily, config_sharpe_windows(config))
-    symbols = universe_symbols(paths, args.universe_name)
+    universe = load_strategy_universe(args)
+    symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     selected, _ = select_for_strategy(
         args.strategy,
@@ -622,7 +497,8 @@ def build_parser() -> argparse.ArgumentParser:
     data_update.add_argument("--start", required=True)
     data_update.add_argument("--end", required=True)
     data_update.add_argument("--universe")
-    data_update.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
+    data_update.add_argument("--universe-name", default="default")
+    data_update.add_argument("--min-fund-size", type=float)
     data_update.add_argument("--adjust")
     data_update.set_defaults(func=command_data_update)
 
@@ -640,7 +516,8 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_run.add_argument("--start", required=True)
     backtest_run.add_argument("--end", required=True)
     backtest_run.add_argument("--strategy", choices=STRATEGY_CHOICES, default="multifactor")
-    backtest_run.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
+    backtest_run.add_argument("--universe", required=True)
+    backtest_run.add_argument("--universe-name", default="default")
     backtest_run.add_argument("--top-n", type=int)
     backtest_run.add_argument("--fee-rate", type=float)
     backtest_run.add_argument("--sharpe-window", type=int)
@@ -657,7 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid.add_argument("--start", required=True)
     optimize_grid.add_argument("--end", required=True)
     optimize_grid.add_argument("--strategy", choices=STRATEGY_CHOICES, default="sharpe-single")
-    optimize_grid.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
+    optimize_grid.add_argument("--universe", required=True)
+    optimize_grid.add_argument("--universe-name", default="default")
     optimize_grid.add_argument("--top-n", default="3,5,10")
     optimize_grid.add_argument("--fee-rate", default="0.0003,0.001")
     optimize_grid.add_argument("--sharpe-window", default="20,25,60,120")
@@ -671,34 +549,13 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid.add_argument("--show", type=int, default=5)
     optimize_grid.set_defaults(func=command_optimize_grid)
 
-    automation = sub.add_parser("automation")
-    automation_sub = automation.add_subparsers(dest="command", required=True)
-    etf_pool = automation_sub.add_parser("etf-pool")
-    etf_pool.add_argument("--date", required=True)
-    etf_pool.add_argument("--candidates", required=True)
-    etf_pool.add_argument("--start", required=True)
-    etf_pool.add_argument("--end", required=True)
-    etf_pool.add_argument("--universe-name", choices=available_universe_names(), default=SECTOR_ROTATION_UNIVERSE_NAME)
-    etf_pool.add_argument("--top-n", default="4,5,6")
-    etf_pool.add_argument("--fee-rate", default="0.0003")
-    etf_pool.add_argument("--sharpe-window", default="15,20,25,30,35")
-    etf_pool.add_argument("--factor-lower-bound", default="-1.0,-0.5,0.0,0.5,1.0")
-    etf_pool.add_argument("--corr-window", default="100")
-    etf_pool.add_argument("--corr-threshold", default="0.9")
-    etf_pool.add_argument("--stop-loss-pct", default="0.1")
-    etf_pool.add_argument("--objective", default="sortino")
-    etf_pool.add_argument("--constraint", choices=OPTIMIZATION_CONSTRAINT_CHOICES, default="drawdown-lt-return")
-    etf_pool.add_argument("--run-id")
-    etf_pool.add_argument("--show", type=int, default=4)
-    etf_pool.add_argument("--apply", action="store_true")
-    etf_pool.set_defaults(func=command_automation_etf_pool)
-
     recommend = sub.add_parser("recommend")
     recommend_sub = recommend.add_subparsers(dest="command", required=True)
     recommend_today = recommend_sub.add_parser("today")
     recommend_today.add_argument("--date", required=True)
     recommend_today.add_argument("--strategy", choices=STRATEGY_CHOICES, default="multifactor")
-    recommend_today.add_argument("--universe-name", choices=available_universe_names(), default=LARGE_ETF_UNIVERSE_NAME)
+    recommend_today.add_argument("--universe", required=True)
+    recommend_today.add_argument("--universe-name", default="default")
     recommend_today.add_argument("--top-n", type=int)
     recommend_today.add_argument("--fee-rate", type=float)
     recommend_today.add_argument("--sharpe-window", type=int)
