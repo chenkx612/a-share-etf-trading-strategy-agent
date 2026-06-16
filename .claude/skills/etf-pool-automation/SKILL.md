@@ -1,6 +1,6 @@
 ---
 name: etf-pool-automation
-description: Select large A-share ETF candidates with keyword pre-filtering, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the ranked-threshold-corr strategy, select/apply the best pool, and output same-day recommendations from the best pool and parameters.
+description: Select large A-share ETF candidates with keyword review flags, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the ranked-threshold-corr strategy, select/apply the best pool, and output same-day recommendations from the best pool and parameters.
 argument-hint: "[--date YYYY-MM-DD] [--apply] [optional candidate1[:name],candidate2[:name],candidate3[:name] override]"
 ---
 
@@ -31,12 +31,15 @@ DATA_ROOT="."
    - Filter ETF fund size >= 10,000,000,000 CNY using `总市值` when available, otherwise `流通市值`.
    - Rank by AKShare spot field `涨跌幅`; do not fetch daily bars just to calculate the same-day return.
    - Exclude ETFs already present in the original `sector-rotation` pool. User-supplied candidates must also pass this check.
-   - The script's `theme` field is only a keyword pre-filter, not final de-duplication.
+   - Treat exact normalized ETF exposure Chinese-name matches with the original `sector-rotation` pool as script-level duplicates. Normalize by removing whitespace and comparing the text before `ETF`; for example `通信ETF华夏` duplicates base `通信ETF`, and `纳指ETF广发` duplicates base `纳指ETF`. Base-pool Chinese names must be stored directly in `references/sector_rotation_universe.csv`; do not import names from another local project.
+   - After removing base-pool symbol/name duplicates, keep only the highest same-day-return ETF for each normalized ETF exposure Chinese name.
+   - Keep keyword/theme matches as AI review flags only. The script marks shortlist rows with `theme`, `base_theme_overlap`, and `base_theme_matches`, but these fields must not hard-reject candidates.
 4. Always run candidate discovery with `select_etf_candidates.py` first and stop for AI semantic de-duplication review before the full automation run, unless the user supplied exactly three reviewed candidates.
    - Read `${RUN_DIR}/candidate_selected.csv` and `${RUN_DIR}/candidate_shortlist.csv`.
-   - Start from the script-selected candidates, then use ETF names/themes to judge whether any are semantically duplicate exposures, such as several semiconductor, AI/computer, broad-index, or new-energy variants.
+   - Start from the script-selected candidates, then use ETF names/themes and `base_theme_matches` to judge whether any candidate duplicates either another candidate or an ETF already in the base pool, such as several semiconductor, AI/computer, broad-index, or new-energy variants.
    - Keep at most one ETF per clearly duplicated exposure.
-   - When a duplicate is removed, scan `${RUN_DIR}/candidate_shortlist.csv` in descending `return_pct` order and take the next non-base-pool ETF that is not semantically duplicate with the kept candidates.
+   - Use `base_theme_overlap=true` as a warning flag, not a hard rejection. Keep or remove those candidates based on AI semantic review.
+   - When a duplicate is removed, scan `${RUN_DIR}/candidate_shortlist.csv` in descending `return_pct` order and take the next non-base-pool ETF that is not semantically duplicate with the base pool or the kept candidates.
    - End with exactly three reviewed candidate symbols and pass them through `run_etf_pool_automation.py --candidates`, even if the reviewed list is unchanged from the script-selected list.
 5. Use a three-year backtest window by default: `--start` defaults to three years before `TRADE_DATE`. Override only if the user explicitly asks.
 6. Dry-run by default; add `--apply` only when requested.
@@ -83,7 +86,7 @@ Data refresh only checks the existing local daily table under `DATA_ROOT`; there
 
 ## Script Responsibilities
 
-- `select_etf_candidates.py`: independently runnable candidate discovery command; fetch AKShare ETF spot rows, filter large ETFs not already in the original pool, rank by `涨跌幅`, apply keyword-based theme pre-filtering, create candidate shortlist/selection, and write temporary files needed by the runner.
+- `select_etf_candidates.py`: independently runnable candidate discovery command; fetch AKShare ETF spot rows, filter large ETFs not already in the original pool, rank by `涨跌幅`, skip script-level normalized ETF exposure Chinese-name duplicates, add keyword/theme review flags, create candidate shortlist/selection, and write temporary files needed by the runner.
 - `run_etf_pool_automation.py`: full automation command only; read the Stage 1 shortlist, accept the AI-reviewed candidate list through `--candidates`, rebuild selected candidate artifacts, clear the reusable output directory for the full run, strictly backfill recent data for the expanded and selected universes, use a temporary recommendation workspace, generate recommendations for the latest complete selected-universe trading date on or before the requested date, write `automation_summary.json`, update `references/sector_rotation_universe.csv` only when `--apply` is passed, and remove runner-only intermediate files after a full run.
 
 Avoid manually reconstructing command lines from `best.json` unless the runner fails and the failure has been diagnosed. Empty recommendation output is a runner failure, not a successful no-pick result.

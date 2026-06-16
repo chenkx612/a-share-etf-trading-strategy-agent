@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -53,6 +54,21 @@ class CandidateRow:
     return_pct: float
     theme: str
     in_base_pool: bool
+    base_theme_overlap: bool = False
+    base_theme_matches: str = ""
+    base_name_duplicate: bool = False
+
+
+def normalized_chinese_name(name: object) -> str:
+    return re.sub(r"\s+", "", str(name)).strip()
+
+
+def normalized_etf_exposure_name(name: object) -> str:
+    normalized = normalized_chinese_name(name)
+    match = re.search(r"ETF", normalized, flags=re.IGNORECASE)
+    if match:
+        return normalized[: match.start()]
+    return normalized
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,11 +91,8 @@ def parse_args() -> argparse.Namespace:
 def load_base_pool(base_universe: str) -> pd.DataFrame:
     frame = pd.read_csv(base_universe)
     frame["symbol"] = frame["symbol"].astype(str)
+    frame["name"] = frame["name"].astype(str)
     return frame
-
-
-def base_pool_symbols(base_universe: str) -> set[str]:
-    return set(load_base_pool(base_universe)["symbol"].astype(str))
 
 
 def theme_for(name: str) -> str:
@@ -88,6 +101,19 @@ def theme_for(name: str) -> str:
         if any(keyword.upper() in upper_name for keyword in keywords):
             return theme
     return "other"
+
+
+def base_theme_matches(base_pool: pd.DataFrame) -> dict[str, str]:
+    if base_pool.empty:
+        return {}
+    frame = base_pool.copy()
+    frame["name"] = frame["name"].astype(str)
+    frame["theme"] = frame["name"].map(theme_for)
+    frame = frame[frame["theme"] != "other"]
+    matches: dict[str, list[str]] = {}
+    for row in frame.itertuples(index=False):
+        matches.setdefault(str(row.theme), []).append(f"{row.symbol}:{row.name}")
+    return {theme: ";".join(values) for theme, values in matches.items()}
 
 
 def to_json_number(value: object) -> float | None:
@@ -100,11 +126,19 @@ def candidate_rows(args: argparse.Namespace) -> list[CandidateRow]:
     frame = normalize_spot_frame(fetch_spot(), args.date)
     frame = frame[(frame["fund_size"] >= args.min_fund_size) & frame["return_pct"].notna()].copy()
     frame["theme"] = frame["name"].astype(str).map(theme_for)
-    base_symbols = base_pool_symbols(args.base_universe)
+    base_pool = load_base_pool(args.base_universe)
+    base_symbols = set(base_pool["symbol"].astype(str))
+    base_exposure_names = {
+        normalized_etf_exposure_name(name)
+        for name in base_pool["name"]
+        if normalized_etf_exposure_name(name)
+    }
+    theme_matches = base_theme_matches(base_pool)
 
     rows: list[CandidateRow] = []
     for item in frame.itertuples(index=False):
         symbol = str(item.symbol)
+        theme = str(item.theme)
         rows.append(
             CandidateRow(
                 symbol=symbol,
@@ -113,32 +147,32 @@ def candidate_rows(args: argparse.Namespace) -> list[CandidateRow]:
                 date=str(item.data_date),
                 latest_price=to_json_number(item.latest_price),
                 return_pct=float(item.return_pct),
-                theme=str(item.theme),
+                theme=theme,
                 in_base_pool=symbol in base_symbols,
+                base_theme_overlap=theme in theme_matches,
+                base_theme_matches=theme_matches.get(theme, ""),
+                base_name_duplicate=normalized_etf_exposure_name(item.name) in base_exposure_names,
             )
         )
     return sorted(rows, key=lambda row: row.return_pct, reverse=True)
 
 
 def select_diversified(rows: list[CandidateRow], count: int) -> list[CandidateRow]:
+    return script_deduplicated_rows(rows)[:count]
+
+
+def script_deduplicated_rows(rows: list[CandidateRow]) -> list[CandidateRow]:
     selected: list[CandidateRow] = []
-    used_themes: set[str] = set()
-    eligible = [row for row in rows if not row.in_base_pool]
+    used_names: set[str] = set()
+    eligible = [row for row in rows if not row.in_base_pool and not row.base_name_duplicate]
 
     for row in eligible:
-        if row.theme in used_themes:
+        name = normalized_etf_exposure_name(row.name)
+        if name and name in used_names:
             continue
         selected.append(row)
-        used_themes.add(row.theme)
-        if len(selected) == count:
-            return selected
-
-    for row in eligible:
-        if row.symbol in {selected_row.symbol for selected_row in selected}:
-            continue
-        selected.append(row)
-        if len(selected) == count:
-            return selected
+        if name:
+            used_names.add(name)
 
     return selected
 
@@ -149,7 +183,7 @@ def parse_candidates(value: str) -> list[str]:
 
 def resolve_selected(args: argparse.Namespace, rows: list[CandidateRow]) -> list[CandidateRow]:
     if not args.candidates:
-        return select_diversified(rows[: args.top_shortlist], args.count)
+        return select_diversified(rows, args.count)
 
     symbols = parse_candidates(args.candidates)
     if len(symbols) != args.count:
@@ -161,6 +195,12 @@ def resolve_selected(args: argparse.Namespace, rows: list[CandidateRow]) -> list
     in_base = [symbol for symbol in symbols if by_symbol[symbol].in_base_pool]
     if in_base:
         raise RuntimeError(f"Candidate symbols already exist in the original sector-rotation pool: {in_base}")
+    base_name_duplicates = [symbol for symbol in symbols if by_symbol[symbol].base_name_duplicate]
+    if base_name_duplicates:
+        raise RuntimeError(
+            "Candidate symbols duplicate original sector-rotation pool ETF Chinese names: "
+            f"{base_name_duplicates}"
+        )
     return [by_symbol[symbol] for symbol in symbols]
 
 
@@ -177,7 +217,7 @@ def write_outputs(args: argparse.Namespace, rows: list[CandidateRow]) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    shortlist = rows[: args.top_shortlist]
+    shortlist = script_deduplicated_rows(rows)[: args.top_shortlist]
     selected = resolve_selected(args, rows)
     if len(selected) != args.count:
         raise RuntimeError(f"Only selected {len(selected)} candidates; expected {args.count}")

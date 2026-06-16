@@ -21,6 +21,9 @@ from quant_core.data.universe import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_SCRIPT_DIR = REPO_ROOT / ".claude" / "skills" / "etf-pool-automation" / "scripts"
+TEST_DATE = "2026-06-12"
+TEST_DAY = date(2026, 6, 12)
+TEST_END_DAY = date(2026, 6, 14)
 
 
 def load_skill_script(script_name: str):
@@ -41,13 +44,13 @@ def test_resolve_complete_universe_date_requires_complete_universe() -> None:
     daily = pd.DataFrame([
         {"date": "2026-06-11", "symbol": "510300"},
         {"date": "2026-06-11", "symbol": "510500"},
-        {"date": "2026-06-12", "symbol": "510300"},
+        {"date": TEST_DATE, "symbol": "510300"},
     ])
 
     recommendation_date = resolve_complete_universe_date(
         daily,
         universe,
-        "2026-06-12",
+        TEST_DATE,
     )
 
     assert recommendation_date == "2026-06-11"
@@ -59,14 +62,14 @@ def test_resolve_complete_universe_date_fails_when_no_complete_date() -> None:
         {"symbol": "510500", "name": "b"},
     ])
     daily = pd.DataFrame([
-        {"date": "2026-06-12", "symbol": "510300"},
+        {"date": TEST_DATE, "symbol": "510300"},
     ])
 
     with pytest.raises(RuntimeError, match="No complete recommendation date"):
         resolve_complete_universe_date(
             daily,
             universe,
-            "2026-06-12",
+            TEST_DATE,
         )
 
 
@@ -76,12 +79,12 @@ def test_normalize_spot_frame_maps_provider_columns() -> None:
         {"代码": "512760", "名称": "芯片ETF", "涨跌幅": "3.5", "总市值": 30_000_000_000, "最新价": "1.0"},
     ])
 
-    frame = normalize_spot_frame(spot, trade_date="2026-06-12")
+    frame = normalize_spot_frame(spot, trade_date=TEST_DATE)
 
     assert frame["symbol"].tolist() == ["510300", "512760"]
     assert frame["return_pct"].tolist() == [1.2, 3.5]
     assert frame["fund_size"].tolist() == [20_000_000_000, 30_000_000_000]
-    assert frame["data_date"].tolist() == ["2026-06-12", "2026-06-12"]
+    assert frame["data_date"].tolist() == [TEST_DATE, TEST_DATE]
 
 
 def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
@@ -94,6 +97,176 @@ def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
     assert runner.run_dir(Path(runner.DEFAULT_ROOT), "reviewed") == Path(
         ".claude/skills/etf-pool-automation/outputs/reviewed"
     )
+
+
+def test_selector_loads_base_chinese_names_from_skill_reference_csv(tmp_path: Path) -> None:
+    selector = load_skill_script("select_etf_candidates")
+    base_path = tmp_path / "sector_rotation_universe.csv"
+    pd.DataFrame([
+        {"symbol": "159915", "name": "创业板", "fund_size": pd.NA},
+        {"symbol": "512800", "name": "银行ETF", "fund_size": pd.NA},
+    ]).to_csv(base_path, index=False)
+
+    base = selector.load_base_pool(base_path)
+
+    assert base["symbol"].tolist() == ["159915", "512800"]
+    assert base["name"].tolist() == ["创业板", "银行ETF"]
+    assert "semantic_name" not in base.columns
+
+
+def test_selector_allows_keyword_theme_overlap_for_ai_review() -> None:
+    selector = load_skill_script("select_etf_candidates")
+    rows = [
+        selector.CandidateRow(
+            symbol="512800",
+            name="银行ETF",
+            fund_size=30_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=5.0,
+            theme="finance",
+            in_base_pool=False,
+            base_theme_overlap=True,
+            base_theme_matches="512800:银行ETF",
+        ),
+        selector.CandidateRow(
+            symbol="159530",
+            name="机器人ETF",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=4.0,
+            theme="robotics",
+            in_base_pool=False,
+        ),
+        selector.CandidateRow(
+            symbol="159766",
+            name="旅游ETF",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=3.0,
+            theme="consumer",
+            in_base_pool=False,
+        ),
+    ]
+
+    selected = selector.select_diversified(rows, count=2)
+
+    assert [row.symbol for row in selected] == ["512800", "159530"]
+
+
+def test_selector_normalizes_etf_exposure_name_before_base_deduplication() -> None:
+    selector = load_skill_script("select_etf_candidates")
+
+    assert selector.normalized_etf_exposure_name("通信ETF华夏") == "通信"
+    assert selector.normalized_etf_exposure_name("纳指ETF广发") == "纳指"
+    assert selector.normalized_etf_exposure_name(" 纳指ETF ") == "纳指"
+    assert selector.normalized_etf_exposure_name("创业板") == "创业板"
+
+
+def test_selector_deduplicates_base_and_candidate_exposure_names() -> None:
+    selector = load_skill_script("select_etf_candidates")
+    rows = [
+        selector.CandidateRow(
+            symbol="515880",
+            name="通信ETF华夏",
+            fund_size=30_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=7.0,
+            theme="other",
+            in_base_pool=False,
+            base_name_duplicate=True,
+        ),
+        selector.CandidateRow(
+            symbol="159501",
+            name="纳指ETF广发",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=6.0,
+            theme="overseas",
+            in_base_pool=False,
+            base_name_duplicate=True,
+        ),
+        selector.CandidateRow(
+            symbol="512801",
+            name="银行ETF华夏",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=5.0,
+            theme="finance",
+            in_base_pool=False,
+        ),
+        selector.CandidateRow(
+            symbol="512802",
+            name="银行ETF易方达",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=4.0,
+            theme="finance",
+            in_base_pool=False,
+        ),
+        selector.CandidateRow(
+            symbol="159766",
+            name="旅游ETF",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=3.0,
+            theme="consumer",
+            in_base_pool=False,
+        ),
+    ]
+
+    deduplicated = selector.script_deduplicated_rows(rows)
+    selected = selector.select_diversified(rows, count=2)
+
+    assert [row.symbol for row in deduplicated] == ["512801", "159766"]
+    assert [row.symbol for row in selected] == ["512801", "159766"]
+
+
+def test_selector_default_selection_fills_after_script_deduplication() -> None:
+    selector = load_skill_script("select_etf_candidates")
+    rows = [
+        selector.CandidateRow(
+            symbol="512801",
+            name="银行ETF华夏",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=5.0,
+            theme="finance",
+            in_base_pool=False,
+        ),
+        selector.CandidateRow(
+            symbol="512802",
+            name="银行ETF易方达",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=4.0,
+            theme="finance",
+            in_base_pool=False,
+        ),
+        selector.CandidateRow(
+            symbol="159766",
+            name="旅游ETF",
+            fund_size=20_000_000_000,
+            date=TEST_DATE,
+            latest_price=1.0,
+            return_pct=3.0,
+            theme="consumer",
+            in_base_pool=False,
+        ),
+    ]
+
+    selected = selector.resolve_selected(argparse.Namespace(candidates=None, top_shortlist=2, count=2), rows)
+
+    assert [row.symbol for row in selected] == ["512801", "159766"]
 
 
 def test_runner_requires_reviewed_candidates_for_full_automation() -> None:
@@ -115,7 +288,7 @@ def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
             "symbol": "512760",
             "name": "芯片ETF",
             "fund_size": 20_000_000_000,
-            "date": "2026-06-12",
+            "date": TEST_DATE,
             "latest_price": 1.0,
             "return_pct": 3.0,
             "theme": "semiconductor",
@@ -125,7 +298,7 @@ def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
             "symbol": "515050",
             "name": "5GETF",
             "fund_size": 15_000_000_000,
-            "date": "2026-06-12",
+            "date": TEST_DATE,
             "latest_price": 1.0,
             "return_pct": 2.0,
             "theme": "other",
@@ -135,7 +308,7 @@ def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
             "symbol": "512800",
             "name": "银行ETF",
             "fund_size": 30_000_000_000,
-            "date": "2026-06-12",
+            "date": TEST_DATE,
             "latest_price": 1.0,
             "return_pct": 1.0,
             "theme": "finance",
@@ -156,7 +329,7 @@ def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
     state = runner.prepare_reviewed_candidates(
         argparse.Namespace(
             candidates="512760,515050,512800",
-            date="2026-06-12",
+            date=TEST_DATE,
             data_root=".",
         ),
         tmp_path,
@@ -166,6 +339,70 @@ def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
     assert state["payload"]["manual_override"] is True
     assert state["selected"]["symbol"].tolist() == ["512760", "515050", "512800"]
     assert state["expanded"]["symbol"].tolist() == ["159915", "512760", "515050", "512800"]
+
+
+def test_runner_allows_reviewed_candidates_with_base_theme_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    pd.DataFrame([
+        {
+            "symbol": "512760",
+            "name": "芯片ETF",
+            "fund_size": 20_000_000_000,
+            "date": TEST_DATE,
+            "latest_price": 1.0,
+            "return_pct": 3.0,
+            "theme": "semiconductor",
+            "in_base_pool": False,
+            "base_theme_overlap": True,
+            "base_theme_matches": "588170:科创半导体ETF",
+        },
+        {
+            "symbol": "515050",
+            "name": "5GETF",
+            "fund_size": 15_000_000_000,
+            "date": TEST_DATE,
+            "latest_price": 1.0,
+            "return_pct": 2.0,
+            "theme": "other",
+            "in_base_pool": False,
+            "base_theme_overlap": False,
+            "base_theme_matches": "",
+        },
+        {
+            "symbol": "159530",
+            "name": "机器人ETF",
+            "fund_size": 15_000_000_000,
+            "date": TEST_DATE,
+            "latest_price": 1.0,
+            "return_pct": 1.0,
+            "theme": "robotics",
+            "in_base_pool": False,
+            "base_theme_overlap": False,
+            "base_theme_matches": "",
+        },
+    ]).to_csv(tmp_path / "candidate_shortlist.csv", index=False)
+    monkeypatch.setattr(
+        runner,
+        "load_base_pool",
+        lambda: pd.DataFrame([{"symbol": "159915", "name": "cyb", "fund_size": pd.NA}]),
+    )
+
+    state = runner.prepare_reviewed_candidates(
+        argparse.Namespace(
+            candidates="512760,515050,159530",
+            date=TEST_DATE,
+            data_root=".",
+        ),
+        tmp_path,
+    )
+
+    assert state["payload"]["candidate_arg"] == "512760,515050,159530"
+    assert state["selected"]["symbol"].tolist() == ["512760", "515050", "159530"]
+    assert bool(state["selected"].loc[0, "base_theme_overlap"]) is True
+    assert state["selected"].loc[0, "base_theme_matches"] == "588170:科创半导体ETF"
 
 
 def test_data_update_does_not_create_outputs_directory(
@@ -181,7 +418,7 @@ def test_data_update_does_not_create_outputs_directory(
     )
     daily = pd.DataFrame([
         {
-            "date": pd.Timestamp("2026-06-12"),
+            "date": pd.Timestamp(TEST_DATE),
             "symbol": "510300",
             "name": "沪深300ETF",
             "open": 1.0,
@@ -205,14 +442,14 @@ def test_data_update_does_not_create_outputs_directory(
     monkeypatch.setattr(
         cli_module,
         "fetch_daily_if_stale",
-        lambda *args, **kwargs: (daily, date(2026, 6, 12)),
+        lambda *args, **kwargs: (daily, TEST_DAY),
     )
 
     cli_module.command_data_update(
         argparse.Namespace(
             root=str(tmp_path),
-            start="2026-06-12",
-            end="2026-06-12",
+            start=TEST_DATE,
+            end=TEST_DATE,
             universe=str(universe_path),
             universe_name="sector-rotation",
             min_fund_size=None,
@@ -235,18 +472,18 @@ def test_recommendation_outputs_are_copied_directly_to_automation_dir(tmp_path: 
     recommendation_dir.mkdir(parents=True)
     factors_dir.mkdir(parents=True)
     automation_dir.mkdir(parents=True)
-    pd.DataFrame([{"date": "2026-06-12", "symbol": "510300", "score": 1.0}]).to_csv(
-        recommendation_dir / "2026-06-12_sector-rotation.csv",
+    pd.DataFrame([{"date": TEST_DATE, "symbol": "510300", "score": 1.0}]).to_csv(
+        recommendation_dir / f"{TEST_DATE}_sector-rotation.csv",
         index=False,
     )
-    pd.DataFrame([{"date": "2026-06-12", "symbol": "510300", "momentum_20": 0.1}]).to_csv(
+    pd.DataFrame([{"date": TEST_DATE, "symbol": "510300", "momentum_20": 0.1}]).to_csv(
         factors_dir / "factors.csv",
         index=False,
     )
 
-    destination = runner.copy_recommend_outputs(rec_root, automation_dir, "2026-06-12")
+    destination = runner.copy_recommend_outputs(rec_root, automation_dir, TEST_DATE)
 
-    assert destination == automation_dir / "recommendation_2026-06-12_sector-rotation.csv"
+    assert destination == automation_dir / f"recommendation_{TEST_DATE}_sector-rotation.csv"
     assert destination.exists()
     assert not (automation_dir / "recommendation_factors.csv").exists()
     assert not (automation_dir / "outputs").exists()
@@ -307,10 +544,10 @@ def test_apply_recommendations_use_temporary_workspace(
             start="2026-01-01",
         ),
         automation_dir,
-        "2026-06-12",
+        TEST_DATE,
     )
 
-    assert destination == automation_dir / "recommendation_2026-06-12_sector-rotation.csv"
+    assert destination == automation_dir / f"recommendation_{TEST_DATE}_sector-rotation.csv"
     assert roots == [str(rec_root), str(rec_root)]
     assert not (data_root / "outputs").exists()
 
@@ -319,7 +556,7 @@ def test_cleanup_intermediate_outputs_keeps_only_summary_recommendation_and_appl
     runner = load_skill_script("run_etf_pool_automation")
     for filename in [
         "automation_summary.json",
-        "recommendation_2026-06-12_sector-rotation.csv",
+        f"recommendation_{TEST_DATE}_sector-rotation.csv",
         "universe_before.csv",
         "candidate_selected.json",
         "candidate_selected.csv",
@@ -340,18 +577,18 @@ def test_cleanup_intermediate_outputs_keeps_only_summary_recommendation_and_appl
 
     assert sorted(path.name for path in tmp_path.iterdir()) == [
         "automation_summary.json",
-        "recommendation_2026-06-12_sector-rotation.csv",
+        f"recommendation_{TEST_DATE}_sector-rotation.csv",
         "universe_before.csv",
     ]
 
 
 def test_fetch_daily_if_stale_skips_when_latest_trade_date_is_covered(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     provider = AkshareETFProvider(adjust="qfq")
     universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
     existing = pd.DataFrame([
         {
-            "date": pd.Timestamp("2026-06-12"),
+            "date": pd.Timestamp(TEST_DATE),
             "symbol": "510300",
             "name": "沪深300ETF",
             "open": 1.0,
@@ -372,21 +609,21 @@ def test_fetch_daily_if_stale_skips_when_latest_trade_date_is_covered(monkeypatc
     incoming, target_trade_date = fetch_daily_if_stale(
         provider,
         universe,
-        date(2026, 6, 12),
-        date(2026, 6, 14),
+        TEST_DAY,
+        TEST_END_DAY,
         existing=existing,
         fetch_one=fetch_one,
     )
 
     assert incoming.empty
-    assert target_trade_date == date(2026, 6, 12)
+    assert target_trade_date == TEST_DAY
     assert calls == []
 
 
 def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_date_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     provider = AkshareETFProvider(adjust="qfq")
     universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
     existing = pd.DataFrame([
@@ -409,7 +646,7 @@ def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_dat
         calls.append((start, end))
         return pd.DataFrame([
             {
-                "date": pd.Timestamp("2026-06-12"),
+                "date": pd.Timestamp(TEST_DATE),
                 "symbol": "510300",
                 "name": "沪深300ETF",
                 "open": 1.0,
@@ -426,20 +663,20 @@ def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_dat
         provider,
         universe,
         date(2010, 1, 1),
-        date(2026, 6, 14),
+        TEST_END_DAY,
         existing=existing,
         fetch_one=fetch_one,
     )
 
     assert not incoming.empty
-    assert target_trade_date == date(2026, 6, 12)
-    assert calls == [(date(2021, 6, 14), date(2026, 6, 14))]
+    assert target_trade_date == TEST_DAY
+    assert calls == [(date(2021, 6, 14), TEST_END_DAY)]
 
 
 def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     provider = AkshareETFProvider(adjust="qfq")
     universe = pd.DataFrame([
         {"symbol": "510300", "name": "沪深300ETF"},
@@ -447,7 +684,7 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
     ])
     existing = pd.DataFrame([
         {
-            "date": pd.Timestamp("2026-06-12"),
+            "date": pd.Timestamp(TEST_DATE),
             "symbol": "510500",
             "name": "中证500ETF",
             "open": 1.0,
@@ -465,7 +702,7 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
         fetched_symbols.extend(single["symbol"].astype(str).tolist())
         return pd.DataFrame([
             {
-                "date": pd.Timestamp("2026-06-12"),
+                "date": pd.Timestamp(TEST_DATE),
                 "symbol": "510300",
                 "name": "沪深300ETF",
                 "open": 1.0,
@@ -482,18 +719,18 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
         provider,
         universe,
         date(2026, 1, 1),
-        date(2026, 6, 14),
+        TEST_END_DAY,
         existing=existing,
         fetch_one=fetch_one,
     )
 
-    assert target_trade_date == date(2026, 6, 12)
+    assert target_trade_date == TEST_DAY
     assert fetched_symbols == ["510300"]
     assert incoming["symbol"].tolist() == ["510300"]
 
 
 def test_fetch_daily_if_stale_refuses_partial_provider_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: date(2026, 6, 12))
+    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     provider = AkshareETFProvider(adjust="qfq")
     universe = pd.DataFrame([
         {"symbol": "510300", "name": "沪深300ETF"},
@@ -503,7 +740,7 @@ def test_fetch_daily_if_stale_refuses_partial_provider_refresh(monkeypatch: pyte
     def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
         return pd.DataFrame([
             {
-                "date": pd.Timestamp("2026-06-12"),
+                "date": pd.Timestamp(TEST_DATE),
                 "symbol": "510300",
                 "name": "沪深300ETF",
                 "open": 1.0,
@@ -521,7 +758,7 @@ def test_fetch_daily_if_stale_refuses_partial_provider_refresh(monkeypatch: pyte
             provider,
             universe,
             date(2026, 1, 1),
-            date(2026, 6, 14),
+            TEST_END_DAY,
             existing=None,
             fetch_one=fetch_one,
         )

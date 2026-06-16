@@ -170,6 +170,16 @@ def prepare_reviewed_candidates(args: argparse.Namespace, automation_dir: Path) 
     ]
     if in_base:
         raise RuntimeError(f"Reviewed candidate symbols already exist in the original sector-rotation pool: {in_base}")
+    base_name_duplicates = [
+        symbol
+        for symbol in symbols
+        if "base_name_duplicate" in by_symbol.columns and csv_bool(by_symbol.loc[symbol].get("base_name_duplicate", False))
+    ]
+    if base_name_duplicates:
+        raise RuntimeError(
+            "Reviewed candidate symbols duplicate original sector-rotation pool ETF Chinese names: "
+            f"{base_name_duplicates}"
+        )
 
     selected = by_symbol.loc[symbols].reset_index(drop=True)
     selected_records = selected.to_dict(orient="records")
