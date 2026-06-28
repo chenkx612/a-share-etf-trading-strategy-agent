@@ -8,8 +8,8 @@ Quant Agent 将量化框架基建和 Claude skill 工作流分开维护。`src/q
 python3 -m quant_core.cli data update --universe path/to/universe.csv --universe-name default --start 2024-01-01 --end 2024-12-31
 python3 -m quant_core.cli factor compute --start 2024-01-01 --end 2024-12-31
 python3 -m quant_core.cli backtest run --universe path/to/universe.csv --start 2024-03-01 --end 2024-12-31 --top-n 10
-python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-single --start 2024-03-01 --end 2024-12-31
-python3 -m quant_core.cli optimize grid --universe path/to/universe.csv --strategy sharpe-single --start 2024-03-01 --end 2024-12-31 --top-n 3,5,10
+python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31
+python3 -m quant_core.cli optimize grid --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31 --top-n 3,5,10
 python3 -m quant_core.cli recommend today --universe path/to/universe.csv --date 2024-12-31 --top-n 10
 ```
 

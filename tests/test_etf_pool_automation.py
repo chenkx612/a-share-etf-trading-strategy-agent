@@ -9,11 +9,10 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-import quant_core.data.universe as universe_module
+import quant_core.data.market_data as market_data_module
 import quant_core.cli as cli_module
-from quant_core.data.etf_spot import normalize_spot_frame
-from quant_core.data.provider import AkshareETFProvider
-from quant_core.data.universe import (
+from quant_core.data.market_data import (
+    AkshareMarketDataClient,
     fetch_daily_if_stale,
     resolve_complete_universe_date,
 )
@@ -73,13 +72,14 @@ def test_resolve_complete_universe_date_fails_when_no_complete_date() -> None:
         )
 
 
-def test_normalize_spot_frame_maps_provider_columns() -> None:
+def test_normalize_spot_frame_maps_market_columns() -> None:
+    selector = load_skill_script("select_etf_candidates")
     spot = pd.DataFrame([
         {"代码": "510300", "名称": "沪深300ETF", "涨跌幅": "1.2", "总市值": 20_000_000_000, "最新价": "4.1"},
         {"代码": "512760", "名称": "芯片ETF", "涨跌幅": "3.5", "总市值": 30_000_000_000, "最新价": "1.0"},
     ])
 
-    frame = normalize_spot_frame(spot, trade_date=TEST_DATE)
+    frame = selector.normalize_spot_frame(spot, trade_date=TEST_DATE)
 
     assert frame["symbol"].tolist() == ["510300", "512760"]
     assert frame["return_pct"].tolist() == [1.2, 3.5]
@@ -278,7 +278,7 @@ def test_runner_requires_reviewed_candidates_for_full_automation() -> None:
     runner.require_reviewed_candidates(argparse.Namespace(candidates="510300,510500,512100"))
 
 
-def test_runner_prepares_reviewed_candidates_from_stage1_shortlist(
+def test_runner_prepares_reviewed_candidates_from_candidate_shortlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -431,14 +431,14 @@ def test_data_update_does_not_create_outputs_directory(
         }
     ])
 
-    class DummyProvider:
+    class DummyMarketDataClient:
         def __init__(self, adjust: str) -> None:
             self.adjust = adjust
 
         def fetch_daily(self, *args: object, **kwargs: object) -> pd.DataFrame:
             raise AssertionError("fetch_daily should be supplied to the stale-fetch helper only")
 
-    monkeypatch.setattr(cli_module, "AkshareETFProvider", DummyProvider)
+    monkeypatch.setattr(cli_module, "AkshareMarketDataClient", DummyMarketDataClient)
     monkeypatch.setattr(
         cli_module,
         "fetch_daily_if_stale",
@@ -452,7 +452,6 @@ def test_data_update_does_not_create_outputs_directory(
             end=TEST_DATE,
             universe=str(universe_path),
             universe_name="sector-rotation",
-            min_fund_size=None,
             adjust=None,
         )
     )
@@ -583,8 +582,7 @@ def test_cleanup_intermediate_outputs_keeps_only_summary_recommendation_and_appl
 
 
 def test_fetch_daily_if_stale_skips_when_latest_trade_date_is_covered(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
-    provider = AkshareETFProvider(adjust="qfq")
+    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
     existing = pd.DataFrame([
         {
@@ -607,7 +605,6 @@ def test_fetch_daily_if_stale_skips_when_latest_trade_date_is_covered(monkeypatc
         return pd.DataFrame()
 
     incoming, target_trade_date = fetch_daily_if_stale(
-        provider,
         universe,
         TEST_DAY,
         TEST_END_DAY,
@@ -623,8 +620,7 @@ def test_fetch_daily_if_stale_skips_when_latest_trade_date_is_covered(monkeypatc
 def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_date_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
-    provider = AkshareETFProvider(adjust="qfq")
+    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
     existing = pd.DataFrame([
         {
@@ -660,7 +656,6 @@ def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_dat
         ])
 
     incoming, target_trade_date = fetch_daily_if_stale(
-        provider,
         universe,
         date(2010, 1, 1),
         TEST_END_DAY,
@@ -676,8 +671,7 @@ def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_dat
 def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
-    provider = AkshareETFProvider(adjust="qfq")
+    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     universe = pd.DataFrame([
         {"symbol": "510300", "name": "沪深300ETF"},
         {"symbol": "510500", "name": "中证500ETF"},
@@ -716,7 +710,6 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
         ])
 
     incoming, target_trade_date = fetch_daily_if_stale(
-        provider,
         universe,
         date(2026, 1, 1),
         TEST_END_DAY,
@@ -729,9 +722,8 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
     assert incoming["symbol"].tolist() == ["510300"]
 
 
-def test_fetch_daily_if_stale_refuses_partial_provider_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(universe_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
-    provider = AkshareETFProvider(adjust="qfq")
+def test_fetch_daily_if_stale_refuses_partial_market_data_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
     universe = pd.DataFrame([
         {"symbol": "510300", "name": "沪深300ETF"},
         {"symbol": "510500", "name": "中证500ETF"},
@@ -755,7 +747,6 @@ def test_fetch_daily_if_stale_refuses_partial_provider_refresh(monkeypatch: pyte
 
     with pytest.raises(RuntimeError, match="missing symbols=\\['510500'\\]"):
         fetch_daily_if_stale(
-            provider,
             universe,
             date(2026, 1, 1),
             TEST_END_DAY,

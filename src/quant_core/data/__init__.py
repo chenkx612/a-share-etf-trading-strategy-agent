@@ -1,3 +1,3 @@
-from quant_core.data.provider import AkshareETFProvider
+from quant_core.data.market_data import AkshareMarketDataClient
 
-__all__ = ["AkshareETFProvider"]
+__all__ = ["AkshareMarketDataClient"]

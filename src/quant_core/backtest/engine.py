@@ -6,8 +6,6 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from quant_core.strategy.selection import selected_to_weight_matrix
-
 
 @dataclass(frozen=True)
 class BacktestResult:
@@ -15,6 +13,25 @@ class BacktestResult:
     equity_curve: pd.DataFrame
     positions: pd.DataFrame
     metrics: dict[str, float]
+
+
+def selected_to_weight_matrix(selected: pd.DataFrame) -> pd.DataFrame:
+    signal_dates = selected.attrs.get("signal_dates")
+    universe_symbols = selected.attrs.get("universe_symbols")
+    if selected.empty:
+        if signal_dates is not None and universe_symbols is not None:
+            return pd.DataFrame(
+                0.0,
+                index=pd.DatetimeIndex(signal_dates),
+                columns=[str(symbol) for symbol in universe_symbols],
+            ).sort_index()
+        return pd.DataFrame()
+    weights = selected.pivot(index="date", columns="symbol", values="target_weight").fillna(0.0).sort_index()
+    if signal_dates is not None:
+        weights = weights.reindex(pd.DatetimeIndex(signal_dates), fill_value=0.0)
+    if universe_symbols is not None:
+        weights = weights.reindex(columns=[str(symbol) for symbol in universe_symbols], fill_value=0.0)
+    return weights.sort_index()
 
 
 def run_backtest(

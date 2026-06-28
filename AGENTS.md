@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/quant_core/` contains the framework package and CLI entry point. Core modules are split by responsibility: `data/` for providers, `factors/` for factor calculation, `strategy/` for selection logic, `backtest/` for simulation, and `reporting/` for generated reports. Shared configuration and path helpers live in `config.py`, `paths.py`, and `storage.py`.
+`src/quant_core/` contains the framework package and CLI entry point. Core modules are split by responsibility: `data/` for market data download/cache and table IO helpers, `factors/` for factor calculation, `strategy/` for selection logic, and `backtest/` for simulation. Shared strategy defaults live in `config.py`, and lightweight report output lives in the CLI.
 
 `tests/` holds pytest coverage for framework behavior. `docs/` contains framework development documentation only; do not put quantitative trading business knowledge there. Skill-specific prompts, knowledge, scripts, templates, stock-pool definitions, and intermediate outputs live under `.claude/skills/<skill-name>/`.
 
@@ -12,7 +12,7 @@
 - `pytest`: run the full test suite.
 - `python3 -m quant_core.cli data update --universe path/to/universe.csv --start 2024-01-01 --end 2024-12-31`: fetch/update ETF daily data.
 - `python3 -m quant_core.cli factor compute --start 2024-01-01 --end 2024-12-31`: compute factor tables.
-- `python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-single --start 2024-03-01 --end 2024-12-31`: run a named strategy backtest.
+- `python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31`: run the Sharpe/correlation/threshold strategy backtest.
 - `python3 -m quant_core.cli --root .claude/skills/etf-pool-automation/outputs/sector_rotation recommend today --universe .claude/skills/etf-pool-automation/outputs/sector_rotation/selected_universe.csv --date 2024-12-31 --top-n 10`: generate skill-scoped recommendations.
 
 ## Coding Style & Naming Conventions

@@ -1,6 +1,6 @@
 ---
 name: etf-pool-automation
-description: Select large A-share ETF candidates with keyword review flags, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the ranked-threshold-corr strategy, select/apply the best pool, and output same-day recommendations from the best pool and parameters.
+description: Select large A-share ETF candidates with keyword review flags, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the sharpe-corr-threshold strategy, select/apply the best pool, and output same-day recommendations from the best pool and parameters.
 argument-hint: "[--date YYYY-MM-DD] [--apply] [optional candidate1[:name],candidate2[:name],candidate3[:name] override]"
 ---
 
@@ -27,9 +27,9 @@ DATA_ROOT="."
 1. Default `TRADE_DATE` to today when `--date` is absent.
 2. Use one reusable output directory, `${RUN_DIR}`. The runner clears it before each run because historical intermediate outputs are not part of the durable result. Only pass a non-default `--run-id` when explicitly comparing separate runs; that creates `${RUN_DIR}/<run-id>`.
 3. Discover candidates automatically unless the user explicitly supplies exactly three candidate ETFs:
-   - Pull AKShare ETF realtime spot data from `fund_etf_spot_em`.
+   - Pull ETF realtime spot data from AKShare `fund_etf_spot_em`; if that endpoint fails, fall back to AKShare ETF symbols plus Tencent quote data.
    - Filter ETF fund size >= 10,000,000,000 CNY using `总市值` when available, otherwise `流通市值`.
-   - Rank by AKShare spot field `涨跌幅`; do not fetch daily bars just to calculate the same-day return.
+   - Rank by realtime spot field `涨跌幅`; do not fetch daily bars just to calculate the same-day return.
    - Exclude ETFs already present in the original `sector-rotation` pool. User-supplied candidates must also pass this check.
    - Treat exact normalized ETF exposure Chinese-name matches with the original `sector-rotation` pool as script-level duplicates. Normalize by removing whitespace and comparing the text before `ETF`; for example `通信ETF华夏` duplicates base `通信ETF`, and `纳指ETF广发` duplicates base `纳指ETF`. Base-pool Chinese names must be stored directly in `references/sector_rotation_universe.csv`; do not import names from another local project.
    - After removing base-pool symbol/name duplicates, keep only the highest same-day-return ETF for each normalized ETF exposure Chinese name.
@@ -80,13 +80,13 @@ python3 .claude/skills/etf-pool-automation/scripts/run_etf_pool_automation.py \
   --apply
 ```
 
-If any candidate is still missing after refresh, stop and report no provider data.
+If any candidate is still missing after refresh, stop and report no market data.
 
-Data refresh only checks the existing local daily table under `DATA_ROOT`; there is no separate skill cache directory. `DATA_ROOT` defaults to the repository root, so daily bars live in the framework-level `data/etf_daily.*` file rather than under `.claude/skills/...`. The sector-rotation pool itself belongs to `references/sector_rotation_universe.csv`, not `data/`. Before requesting provider daily bars, the runner resolves the latest trading date on or before `TRADE_DATE`; symbols already covered for that trading date are skipped. Symbols missing that trading date are refreshed over the full adjusted daily window capped to the most recent five calendar years, because qfq data can be restated. If a requested stale symbol is still missing from the provider result, stop and report no provider data for that symbol.
+Data refresh only checks the existing local daily table under `DATA_ROOT`; there is no separate skill cache directory. `DATA_ROOT` defaults to the repository root, so daily bars live in the framework-level `data/etf_daily.*` file rather than under `.claude/skills/...`. The sector-rotation pool itself belongs to `references/sector_rotation_universe.csv`, not `data/`. Before requesting daily bars, the runner resolves the latest trading date on or before `TRADE_DATE`; symbols already covered for that trading date are skipped. Symbols missing that trading date are refreshed over the full adjusted daily window capped to the most recent five calendar years, because qfq data can be restated. If a requested stale symbol is still missing from the market data result, stop and report no market data for that symbol.
 
 ## Script Responsibilities
 
-- `select_etf_candidates.py`: independently runnable candidate discovery command; fetch AKShare ETF spot rows, filter large ETFs not already in the original pool, rank by `涨跌幅`, skip script-level normalized ETF exposure Chinese-name duplicates, add keyword/theme review flags, create candidate shortlist/selection, and write temporary files needed by the runner.
+- `select_etf_candidates.py`: independently runnable candidate discovery command; fetch ETF spot rows with AKShare first and Tencent quote fallback, filter large ETFs not already in the original pool, rank by `涨跌幅`, skip script-level normalized ETF exposure Chinese-name duplicates, add keyword/theme review flags, create candidate shortlist/selection, and write temporary files needed by the runner.
 - `run_etf_pool_automation.py`: full automation command only; read the Stage 1 shortlist, accept the AI-reviewed candidate list through `--candidates`, rebuild selected candidate artifacts, clear the reusable output directory for the full run, strictly backfill recent data for the expanded and selected universes, use a temporary recommendation workspace, generate recommendations for the latest complete selected-universe trading date on or before the requested date, write `automation_summary.json`, update `references/sector_rotation_universe.csv` only when `--apply` is passed, and remove runner-only intermediate files after a full run.
 
 Avoid manually reconstructing command lines from `best.json` unless the runner fails and the failure has been diagnosed. Empty recommendation output is a runner failure, not a successful no-pick result.

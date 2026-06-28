@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 
@@ -15,10 +14,9 @@ from quant_core.cli import (
     sort_optimization_results,
 )
 from quant_core.config import StrategyConfig
-from quant_core.data.provider import AkshareETFProvider, to_tencent_symbol
+from quant_core.data.market_data import AkshareMarketDataClient, to_tencent_symbol
 from quant_core.factors import compute_factors
-from quant_core.strategy.correlation_filter import select_ranked_threshold_filter, select_ranked_correlation_filter
-from quant_core.strategy.selection import score_and_select
+from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
 
 
 def sample_daily() -> pd.DataFrame:
@@ -42,39 +40,28 @@ def sample_daily() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_factor_selection_backtest_loop() -> None:
+def test_sharpe_corr_threshold_selection_backtest_loop() -> None:
     daily = sample_daily()
     factors = compute_factors(daily)
     assert "sharpe_20" in factors.columns
     assert "sharpe_25" in factors.columns
-    selected = score_and_select(
+    selected = select_sharpe_corr_threshold(
         factors,
         StrategyConfig(top_n=2),
         start=pd.Timestamp("2024-01-25"),
         end=pd.Timestamp("2024-02-10"),
+        universe_symbols={"510300", "510500", "159915"},
+        corr_window=10,
+        factor_lower_bound=0.0,
     )
     assert not selected.empty
-    assert selected.groupby("date")["symbol"].count().max() == 2
-    assert selected.groupby("date")["target_weight"].sum().round(6).eq(1.0).all()
+    assert selected.groupby("date")["symbol"].count().max() <= 2
+    assert selected.groupby("date")["target_weight"].sum().le(1.0).all()
 
     result = run_backtest(daily, selected)
     assert not result.daily_returns.empty
     assert "total_return" in result.metrics
     assert result.positions["weight"].gt(0).all()
-
-
-def test_sharpe_single_factor_config_selects_by_sharpe() -> None:
-    daily = sample_daily()
-    factors = compute_factors(daily)
-    selected = score_and_select(
-        factors,
-        StrategyConfig.sharpe_single_factor(top_n=1),
-        start=pd.Timestamp("2024-01-25"),
-        end=pd.Timestamp("2024-02-10"),
-    )
-    assert not selected.empty
-    assert selected.groupby("date")["symbol"].count().eq(1).all()
-    assert selected["score"].notna().all()
 
 
 def test_compute_factors_supports_parameterized_sharpe_windows() -> None:
@@ -88,9 +75,9 @@ def test_compute_factors_supports_parameterized_sharpe_windows() -> None:
 
 
 def test_strategy_config_uses_custom_sharpe_window() -> None:
-    config = StrategyConfig.sharpe_single_factor(top_n=1, sharpe_window=30)
+    config = StrategyConfig(top_n=1, sharpe_window=30)
 
-    assert config.factor_weights == {"sharpe_30": 1.0}
+    assert config.factor_name == "sharpe_30"
 
 
 def test_missing_sharpe_factor_columns_are_computed_from_daily() -> None:
@@ -136,43 +123,7 @@ def test_drawdown_lt_return_constraint_and_sorting() -> None:
     assert sorted_results.iloc[0]["name"] == "valid_high"
 
 
-def test_strategy_selection_can_filter_by_universe() -> None:
-    daily = sample_daily()
-    factors = compute_factors(daily)
-    selected = score_and_select(
-        factors,
-        StrategyConfig(top_n=2),
-        start=pd.Timestamp("2024-01-25"),
-        end=pd.Timestamp("2024-02-10"),
-        universe_symbols={"510300"},
-    )
-    assert not selected.empty
-    assert set(selected["symbol"]) == {"510300"}
-    assert selected.groupby("date")["target_weight"].sum().round(6).eq(1.0).all()
-
-
-def test_ranked_correlation_filter_runs_in_framework_backtest() -> None:
-    daily = sample_daily()
-    factors = compute_factors(daily)
-    config = replace(StrategyConfig.ranked_correlation_filter(), top_n=2)
-    selected = select_ranked_correlation_filter(
-        factors,
-        config,
-        start=pd.Timestamp("2024-01-25"),
-        end=pd.Timestamp("2024-02-10"),
-        universe_symbols={"510300", "510500", "159915"},
-        corr_window=10,
-    )
-    assert not selected.empty
-    assert {"name", "score", "target_weight"}.issubset(selected.columns)
-
-    result = run_backtest(daily, selected, fee_rate=0.0003)
-    assert not result.equity_curve.empty
-    assert "total_return" in result.metrics
-    assert result.positions["weight"].gt(0).all()
-
-
-def test_ranked_threshold_filter_leaves_cash_and_can_liquidate() -> None:
+def test_sharpe_corr_threshold_leaves_cash_and_can_liquidate() -> None:
     dates = pd.date_range("2024-01-01", periods=4, freq="D")
     daily = pd.DataFrame([
         {
@@ -196,9 +147,9 @@ def test_ranked_threshold_filter_leaves_cash_and_can_liquidate() -> None:
         0.8, -0.2,
         -0.1, -0.3,
     ]
-    config = StrategyConfig.ranked_threshold_filter(top_n=2)
+    config = StrategyConfig(top_n=2)
 
-    selected = select_ranked_threshold_filter(
+    selected = select_sharpe_corr_threshold(
         factors,
         config,
         start=dates[0],
@@ -264,7 +215,7 @@ def test_factor_ic_uses_tradeable_next_open_forward_return() -> None:
     assert result["rank_ic"] == pytest.approx(1.0)
 
 
-def test_etf_provider_falls_back_to_tencent_with_qfq(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_market_data_client_falls_back_to_tencent_with_qfq(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 
     def fund_etf_hist_em(**kwargs):
@@ -289,7 +240,7 @@ def test_etf_provider_falls_back_to_tencent_with_qfq(monkeypatch: pytest.MonkeyP
     monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
     universe = pd.DataFrame([{"symbol": "159915", "name": "cyb"}])
 
-    daily = AkshareETFProvider(adjust="qfq").fetch_daily(
+    daily = AkshareMarketDataClient(adjust="qfq").fetch_daily(
         universe,
         date(2024, 1, 1),
         date(2024, 1, 31),

@@ -2,37 +2,38 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 
-from quant_core.backtest.engine import factor_ic, run_backtest
+from quant_core.backtest.engine import run_backtest
 from quant_core.config import (
-    RANKED_THRESHOLD_CORR_WINDOW,
-    RANKED_THRESHOLD_CORR_THRESHOLD,
-    RANKED_THRESHOLD_LOWER_BOUND,
-    RANKED_THRESHOLD_STOP_LOSS_PCT,
-    RANKED_CORR_CORR_WINDOW,
-    RANKED_CORR_CORR_THRESHOLD,
-    RANKED_CORR_STOP_LOSS_PCT,
+    SHARPE_CORR_THRESHOLD_CORR_THRESHOLD,
+    SHARPE_CORR_THRESHOLD_CORR_WINDOW,
+    SHARPE_CORR_THRESHOLD_LOWER_BOUND,
+    SHARPE_CORR_THRESHOLD_STOP_LOSS_PCT,
+    STRATEGY_NAME,
     StrategyConfig,
 )
-from quant_core.data.provider import AkshareETFProvider, merge_incremental, validate_daily
-from quant_core.data.universe import (
+from quant_core.data.market_data import (
+    AkshareMarketDataClient,
+    ProjectPaths,
     fetch_daily_if_stale,
+    load_universe,
+    merge_incremental,
+    read_daily,
+    read_table,
+    universe_symbols,
+    validate_daily,
+    write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
-from quant_core.paths import ProjectPaths
-from quant_core.reporting import build_markdown_report
-from quant_core.storage import read_table, write_table
-from quant_core.strategy.correlation_filter import select_ranked_threshold_filter, select_ranked_correlation_filter
-from quant_core.strategy.selection import score_and_select, score_factors
+from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
 
 
-STRATEGY_CHOICES = ["multifactor", "sharpe-single", "ranked-corr", "ranked-threshold-corr"]
+STRATEGY_CHOICES = [STRATEGY_NAME]
 OPTIMIZATION_CONSTRAINT_CHOICES = ["none", "drawdown-lt-return"]
 
 
@@ -44,16 +45,8 @@ def parse_float_list(value: str) -> list[float]:
     return [float(item.strip()) for item in value.split(",") if item.strip()]
 
 
-def parse_symbol_list(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
 def parse_sharpe_windows(value: str) -> list[int]:
     return list(normalize_sharpe_windows(parse_int_list(value)))
-
-
-def strategy_uses_sharpe_window(strategy: str) -> bool:
-    return strategy in {"sharpe-single", "ranked-corr", "ranked-threshold-corr"}
 
 
 def metrics_satisfy_constraint(metrics: dict[str, float], constraint: str) -> bool:
@@ -92,6 +85,8 @@ def optimization_grid_results(
     constraint: str,
 ) -> pd.DataFrame:
     rows = []
+    if strategy != STRATEGY_NAME:
+        raise ValueError(f"Unknown strategy: {strategy}")
     candidate_sharpe_windows = list(sharpe_windows or [None])
     for top_n in top_ns:
         for fee_rate in fee_rates:
@@ -100,33 +95,43 @@ def optimization_grid_results(
                     for corr_window in corr_windows:
                         for corr_threshold in corr_thresholds:
                             for stop_loss_pct in stop_loss_pcts:
-                                config_args = argparse.Namespace(
+                                config = build_strategy_config(argparse.Namespace(
                                     strategy=strategy,
                                     top_n=top_n,
                                     fee_rate=fee_rate,
                                     sharpe_window=sharpe_window,
-                                )
-                                config = build_strategy_config(config_args)
-                                selected, correlation_filter = select_for_strategy(
-                                    strategy,
+                                ))
+                                selected = select_sharpe_corr_threshold(
                                     factors,
                                     config,
-                                    start,
-                                    end,
-                                    symbols,
-                                    factor_lower_bound=factor_lower_bound,
-                                    corr_window=corr_window,
-                                    corr_threshold=corr_threshold,
-                                    stop_loss_pct=stop_loss_pct,
+                                    start=start,
+                                    end=end,
+                                    universe_symbols=symbols,
+                                    factor_lower_bound=(
+                                        factor_lower_bound
+                                        if factor_lower_bound is not None
+                                        else SHARPE_CORR_THRESHOLD_LOWER_BOUND
+                                    ),
+                                    corr_window=(
+                                        corr_window
+                                        if corr_window is not None
+                                        else SHARPE_CORR_THRESHOLD_CORR_WINDOW
+                                    ),
+                                    corr_threshold=(
+                                        corr_threshold
+                                        if corr_threshold is not None
+                                        else SHARPE_CORR_THRESHOLD_CORR_THRESHOLD
+                                    ),
+                                    stop_loss_pct=(
+                                        stop_loss_pct
+                                        if stop_loss_pct is not None
+                                        else SHARPE_CORR_THRESHOLD_STOP_LOSS_PCT
+                                    ),
                                 )
                                 result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-                                if correlation_filter:
-                                    metrics = result.metrics
-                                else:
-                                    scored = score_factors(factors, config)
-                                    metrics = {**result.metrics, **factor_ic(scored)}
+                                metrics = result.metrics
                                 rows.append({
-                                    "strategy": strategy,
+                                    "strategy": STRATEGY_NAME,
                                     "top_n": top_n,
                                     "fee_rate": fee_rate,
                                     "sharpe_window": sharpe_window,
@@ -140,36 +145,16 @@ def optimization_grid_results(
     return pd.DataFrame(rows)
 
 
-def best_optimization_row(results: pd.DataFrame, objective: str, constraint: str) -> pd.Series:
-    if results.empty:
-        raise ValueError("No optimization results generated")
-    if objective not in results.columns:
-        raise ValueError(f"Objective {objective!r} is not available in results")
-    return sort_optimization_results(results, objective, constraint).iloc[0]
-
-
 def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
-    strategy = getattr(args, "strategy", "multifactor")
-    sharpe_window = getattr(args, "sharpe_window", None)
-    if strategy == "ranked-threshold-corr":
-        config = StrategyConfig.ranked_threshold_filter(
-            **({"sharpe_window": sharpe_window} if sharpe_window is not None else {})
-        )
-    elif strategy == "ranked-corr":
-        config = StrategyConfig.ranked_correlation_filter(
-            **({"sharpe_window": sharpe_window} if sharpe_window is not None else {})
-        )
-    elif strategy == "sharpe-single":
-        config = StrategyConfig.sharpe_single_factor(
-            **({"sharpe_window": sharpe_window} if sharpe_window is not None else {})
-        )
-    else:
-        config = StrategyConfig()
-    if getattr(args, "top_n", None) is not None:
-        config = replace(config, top_n=args.top_n)
-    if getattr(args, "fee_rate", None) is not None:
-        config = replace(config, fee_rate=args.fee_rate)
-    return config
+    strategy = getattr(args, "strategy", STRATEGY_NAME)
+    if strategy != STRATEGY_NAME:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    defaults = StrategyConfig()
+    return StrategyConfig(
+        top_n=getattr(args, "top_n", None) or defaults.top_n,
+        fee_rate=getattr(args, "fee_rate", None) or defaults.fee_rate,
+        sharpe_window=getattr(args, "sharpe_window", None) or defaults.sharpe_window,
+    )
 
 
 def ensure_sharpe_factor_columns(
@@ -191,78 +176,43 @@ def ensure_sharpe_factor_columns(
     return out
 
 
-def config_sharpe_windows(config: StrategyConfig) -> list[int]:
-    windows = []
-    for factor in config.factor_weights:
-        if factor.startswith("sharpe_"):
-            windows.append(int(factor.removeprefix("sharpe_")))
-    return windows
-
-
-def select_for_strategy(
-    strategy: str,
-    factors: pd.DataFrame,
-    config: StrategyConfig,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    universe_symbols_: set[str],
-    factor_lower_bound: float | None = None,
-    corr_window: int | None = None,
-    corr_threshold: float | None = None,
-    stop_loss_pct: float | None = None,
-) -> tuple[pd.DataFrame, bool]:
-    if strategy == "ranked-threshold-corr":
-        return (
-            select_ranked_threshold_filter(
-                factors,
-                config,
-                start=start,
-                end=end,
-                universe_symbols=universe_symbols_,
-                corr_window=RANKED_THRESHOLD_CORR_WINDOW if corr_window is None else corr_window,
-                corr_threshold=(
-                    RANKED_THRESHOLD_CORR_THRESHOLD if corr_threshold is None else corr_threshold
-                ),
-                stop_loss_pct=(
-                    RANKED_THRESHOLD_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
-                ),
-                factor_lower_bound=(
-                    RANKED_THRESHOLD_LOWER_BOUND if factor_lower_bound is None else factor_lower_bound
-                ),
-            ),
-            True,
-        )
-    if strategy == "ranked-corr":
-        return (
-            select_ranked_correlation_filter(
-                factors,
-                config,
-                start=start,
-                end=end,
-                universe_symbols=universe_symbols_,
-                corr_window=RANKED_CORR_CORR_WINDOW if corr_window is None else corr_window,
-                corr_threshold=RANKED_CORR_CORR_THRESHOLD if corr_threshold is None else corr_threshold,
-                stop_loss_pct=RANKED_CORR_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct,
-            ),
-            True,
-        )
-    return score_and_select(factors, config, start=start, end=end), False
-
-
-def load_universe_file(path: Path) -> pd.DataFrame:
-    universe = pd.read_csv(path)
-    universe = universe.copy()
-    universe["symbol"] = universe["symbol"].astype(str)
-    return universe
+def build_markdown_report(
+    run_id: str,
+    metrics: dict[str, float],
+    recommendation: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# Backtest Report: {run_id}",
+        "",
+        "## Metrics",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+    ]
+    for key, value in metrics.items():
+        lines.append(f"| {key} | {value:.6f} |")
+    lines.extend([
+        "",
+        "## Latest Recommendation",
+        "",
+        "| Symbol | Name | Score | Target Weight |",
+        "| --- | --- | ---: | ---: |",
+    ])
+    if not recommendation.empty:
+        for row in recommendation.itertuples(index=False):
+            lines.append(
+                f"| {row.symbol} | {row.name} | {float(row.score):.6f} | {float(row.target_weight):.4f} |"
+            )
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
 
 
 def resolve_data_universe(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     if args.universe and Path(args.universe).exists():
-        return load_universe_file(Path(args.universe)), args.universe_name
-    if getattr(args, "min_fund_size", None) is not None:
-        provider = AkshareETFProvider(adjust=effective_adjust(args))
-        return provider.fetch_universe(args.min_fund_size), args.universe_name
-    raise FileNotFoundError("No universe was provided. Pass --universe PATH or --min-fund-size VALUE.")
+        return load_universe(Path(args.universe)), args.universe_name
+    raise FileNotFoundError("No universe was provided. Pass --universe PATH.")
 
 
 def effective_adjust(args: argparse.Namespace) -> str:
@@ -272,20 +222,7 @@ def effective_adjust(args: argparse.Namespace) -> str:
 def load_strategy_universe(args: argparse.Namespace) -> pd.DataFrame:
     if not getattr(args, "universe", None):
         raise FileNotFoundError("No universe was provided. Pass --universe PATH.")
-    return load_universe_file(Path(args.universe))
-
-
-def universe_symbols(universe: pd.DataFrame) -> set[str]:
-    return set(universe["symbol"].astype(str))
-
-
-def filter_factors_by_universe(factors: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
-    symbols = universe_symbols(universe)
-    return factors[factors["symbol"].astype(str).isin(symbols)].copy()
-
-
-def read_daily(paths: ProjectPaths) -> pd.DataFrame:
-    return read_table(paths.data_daily, parse_dates=["date"])
+    return load_universe(Path(args.universe))
 
 
 def parse_date(value: str) -> date:
@@ -295,19 +232,18 @@ def parse_date(value: str) -> date:
 def command_data_update(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure_data()
-    provider = AkshareETFProvider(adjust=effective_adjust(args))
+    market_data = AkshareMarketDataClient(adjust=effective_adjust(args))
     universe, _universe_name = resolve_data_universe(args)
     try:
         existing = read_daily(paths)
     except FileNotFoundError:
         existing = None
     incoming, target_trade_date = fetch_daily_if_stale(
-        provider,
         universe,
         parse_date(args.start),
         parse_date(args.end),
         existing=existing,
-        fetch_one=provider.fetch_daily,
+        fetch_one=market_data.fetch_daily,
         log=print,
     )
     daily = merge_incremental(existing, incoming)
@@ -343,31 +279,26 @@ def command_backtest_run(args: argparse.Namespace) -> None:
     config = build_strategy_config(args)
     daily = read_daily(paths)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
-    factors = ensure_sharpe_factor_columns(factors, daily, config_sharpe_windows(config))
+    factors = ensure_sharpe_factor_columns(factors, daily, [config.sharpe_window])
     universe = load_strategy_universe(args)
     symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    selected, correlation_filter = select_for_strategy(
-        args.strategy,
+    selected = select_sharpe_corr_threshold(
         factors,
         config,
-        start,
-        end,
-        symbols,
+        start=start,
+        end=end,
+        universe_symbols=symbols,
         factor_lower_bound=getattr(args, "factor_lower_bound", None),
         corr_window=getattr(args, "corr_window", None),
         corr_threshold=getattr(args, "corr_threshold", None),
         stop_loss_pct=getattr(args, "stop_loss_pct", None),
     )
     result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-    if correlation_filter:
-        metrics = result.metrics
-    else:
-        scored = score_factors(factors, config)
-        metrics = {**result.metrics, **factor_ic(scored)}
-    run_id = args.run_id or f"{args.start}_{args.end}_{args.strategy}_{args.universe_name}_top{config.top_n}"
+    metrics = result.metrics
+    run_id = args.run_id or f"{args.start}_{args.end}_{STRATEGY_NAME}_{args.universe_name}_top{config.top_n}"
     run_dir = paths.outputs / "backtests" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     selected.to_csv(run_dir / "orders.csv", index=False)
@@ -385,31 +316,17 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     paths.ensure()
     daily = read_daily(paths)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
-    sharpe_windows = (
-        parse_sharpe_windows(args.sharpe_window)
-        if strategy_uses_sharpe_window(args.strategy)
-        else []
-    )
-    if sharpe_windows:
-        factors = ensure_sharpe_factor_columns(factors, daily, sharpe_windows)
+    sharpe_windows = parse_sharpe_windows(args.sharpe_window)
+    factors = ensure_sharpe_factor_columns(factors, daily, sharpe_windows)
     universe = load_strategy_universe(args)
     symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
-    factor_lower_bounds = [None]
-    corr_windows = [None]
-    corr_thresholds = [None]
-    stop_loss_pcts = [None]
-    if args.strategy == "ranked-threshold-corr":
-        factor_lower_bounds = parse_float_list(args.factor_lower_bound)
-        corr_windows = parse_int_list(args.corr_window)
-        corr_thresholds = parse_float_list(args.corr_threshold)
-        stop_loss_pcts = parse_float_list(args.stop_loss_pct)
-    elif args.strategy == "ranked-corr":
-        corr_windows = parse_int_list(args.corr_window)
-        corr_thresholds = parse_float_list(args.corr_threshold)
-        stop_loss_pcts = parse_float_list(args.stop_loss_pct)
+    factor_lower_bounds = parse_float_list(args.factor_lower_bound)
+    corr_windows = parse_int_list(args.corr_window)
+    corr_thresholds = parse_float_list(args.corr_threshold)
+    stop_loss_pcts = parse_float_list(args.stop_loss_pct)
 
     results = optimization_grid_results(
         strategy=args.strategy,
@@ -465,17 +382,16 @@ def command_recommend_today(args: argparse.Namespace) -> None:
     target_date = pd.Timestamp(args.date)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
     daily = read_daily(paths)
-    factors = ensure_sharpe_factor_columns(factors, daily, config_sharpe_windows(config))
+    factors = ensure_sharpe_factor_columns(factors, daily, [config.sharpe_window])
     universe = load_strategy_universe(args)
     symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
-    selected, _ = select_for_strategy(
-        args.strategy,
+    selected = select_sharpe_corr_threshold(
         factors,
         config,
-        target_date,
-        target_date,
-        symbols,
+        start=target_date,
+        end=target_date,
+        universe_symbols=symbols,
         factor_lower_bound=getattr(args, "factor_lower_bound", None),
         corr_window=getattr(args, "corr_window", None),
         corr_threshold=getattr(args, "corr_threshold", None),
@@ -498,7 +414,6 @@ def build_parser() -> argparse.ArgumentParser:
     data_update.add_argument("--end", required=True)
     data_update.add_argument("--universe")
     data_update.add_argument("--universe-name", default="default")
-    data_update.add_argument("--min-fund-size", type=float)
     data_update.add_argument("--adjust")
     data_update.set_defaults(func=command_data_update)
 
@@ -515,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_run = backtest_sub.add_parser("run")
     backtest_run.add_argument("--start", required=True)
     backtest_run.add_argument("--end", required=True)
-    backtest_run.add_argument("--strategy", choices=STRATEGY_CHOICES, default="multifactor")
+    backtest_run.add_argument("--strategy", choices=STRATEGY_CHOICES, default=STRATEGY_NAME)
     backtest_run.add_argument("--universe", required=True)
     backtest_run.add_argument("--universe-name", default="default")
     backtest_run.add_argument("--top-n", type=int)
@@ -533,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid = optimize_sub.add_parser("grid")
     optimize_grid.add_argument("--start", required=True)
     optimize_grid.add_argument("--end", required=True)
-    optimize_grid.add_argument("--strategy", choices=STRATEGY_CHOICES, default="sharpe-single")
+    optimize_grid.add_argument("--strategy", choices=STRATEGY_CHOICES, default=STRATEGY_NAME)
     optimize_grid.add_argument("--universe", required=True)
     optimize_grid.add_argument("--universe-name", default="default")
     optimize_grid.add_argument("--top-n", default="3,5,10")
@@ -553,7 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_sub = recommend.add_subparsers(dest="command", required=True)
     recommend_today = recommend_sub.add_parser("today")
     recommend_today.add_argument("--date", required=True)
-    recommend_today.add_argument("--strategy", choices=STRATEGY_CHOICES, default="multifactor")
+    recommend_today.add_argument("--strategy", choices=STRATEGY_CHOICES, default=STRATEGY_NAME)
     recommend_today.add_argument("--universe", required=True)
     recommend_today.add_argument("--universe-name", default="default")
     recommend_today.add_argument("--top-n", type=int)

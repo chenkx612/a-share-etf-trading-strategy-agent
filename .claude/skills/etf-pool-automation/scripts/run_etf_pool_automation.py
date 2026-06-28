@@ -21,14 +21,18 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-from quant_core.data.provider import AkshareETFProvider  # noqa: E402
-from quant_core.data.universe import (  # noqa: E402
+from quant_core.data.market_data import (  # noqa: E402
+    AkshareMarketDataClient,
+    ProjectPaths,
     expanded_universe as build_expanded_universe,
     fetch_tencent_daily_if_stale,
+    load_universe,
     merge_and_store_daily,
+    parse_symbol_list,
+    read_table,
     resolve_complete_universe_date,
+    write_table,
 )
-from quant_core.paths import ProjectPaths  # noqa: E402
 from quant_core.cli import (  # noqa: E402
     command_factor_compute,
     command_recommend_today,
@@ -40,7 +44,6 @@ from quant_core.cli import (  # noqa: E402
     sort_optimization_results,
 )
 from quant_core.factors import compute_factors  # noqa: E402
-from quant_core.storage import read_table, write_table  # noqa: E402
 
 
 DEFAULT_RUN_ID = "current"
@@ -126,13 +129,11 @@ def run_command(args: list[str], label: str) -> None:
 
 
 def parse_candidates(value: str) -> list[str]:
-    return [part.strip().split(":", 1)[0] for part in value.split(",") if part.strip()]
+    return parse_symbol_list(value)
 
 
 def load_base_pool() -> pd.DataFrame:
-    frame = pd.read_csv(DEFAULT_BASE_POOL, dtype={"symbol": str})
-    frame["symbol"] = frame["symbol"].astype(str)
-    return frame
+    return load_universe(DEFAULT_BASE_POOL)
 
 
 def csv_bool(value: object) -> bool:
@@ -243,14 +244,6 @@ def copy_recommend_outputs(rec_root: Path, automation_dir: Path, recommendation_
     return destination
 
 
-def best_int(best: dict[str, Any], key: str) -> str:
-    return str(int(float(best[key])))
-
-
-def best_float(best: dict[str, Any], key: str) -> str:
-    return str(float(best[key]))
-
-
 def generate_recommendations(args: argparse.Namespace, automation_dir: Path, recommendation_date: str) -> Path:
     best = json.loads((automation_dir / "best.json").read_text(encoding="utf-8"))
     rec_root = prepare_recommend_workspace(Path(args.data_root), automation_dir)
@@ -263,7 +256,7 @@ def generate_recommendations(args: argparse.Namespace, automation_dir: Path, rec
                 root=str(rec_root),
                 start=args.start,
                 end=recommendation_date,
-                sharpe_window=best_int(best, "sharpe_window"),
+                sharpe_window=str(int(float(best["sharpe_window"]))),
             )
         )
         log_step(f"END factor compute for recommendation ({time.monotonic() - start:.1f}s)")
@@ -274,7 +267,7 @@ def generate_recommendations(args: argparse.Namespace, automation_dir: Path, rec
             argparse.Namespace(
                 root=str(rec_root),
                 date=recommendation_date,
-                strategy="ranked-threshold-corr",
+                strategy="sharpe-corr-threshold",
                 universe=str(automation_dir / "selected_universe.csv"),
                 universe_name="sector-rotation",
                 top_n=int(float(best["top_n"])),
@@ -330,7 +323,7 @@ def run_pool_optimization(args: argparse.Namespace, candidates: str, run_id: str
         symbols = set(pool["symbol"].astype(str))
         pool_factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
         results = optimization_grid_results(
-            strategy="ranked-threshold-corr",
+            strategy="sharpe-corr-threshold",
             daily=daily,
             factors=pool_factors,
             symbols=symbols,
@@ -415,8 +408,15 @@ def strict_recent_universe_backfill(
     universe["symbol"] = universe["symbol"].astype(str)
     end = datetime.strptime(args.date, "%Y-%m-%d").date()
     start = max(datetime.strptime(args.start, "%Y-%m-%d").date(), end - timedelta(days=lookback_days))
-    provider = AkshareETFProvider(adjust="qfq")
-    incoming, target_trade_date = fetch_tencent_daily_if_stale(provider, universe, start, end, paths=paths, log=log_step)
+    market_data = AkshareMarketDataClient(adjust="qfq")
+    incoming, target_trade_date = fetch_tencent_daily_if_stale(
+        market_data,
+        universe,
+        start,
+        end,
+        paths=paths,
+        log=log_step,
+    )
     if incoming.empty:
         verified = read_daily(paths)
     else:

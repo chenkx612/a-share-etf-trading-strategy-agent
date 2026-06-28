@@ -1,3 +1,3 @@
-from quant_core.strategy.selection import score_and_select
+from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
 
-__all__ = ["score_and_select"]
+__all__ = ["select_sharpe_corr_threshold"]
