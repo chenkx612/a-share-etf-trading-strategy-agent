@@ -89,7 +89,7 @@ def test_normalize_spot_frame_maps_market_columns() -> None:
 
 
 def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     selector = load_skill_script("select_etf_candidates")
 
     assert runner.DEFAULT_ROOT == ".claude/skills/etf-pool-automation/outputs"
@@ -271,7 +271,7 @@ def test_selector_default_selection_fills_after_script_deduplication() -> None:
 
 
 def test_runner_requires_reviewed_candidates_for_full_automation() -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
 
     with pytest.raises(SystemExit, match="Full automation requires reviewed candidates"):
         runner.require_reviewed_candidates(argparse.Namespace(candidates=None))
@@ -283,7 +283,7 @@ def test_runner_prepares_reviewed_candidates_from_candidate_shortlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     pd.DataFrame([
         {
             "symbol": "512760",
@@ -346,7 +346,7 @@ def test_runner_allows_reviewed_candidates_with_base_theme_overlap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     pd.DataFrame([
         {
             "symbol": "512760",
@@ -464,7 +464,7 @@ def test_data_update_does_not_create_outputs_directory(
 
 
 def test_recommendation_outputs_are_copied_directly_to_automation_dir(tmp_path: Path) -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     rec_root = tmp_path / "workspace"
     automation_dir = tmp_path / "outputs"
     recommendation_dir = rec_root / "outputs" / "recommendations"
@@ -495,7 +495,7 @@ def test_apply_recommendations_use_temporary_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     automation_dir = tmp_path / "automation"
     data_root = tmp_path / "repo-root"
     rec_root = tmp_path / "recommend-workspace"
@@ -553,8 +553,100 @@ def test_apply_recommendations_use_temporary_workspace(
     assert not (data_root / "outputs").exists()
 
 
+def test_symbol_return_contributions_uses_held_weight_times_next_open_return() -> None:
+    runner = load_skill_script("utils")
+    daily = pd.DataFrame([
+        {"date": pd.Timestamp("2026-06-10"), "symbol": "510300", "open": 10.0},
+        {"date": pd.Timestamp("2026-06-10"), "symbol": "510500", "open": 10.0},
+        {"date": pd.Timestamp("2026-06-11"), "symbol": "510300", "open": 10.0},
+        {"date": pd.Timestamp("2026-06-11"), "symbol": "510500", "open": 10.0},
+        {"date": pd.Timestamp("2026-06-12"), "symbol": "510300", "open": 8.0},
+        {"date": pd.Timestamp("2026-06-12"), "symbol": "510500", "open": 12.0},
+    ])
+    selected = pd.DataFrame([
+        {"date": pd.Timestamp("2026-06-10"), "symbol": "510300", "target_weight": 0.5},
+        {"date": pd.Timestamp("2026-06-10"), "symbol": "510500", "target_weight": 0.5},
+    ])
+
+    contributions = runner.symbol_return_contributions(
+        daily,
+        selected,
+        {"510300", "510500"},
+        fee_rate=0.0,
+    )
+
+    assert contributions["symbol"].tolist() == ["510300", "510500"]
+    assert contributions["contribution"].tolist() == pytest.approx([-0.1, 0.1])
+
+
+def test_pruned_pool_challenge_accepts_only_when_sortino_improves(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = load_skill_script("utils")
+    selected_universe = pd.DataFrame([
+        {"symbol": "510300", "name": "沪深300ETF"},
+        {"symbol": "510500", "name": "中证500ETF"},
+    ])
+    monkeypatch.setattr(
+        runner,
+        "best_strategy_selection",
+        lambda *args, **kwargs: pd.DataFrame([{"symbol": "510300"}]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "symbol_return_contributions",
+        lambda *args, **kwargs: pd.DataFrame([
+            {"symbol": "510300", "contribution": -0.2},
+            {"symbol": "510500", "contribution": 0.1},
+        ]),
+    )
+    monkeypatch.setattr(
+        runner,
+        "optimize_pool",
+        lambda *args, **kwargs: pd.DataFrame([
+            {
+                "top_n": 4,
+                "fee_rate": 0.0003,
+                "sharpe_window": 20,
+                "factor_lower_bound": 0.0,
+                "corr_window": 100,
+                "corr_threshold": 0.9,
+                "stop_loss_pct": 0.1,
+                "valid": True,
+                "sortino": 1.5,
+            }
+        ]),
+    )
+
+    challenge = runner.evaluate_pruned_pool_challenge(
+        args=argparse.Namespace(),
+        daily=pd.DataFrame(),
+        factors=pd.DataFrame(),
+        selected_universe=selected_universe,
+        current_best={
+            "pool_label": "base",
+            "sortino": 1.0,
+            "fee_rate": 0.0003,
+            "top_n": 4,
+            "sharpe_window": 20,
+            "factor_lower_bound": 0.0,
+            "corr_window": 100,
+            "corr_threshold": 0.9,
+            "stop_loss_pct": 0.1,
+        },
+        names={"510300": "沪深300ETF", "510500": "中证500ETF"},
+        start_date=pd.Timestamp("2023-06-12"),
+        end_date=pd.Timestamp(TEST_DATE),
+        sharpe_windows=[20],
+    )
+
+    assert challenge["accepted"] is True
+    assert challenge["removed_symbol"] == "510300"
+    assert challenge["universe"]["symbol"].tolist() == ["510500"]
+    assert challenge["best"]["pruning_accepted"] is True
+    assert challenge["best"]["base_sortino"] == 1.0
+
+
 def test_write_summary_includes_recommendation_filters(tmp_path: Path) -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     recommendation_path = tmp_path / f"recommendation_{TEST_DATE}_sector-rotation.csv"
     pd.DataFrame([
         {
@@ -627,7 +719,7 @@ def test_write_summary_includes_recommendation_filters(tmp_path: Path) -> None:
 
 
 def test_cleanup_intermediate_outputs_keeps_only_summary_recommendation_and_apply_backup(tmp_path: Path) -> None:
-    runner = load_skill_script("run_etf_pool_automation")
+    runner = load_skill_script("utils")
     for filename in [
         "automation_summary.json",
         f"recommendation_{TEST_DATE}_sector-rotation.csv",

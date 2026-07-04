@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -22,19 +21,9 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-from quant_core.data.market_data import (  # noqa: E402
-    AkshareMarketDataClient,
-    ProjectPaths,
-    expanded_universe as build_expanded_universe,
-    fetch_tencent_daily_if_stale,
-    load_universe,
-    merge_and_store_daily,
-    parse_symbol_list,
-    read_table,
-    resolve_complete_universe_date,
-    write_table,
-)
+from quant_core.backtest.engine import run_backtest  # noqa: E402
 from quant_core.cli import (  # noqa: E402
+    build_strategy_config,
     command_factor_compute,
     command_recommend_today,
     optimization_grid_results,
@@ -44,7 +33,20 @@ from quant_core.cli import (  # noqa: E402
     read_daily,
     sort_optimization_results,
 )
+from quant_core.config import STRATEGY_NAME  # noqa: E402
+from quant_core.data.market_data import (  # noqa: E402
+    AkshareMarketDataClient,
+    ProjectPaths,
+    expanded_universe as build_expanded_universe,
+    fetch_tencent_daily_if_stale,
+    load_universe,
+    merge_and_store_daily,
+    parse_symbol_list,
+    resolve_complete_universe_date,
+    write_table,
+)
 from quant_core.factors import compute_factors  # noqa: E402
+from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold  # noqa: E402
 
 
 DEFAULT_RUN_ID = "current"
@@ -63,15 +65,15 @@ DEFAULT_UNIVERSE_NAME = "sector-rotation"
 DEFAULT_BASE_POOL = SCRIPT_DIR.parent / "references" / "sector_rotation_universe.csv"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the ETF pool automation end to end.")
+def add_common_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--date", default=date.today().isoformat())
     parser.add_argument("--root", default=DEFAULT_ROOT)
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
     parser.add_argument("--start", help="Backtest start date. Defaults to three years before --date.")
     parser.add_argument("--run-id")
-    parser.add_argument("--candidates", required=True, help="Reviewed comma-separated candidate symbols.")
-    parser.add_argument("--apply", action="store_true")
+
+
+def add_optimization_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-n", default=DEFAULT_TOP_N)
     parser.add_argument("--fee-rate", default=DEFAULT_FEE_RATE)
     parser.add_argument("--sharpe-window", default=DEFAULT_SHARPE_WINDOW)
@@ -81,11 +83,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-loss-pct", default=DEFAULT_STOP_LOSS_PCT)
     parser.add_argument("--objective", default=DEFAULT_OBJECTIVE)
     parser.add_argument("--constraint", default=DEFAULT_CONSTRAINT)
-    return parser.parse_args()
+
+
+def fill_default_start(args: argparse.Namespace) -> None:
+    if args.start is None:
+        args.start = default_start(args.date)
 
 
 def require_reviewed_candidates(args: argparse.Namespace) -> None:
-    if args.candidates:
+    if getattr(args, "candidates", None):
         return
     raise SystemExit(
         "Full automation requires reviewed candidates. "
@@ -98,6 +104,10 @@ def run_dir(root: Path, run_id: str) -> Path:
     if run_id == DEFAULT_RUN_ID:
         return root
     return root / run_id
+
+
+def automation_dir_from_args(args: argparse.Namespace) -> Path:
+    return run_dir(Path(args.root), args.run_id or DEFAULT_RUN_ID)
 
 
 def default_start(trade_date: str) -> str:
@@ -154,7 +164,7 @@ def prepare_reviewed_candidates(args: argparse.Namespace, automation_dir: Path) 
     original_selected_path = automation_dir / "candidate_selected.csv"
     if not shortlist_path.exists():
         raise RuntimeError(
-            f"Missing {shortlist_path}; run select_etf_candidates.py before run_etf_pool_automation.py."
+            f"Missing {shortlist_path}; run select_etf_candidates.py before prepare_etf_pool_run.py."
         )
 
     symbols = parse_candidates(args.candidates)
@@ -225,6 +235,14 @@ def write_reviewed_candidate_outputs(candidate_state: dict[str, Any], automation
     )
     log_step(f"reviewed candidates: {payload['candidate_arg']}")
     return payload
+
+
+def load_candidate_arg(automation_dir: Path) -> str:
+    path = automation_dir / "candidate_selected.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path}; run prepare_etf_pool_run.py first.")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return str(payload["candidate_arg"])
 
 
 def prepare_recommend_workspace(data_root: Path, automation_dir: Path) -> Path:
@@ -350,27 +368,7 @@ def run_pool_optimization(args: argparse.Namespace, candidates: str, run_id: str
 
     for pool_label, candidate_symbol in candidate_specs:
         pool = candidate_pool_frame(base_universe, candidate_symbol, names)
-        symbols = set(pool["symbol"].astype(str))
-        pool_factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
-        results = optimization_grid_results(
-            strategy="sharpe-corr-threshold",
-            daily=daily,
-            factors=pool_factors,
-            symbols=symbols,
-            start=start_date,
-            end=end_date,
-            top_ns=parse_int_list(args.top_n),
-            fee_rates=parse_float_list(args.fee_rate),
-            sharpe_windows=sharpe_windows,
-            factor_lower_bounds=parse_float_list(args.factor_lower_bound),
-            corr_windows=parse_int_list(args.corr_window),
-            corr_thresholds=parse_float_list(args.corr_threshold),
-            stop_loss_pcts=parse_float_list(args.stop_loss_pct),
-            constraint=args.constraint,
-        )
-        if results.empty:
-            raise ValueError(f"No optimization results generated for pool {pool_label}")
-        results = sort_optimization_results(results, args.objective, args.constraint)
+        results = optimize_pool(args, daily, factors, pool, start_date, end_date, sharpe_windows)
         results.insert(0, "pool_label", pool_label)
         results.insert(1, "added_symbol", candidate_symbol)
         all_results.append(results)
@@ -381,16 +379,52 @@ def run_pool_optimization(args: argparse.Namespace, candidates: str, run_id: str
         pool.to_csv(run_dir_path / f"{pool_label}_universe.csv", index=False)
 
     evaluation_frame = sort_optimization_results(pd.DataFrame(evaluations), args.objective, args.constraint)
-    details = pd.concat(all_results, ignore_index=True)
-    details.to_csv(run_dir_path / "all_results.csv", index=False)
-    evaluation_frame.to_csv(run_dir_path / "evaluations.csv", index=False)
-
     best = evaluation_frame.iloc[0].to_dict()
     selected_candidate = best.get("added_symbol")
     selected_candidate = None if pd.isna(selected_candidate) else str(selected_candidate)
     selected_universe = candidate_pool_frame(base_universe, selected_candidate, names)
+    pruning_challenge = evaluate_pruned_pool_challenge(
+        args=args,
+        daily=daily,
+        factors=factors,
+        selected_universe=selected_universe,
+        current_best=best,
+        names=names,
+        start_date=start_date,
+        end_date=end_date,
+        sharpe_windows=sharpe_windows,
+    )
+    if pruning_challenge["evaluated"]:
+        pruned_results = pruning_challenge["results"]
+        if not pruned_results.empty:
+            all_results.append(pruned_results)
+            evaluations.append(pruning_challenge["best"])
+            pruned_results.to_csv(run_dir_path / f"{pruning_challenge['pool_label']}_results.csv", index=False)
+        if pruning_challenge["accepted"]:
+            best = pruning_challenge["best"]
+            selected_universe = pruning_challenge["universe"]
+            log_step(
+                "accepted pruned pool: removed "
+                f"{pruning_challenge['removed_symbol']} because sortino improved "
+                f"from {pruning_challenge['base_sortino']:.6f} to {pruning_challenge['pruned_sortino']:.6f}"
+            )
+        else:
+            log_step(
+                "kept original best pool: removing "
+                f"{pruning_challenge['removed_symbol']} did not improve sortino "
+                f"({pruning_challenge['pruned_sortino']:.6f} <= {pruning_challenge['base_sortino']:.6f})"
+            )
+
+    evaluation_frame = sort_optimization_results(pd.DataFrame(evaluations), args.objective, args.constraint)
+    details = pd.concat(all_results, ignore_index=True)
+    details.to_csv(run_dir_path / "all_results.csv", index=False)
+    evaluation_frame.to_csv(run_dir_path / "evaluations.csv", index=False)
     selected_universe.to_csv(run_dir_path / "selected_universe.csv", index=False)
     (run_dir_path / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
+    (run_dir_path / "pruning_challenge.json").write_text(
+        json.dumps(pruning_challenge_summary(pruning_challenge), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     if args.apply:
         current_path = write_table(base_universe, run_dir_path / "universe_before")
@@ -398,8 +432,179 @@ def run_pool_optimization(args: argparse.Namespace, candidates: str, run_id: str
         selected_universe.to_csv(selected_path, index=False)
         print(f"backed up previous universe to {current_path}")
         print(f"updated universe to {selected_path}")
+    (run_dir_path / "apply_status.json").write_text(
+        json.dumps({"apply": bool(args.apply)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     log_step(f"END pool optimization grid ({time.monotonic() - start:.1f}s)")
+
+
+def optimize_pool(
+    args: argparse.Namespace,
+    daily: pd.DataFrame,
+    factors: pd.DataFrame,
+    pool: pd.DataFrame,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    sharpe_windows: list[int],
+) -> pd.DataFrame:
+    symbols = set(pool["symbol"].astype(str))
+    pool_factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
+    results = optimization_grid_results(
+        strategy="sharpe-corr-threshold",
+        daily=daily,
+        factors=pool_factors,
+        symbols=symbols,
+        start=start_date,
+        end=end_date,
+        top_ns=parse_int_list(args.top_n),
+        fee_rates=parse_float_list(args.fee_rate),
+        sharpe_windows=sharpe_windows,
+        factor_lower_bounds=parse_float_list(args.factor_lower_bound),
+        corr_windows=parse_int_list(args.corr_window),
+        corr_thresholds=parse_float_list(args.corr_threshold),
+        stop_loss_pcts=parse_float_list(args.stop_loss_pct),
+        constraint=args.constraint,
+    )
+    if results.empty:
+        raise ValueError("No optimization results generated for pool")
+    return sort_optimization_results(results, args.objective, args.constraint)
+
+
+def best_strategy_selection(
+    best: dict[str, Any],
+    factors: pd.DataFrame,
+    symbols: set[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    config = build_strategy_config(
+        argparse.Namespace(
+            strategy=STRATEGY_NAME,
+            top_n=int(float(best["top_n"])),
+            fee_rate=float(best["fee_rate"]),
+            sharpe_window=int(float(best["sharpe_window"])),
+        )
+    )
+    pool_factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
+    return select_sharpe_corr_threshold(
+        pool_factors,
+        config,
+        start=start_date,
+        end=end_date,
+        universe_symbols=symbols,
+        factor_lower_bound=float(best["factor_lower_bound"]),
+        corr_window=int(float(best["corr_window"])),
+        corr_threshold=float(best["corr_threshold"]),
+        stop_loss_pct=float(best["stop_loss_pct"]),
+    )
+
+
+def symbol_return_contributions(
+    daily: pd.DataFrame,
+    selected: pd.DataFrame,
+    symbols: set[str],
+    fee_rate: float,
+) -> pd.DataFrame:
+    result = run_backtest(daily, selected, fee_rate=fee_rate)
+    symbol_list = sorted(str(symbol) for symbol in symbols)
+    if result.positions.empty:
+        return pd.DataFrame({"symbol": symbol_list, "contribution": [0.0] * len(symbol_list)})
+
+    prices = daily.copy()
+    prices["symbol"] = prices["symbol"].astype(str)
+    prices = prices[prices["symbol"].isin(symbol_list)]
+    open_prices = prices.pivot(index="date", columns="symbol", values="open").sort_index().ffill()
+    forward_returns = open_prices.shift(-1) / open_prices - 1.0
+    contribution_lookup = forward_returns.stack().rename("forward_return").reset_index()
+
+    positions = result.positions.copy()
+    positions["symbol"] = positions["symbol"].astype(str)
+    positions["date"] = pd.to_datetime(positions["date"])
+    contribution_lookup["date"] = pd.to_datetime(contribution_lookup["date"])
+    merged = positions.merge(contribution_lookup, on=["date", "symbol"], how="left")
+    merged["contribution"] = merged["weight"].astype(float) * merged["forward_return"].fillna(0.0).astype(float)
+    contributions = merged.groupby("symbol", as_index=False)["contribution"].sum()
+    contributions = pd.DataFrame({"symbol": symbol_list}).merge(contributions, on="symbol", how="left")
+    contributions["contribution"] = contributions["contribution"].fillna(0.0)
+    return contributions.sort_values(["contribution", "symbol"], ascending=[True, True]).reset_index(drop=True)
+
+
+def evaluate_pruned_pool_challenge(
+    *,
+    args: argparse.Namespace,
+    daily: pd.DataFrame,
+    factors: pd.DataFrame,
+    selected_universe: pd.DataFrame,
+    current_best: dict[str, Any],
+    names: dict[str, str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    sharpe_windows: list[int],
+) -> dict[str, Any]:
+    selected_universe = selected_universe.copy()
+    selected_universe["symbol"] = selected_universe["symbol"].astype(str)
+    symbols = set(selected_universe["symbol"])
+    if len(symbols) <= 1:
+        return {"evaluated": False, "reason": "selected pool has one or fewer ETF"}
+
+    selected = best_strategy_selection(current_best, factors, symbols, start_date, end_date)
+    contributions = symbol_return_contributions(
+        daily,
+        selected,
+        symbols,
+        fee_rate=float(current_best["fee_rate"]),
+    )
+    if contributions.empty:
+        return {"evaluated": False, "reason": "no contribution rows generated"}
+
+    worst = contributions.iloc[0].to_dict()
+    removed_symbol = str(worst["symbol"])
+    pruned_universe = selected_universe[selected_universe["symbol"] != removed_symbol].reset_index(drop=True)
+    if pruned_universe.empty:
+        return {"evaluated": False, "reason": "pruned pool would be empty"}
+
+    pool_label = f"remove_{removed_symbol}"
+    pruned_results = optimize_pool(args, daily, factors, pruned_universe, start_date, end_date, sharpe_windows)
+    pruned_results.insert(0, "pool_label", pool_label)
+    pruned_results.insert(1, "added_symbol", current_best.get("added_symbol"))
+    pruned_results.insert(2, "removed_symbol", removed_symbol)
+    pruned_results.insert(3, "removed_name", names.get(removed_symbol, removed_symbol))
+    pruned_best = pruned_results.iloc[0].to_dict()
+    pruned_best["pool_size"] = len(pruned_universe)
+    pruned_best["pruning_accepted"] = False
+
+    base_sortino = float(current_best.get("sortino", float("nan")))
+    pruned_sortino = float(pruned_best.get("sortino", float("nan")))
+    accepted = pd.notna(pruned_sortino) and pd.notna(base_sortino) and pruned_sortino > base_sortino
+    pruned_best["pruning_accepted"] = bool(accepted)
+    pruned_best["base_pool_label"] = current_best.get("pool_label")
+    pruned_best["base_sortino"] = base_sortino
+
+    return {
+        "evaluated": True,
+        "accepted": bool(accepted),
+        "pool_label": pool_label,
+        "removed_symbol": removed_symbol,
+        "removed_name": names.get(removed_symbol, removed_symbol),
+        "removed_contribution": float(worst["contribution"]),
+        "base_pool_label": current_best.get("pool_label"),
+        "base_sortino": base_sortino,
+        "pruned_sortino": pruned_sortino,
+        "contributions": dataframe_records_without_nulls(contributions),
+        "results": pruned_results,
+        "best": pruned_best,
+        "universe": pruned_universe,
+    }
+
+
+def pruning_challenge_summary(challenge: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in challenge.items()
+        if key not in {"results", "universe"}
+    }
 
 
 def latest_symbol_names(daily: pd.DataFrame) -> dict[str, str]:
@@ -511,6 +716,18 @@ def write_summary(
     log_step("START write automation summary")
     candidate_payload = json.loads((automation_dir / "candidate_selected.json").read_text(encoding="utf-8"))
     best = json.loads((automation_dir / "best.json").read_text(encoding="utf-8"))
+    apply_status_path = automation_dir / "apply_status.json"
+    apply_status = (
+        json.loads(apply_status_path.read_text(encoding="utf-8"))
+        if apply_status_path.exists()
+        else {"apply": bool(args.apply)}
+    )
+    pruning_challenge_path = automation_dir / "pruning_challenge.json"
+    pruning_challenge = (
+        json.loads(pruning_challenge_path.read_text(encoding="utf-8"))
+        if pruning_challenge_path.exists()
+        else {"evaluated": False, "reason": "missing pruning challenge output"}
+    )
     evaluations = pd.read_csv(automation_dir / "evaluations.csv")
     all_results = pd.read_csv(automation_dir / "all_results.csv")
     recommendation_output = (
@@ -527,7 +744,7 @@ def write_summary(
         "recommendation_date": recommendation_date,
         "objective": args.objective,
         "constraint": args.constraint,
-        "apply": args.apply,
+        "apply": bool(apply_status.get("apply", False)),
         "automation_dir": str(automation_dir),
         "data_root": args.data_root,
         "recommendation_path": str(recommendation_path),
@@ -536,6 +753,7 @@ def write_summary(
         "manual_override": candidate_payload["manual_override"],
         "grid_values_by_pool": grid_values_by_pool(all_results),
         "best": best,
+        "pruning_challenge": pruning_challenge,
         "evaluations": evaluations.to_dict(orient="records"),
         "recommendations": recommendations.to_dict(orient="records"),
         "recommendation_filters": recommendation_filters,
@@ -545,61 +763,3 @@ def write_summary(
         encoding="utf-8",
     )
     log_step("END write automation summary")
-
-
-def main() -> None:
-    whole_start = time.monotonic()
-    args = parse_args()
-    require_reviewed_candidates(args)
-    if args.start is None:
-        args.start = default_start(args.date)
-    root = Path(args.root)
-    run_id = args.run_id or DEFAULT_RUN_ID
-    automation_dir = run_dir(root, run_id)
-    candidate_state = prepare_reviewed_candidates(args, automation_dir)
-    log_step(f"reset run directory: {automation_dir}")
-    reset_run_dir(automation_dir)
-    candidate_payload = write_reviewed_candidate_outputs(candidate_state, automation_dir)
-
-    candidates = candidate_payload["candidate_arg"]
-    run_command(
-        [
-            "python3",
-            "-m",
-            "quant_core.cli",
-            "--root",
-            args.data_root,
-            "data",
-            "update",
-            "--start",
-            args.start,
-            "--end",
-            args.date,
-            "--universe",
-            str(automation_dir / "expanded_refresh_universe.csv"),
-            "--universe-name",
-            "sector-rotation",
-        ],
-        "data update",
-    )
-    strict_recent_universe_backfill(
-        args,
-        automation_dir / "expanded_refresh_universe.csv",
-        label="expanded universe",
-    )
-    run_pool_optimization(args, candidates, run_id)
-    verified = strict_recent_universe_backfill(
-        args,
-        automation_dir / "selected_universe.csv",
-        label="selected universe",
-    )
-    recommendation_date = resolve_recommendation_date(args, verified, automation_dir / "selected_universe.csv")
-    recommendation_path = generate_recommendations(args, automation_dir, recommendation_date)
-    write_summary(args, automation_dir, recommendation_path, recommendation_date)
-    cleanup_intermediate_outputs(automation_dir)
-    log_step(f"wrote automation summary to {automation_dir / 'automation_summary.json'}")
-    log_step(f"full run complete ({time.monotonic() - whole_start:.1f}s)")
-
-
-if __name__ == "__main__":
-    main()
