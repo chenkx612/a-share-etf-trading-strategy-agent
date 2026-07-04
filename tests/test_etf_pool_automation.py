@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -484,6 +485,7 @@ def test_recommendation_outputs_are_copied_directly_to_automation_dir(tmp_path: 
 
     assert destination == automation_dir / f"recommendation_{TEST_DATE}_sector-rotation.csv"
     assert destination.exists()
+    assert not (automation_dir / f"recommendation_{TEST_DATE}_sector-rotation_filters.json").exists()
     assert not (automation_dir / "recommendation_factors.csv").exists()
     assert not (automation_dir / "outputs").exists()
     assert not (automation_dir / "data").exists()
@@ -549,6 +551,79 @@ def test_apply_recommendations_use_temporary_workspace(
     assert destination == automation_dir / f"recommendation_{TEST_DATE}_sector-rotation.csv"
     assert roots == [str(rec_root), str(rec_root)]
     assert not (data_root / "outputs").exists()
+
+
+def test_write_summary_includes_recommendation_filters(tmp_path: Path) -> None:
+    runner = load_skill_script("run_etf_pool_automation")
+    recommendation_path = tmp_path / f"recommendation_{TEST_DATE}_sector-rotation.csv"
+    pd.DataFrame([
+        {
+            "record_type": "recommendation",
+            "date": TEST_DATE,
+            "symbol": "510300",
+            "name": "沪深300ETF",
+            "score": 1.0,
+            "target_weight": 0.25,
+        },
+        {
+            "record_type": "filtered",
+            "date": TEST_DATE,
+            "symbol": "510500",
+            "name": "中证500ETF",
+            "score": 0.8,
+            "target_weight": 0.0,
+            "filter": "stop_loss",
+            "daily_return": -0.12,
+            "stop_loss_pct": 0.1,
+        },
+    ]).to_csv(recommendation_path, index=False)
+    (tmp_path / "candidate_selected.json").write_text(
+        json.dumps({
+            "selected": [{"symbol": "510300"}],
+            "candidate_arg": "510300,510500,159915",
+            "manual_override": False,
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "best.json").write_text(json.dumps({"pool_label": "base"}), encoding="utf-8")
+    pd.DataFrame([{"pool_label": "base", "top_n": 4}]).to_csv(tmp_path / "evaluations.csv", index=False)
+    pd.DataFrame([{"pool_label": "base", "top_n": 4}]).to_csv(tmp_path / "all_results.csv", index=False)
+
+    runner.write_summary(
+        argparse.Namespace(
+            date=TEST_DATE,
+            objective="sortino",
+            constraint="drawdown-lt-return",
+            apply=False,
+            data_root=".",
+        ),
+        tmp_path,
+        recommendation_path,
+        TEST_DATE,
+    )
+
+    summary = json.loads((tmp_path / "automation_summary.json").read_text(encoding="utf-8"))
+    assert summary["recommendations"] == [
+        {
+            "date": "2026-06-12",
+            "symbol": "510300",
+            "name": "沪深300ETF",
+            "score": 1.0,
+            "target_weight": 0.25,
+        }
+    ]
+    assert summary["recommendation_filters"] == [
+        {
+            "date": "2026-06-12",
+            "symbol": "510500",
+            "name": "中证500ETF",
+            "score": 0.8,
+            "target_weight": 0.0,
+            "filter": "stop_loss",
+            "daily_return": -0.12,
+            "stop_loss_pct": 0.1,
+        }
+    ]
 
 
 def test_cleanup_intermediate_outputs_keeps_only_summary_recommendation_and_apply_backup(tmp_path: Path) -> None:

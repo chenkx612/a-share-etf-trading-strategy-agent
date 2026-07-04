@@ -46,6 +46,7 @@ def select_sharpe_corr_threshold(
     rolling_corr = daily_rets.rolling(corr_window).corr()
 
     rows: list[dict[str, object]] = []
+    filter_events: list[dict[str, object]] = []
     signal_dates: list[pd.Timestamp] = []
     prev_selected: list[str] = []
     names = df.drop_duplicates("symbol").set_index("symbol")["name"].to_dict()
@@ -59,12 +60,24 @@ def select_sharpe_corr_threshold(
             continue
         signal_dates.append(date)
 
+        day_scores = score_frame.loc[date].dropna()
         stopped_assets = {
             asset
-            for asset in prev_selected
+            for asset in day_scores.index
             if asset in daily_rets.columns and daily_rets.loc[date, asset] < -stop_loss_pct
         }
-        day_scores = score_frame.loc[date].dropna().drop(stopped_assets, errors="ignore")
+        for asset in sorted(stopped_assets):
+            filter_events.append({
+                "date": date.date().isoformat(),
+                "symbol": str(asset),
+                "name": names.get(str(asset), str(asset)),
+                "filter": "stop_loss",
+                "condition": "daily_return < -stop_loss_pct",
+                "daily_return": float(daily_rets.loc[date, asset]),
+                "stop_loss_pct": float(stop_loss_pct),
+                "score": float(day_scores.loc[asset]),
+            })
+        day_scores = day_scores.drop(stopped_assets, errors="ignore")
         day_scores = day_scores[day_scores > factor_lower_bound]
         if day_scores.empty:
             prev_selected = []
@@ -79,7 +92,21 @@ def select_sharpe_corr_threshold(
         for asset in day_scores.sort_values(ascending=False).index.tolist():
             if len(selected) >= config.top_n:
                 break
-            if _too_correlated(asset, selected, curr_corr, corr_threshold):
+            corr_block = _correlation_block(asset, selected, curr_corr, corr_threshold)
+            if corr_block is not None:
+                selected_asset, corr_value = corr_block
+                filter_events.append({
+                    "date": date.date().isoformat(),
+                    "symbol": str(asset),
+                    "name": names.get(str(asset), str(asset)),
+                    "filter": "correlation",
+                    "condition": "correlation > corr_threshold",
+                    "correlation": float(corr_value),
+                    "corr_threshold": float(corr_threshold),
+                    "selected_symbol": str(selected_asset),
+                    "selected_name": names.get(str(selected_asset), str(selected_asset)),
+                    "score": float(day_scores.loc[asset]),
+                })
                 continue
             selected.append(str(asset))
 
@@ -98,20 +125,21 @@ def select_sharpe_corr_threshold(
     selected = pd.DataFrame(rows, columns=["date", "symbol", "name", "score", "target_weight"])
     selected.attrs["signal_dates"] = signal_dates
     selected.attrs["universe_symbols"] = available_symbols
+    selected.attrs["filter_events"] = filter_events
     return selected
 
 
-def _too_correlated(
+def _correlation_block(
     asset: str,
     selected: list[str],
     corr: pd.DataFrame,
     threshold: float,
-) -> bool:
+) -> tuple[str, float] | None:
     if corr.empty:
-        return False
+        return None
     for selected_asset in selected:
         if asset in corr.index and selected_asset in corr.columns:
             value = corr.loc[asset, selected_asset]
             if value > threshold:
-                return True
-    return False
+                return selected_asset, float(value)
+    return None

@@ -99,6 +99,7 @@ Reply in Chinese. Include only:
 - 网格参数明细：from `automation_summary.json` `grid_values_by_pool`, unique tried values by pool for `top_n`, `sharpe_window`, `factor_lower_bound`, `corr_window`, `corr_threshold`, `stop_loss_pct`; include `objective` and `constraint`.
 - 各池最优参数：from `automation_summary.json` `evaluations`, only `top_n`, `sharpe_window`, `factor_lower_bound`, `corr_window`, `corr_threshold`, `stop_loss_pct`, plus `sortino`, `annual_return`, `max_drawdown`, `valid`.
 - 最佳股票池：from `automation_summary.json` `best`, `pool_label`, `added_symbol`, display name, best strategy/filter parameters, key metrics, and apply status.
-- 当日建议：from `automation_summary.json` `recommendation_date` and recommendation CSV, `symbol`, `name`, `score`, `target_weight`.
+- 当日建议：from `automation_summary.json` `recommendation_date` and recommendation CSV rows with `record_type=recommendation`, `symbol`, `name`, `score`, `target_weight`.
+- 过滤说明：only when `automation_summary.json` `recommendation_filters` is non-empty. Say exactly which ETF was filtered and why. For `stop_loss`, include `symbol`, `name`, `daily_return`, and `stop_loss_pct`. For `correlation`, include filtered `symbol`, `name`, compared selected ETF, `correlation`, and `corr_threshold`.
 
 Do not include backtest config such as `fee_rate` in "最优参数"; mention it only for audit/debugging. If recommendations are empty, say no ETF passed the filters.

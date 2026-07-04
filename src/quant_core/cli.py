@@ -209,6 +209,37 @@ def build_markdown_report(
     return output_path
 
 
+def recommendation_output_frame(recommendation: pd.DataFrame) -> pd.DataFrame:
+    output_columns = [
+        "record_type",
+        "date",
+        "symbol",
+        "name",
+        "score",
+        "target_weight",
+        "filter",
+        "condition",
+        "daily_return",
+        "stop_loss_pct",
+        "correlation",
+        "corr_threshold",
+        "selected_symbol",
+        "selected_name",
+    ]
+    recommended = recommendation.copy()
+    recommended.insert(0, "record_type", "recommendation")
+    filtered = pd.DataFrame(recommendation.attrs.get("filter_events", []))
+    if not filtered.empty:
+        filtered.insert(0, "record_type", "filtered")
+        if "target_weight" not in filtered.columns:
+            filtered["target_weight"] = 0.0
+    combined = pd.concat([recommended, filtered], ignore_index=True, sort=False)
+    for column in output_columns:
+        if column not in combined.columns:
+            combined[column] = pd.NA
+    return combined[output_columns]
+
+
 def resolve_data_universe(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
     if args.universe and Path(args.universe).exists():
         return load_universe(Path(args.universe)), args.universe_name
@@ -398,7 +429,7 @@ def command_recommend_today(args: argparse.Namespace) -> None:
         stop_loss_pct=getattr(args, "stop_loss_pct", None),
     )
     out = paths.outputs / "recommendations" / f"{args.date}_{args.universe_name}.csv"
-    selected.to_csv(out, index=False)
+    recommendation_output_frame(selected).to_csv(out, index=False)
     print(f"wrote {len(selected)} recommendations to {out}")
 
 

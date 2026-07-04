@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -121,8 +122,12 @@ def run_command(args: list[str], label: str) -> None:
     start = time.monotonic()
     log_step(f"START {label}")
     print("+ " + " ".join(args))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(SRC_ROOT), env.get("PYTHONPATH", "")]
+    ).strip(os.pathsep)
     try:
-        subprocess.run(args, cwd=REPO_ROOT, check=True)
+        subprocess.run(args, cwd=REPO_ROOT, env=env, check=True)
     finally:
         elapsed = time.monotonic() - start
         log_step(f"END {label} ({elapsed:.1f}s)")
@@ -242,6 +247,31 @@ def copy_recommend_outputs(rec_root: Path, automation_dir: Path, recommendation_
     if source.exists():
         shutil.copy2(source, destination)
     return destination
+
+
+def dataframe_records_without_nulls(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    records = frame.where(pd.notna(frame), None).to_dict(orient="records")
+    return [
+        {key: value for key, value in record.items() if value is not None}
+        for record in records
+    ]
+
+
+def split_recommendation_output(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    if frame.empty or "record_type" not in frame.columns:
+        return frame, []
+
+    recommendation_rows = frame[frame["record_type"].eq("recommendation")].copy()
+    filter_rows = frame[frame["record_type"].eq("filtered")].copy()
+    recommendation_columns = [
+        column
+        for column in ["date", "symbol", "name", "score", "target_weight"]
+        if column in recommendation_rows.columns
+    ]
+    recommendation_rows = recommendation_rows[recommendation_columns]
+    if "record_type" in filter_rows.columns:
+        filter_rows = filter_rows.drop(columns=["record_type"])
+    return recommendation_rows, dataframe_records_without_nulls(filter_rows)
 
 
 def generate_recommendations(args: argparse.Namespace, automation_dir: Path, recommendation_date: str) -> Path:
@@ -483,7 +513,15 @@ def write_summary(
     best = json.loads((automation_dir / "best.json").read_text(encoding="utf-8"))
     evaluations = pd.read_csv(automation_dir / "evaluations.csv")
     all_results = pd.read_csv(automation_dir / "all_results.csv")
-    recommendations = pd.read_csv(recommendation_path) if recommendation_path.exists() else pd.DataFrame()
+    recommendation_output = (
+        pd.read_csv(
+            recommendation_path,
+            dtype={"symbol": str, "selected_symbol": str},
+        )
+        if recommendation_path.exists()
+        else pd.DataFrame()
+    )
+    recommendations, recommendation_filters = split_recommendation_output(recommendation_output)
     payload = {
         "date": args.date,
         "recommendation_date": recommendation_date,
@@ -500,6 +538,7 @@ def write_summary(
         "best": best,
         "evaluations": evaluations.to_dict(orient="records"),
         "recommendations": recommendations.to_dict(orient="records"),
+        "recommendation_filters": recommendation_filters,
     }
     (automation_dir / "automation_summary.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),

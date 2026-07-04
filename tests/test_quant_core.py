@@ -11,6 +11,7 @@ from quant_core.backtest.engine import compute_metrics, factor_ic, run_backtest
 from quant_core.cli import (
     ensure_sharpe_factor_columns,
     metrics_satisfy_constraint,
+    recommendation_output_frame,
     sort_optimization_results,
 )
 from quant_core.config import StrategyConfig
@@ -166,6 +167,125 @@ def test_sharpe_corr_threshold_leaves_cash_and_can_liquidate() -> None:
 
     result = run_backtest(daily, selected, fee_rate=0.0)
     assert dates[3] not in set(result.positions["date"])
+
+
+def test_sharpe_corr_threshold_stop_loss_filters_single_day_candidates() -> None:
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    closes = {
+        "510300": [100.0, 100.0, 88.0],
+        "510500": [100.0, 101.0, 102.0],
+        "159915": [100.0, 99.0, 100.0],
+    }
+    rows = []
+    for symbol, prices in closes.items():
+        for day, close in zip(dates, prices, strict=True):
+            rows.append({
+                "date": day,
+                "symbol": symbol,
+                "name": f"ETF{symbol}",
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1000,
+                "amount": close * 1000,
+                "turnover": 1.0,
+                "sharpe_25": 0.1,
+            })
+    factors = pd.DataFrame(rows)
+    factors.loc[
+        factors["date"].eq(dates[-1]),
+        "sharpe_25",
+    ] = [10.0, 5.0, 4.0]
+
+    selected = select_sharpe_corr_threshold(
+        factors,
+        StrategyConfig(top_n=2),
+        start=dates[-1],
+        end=dates[-1],
+        universe_symbols={"510300", "510500", "159915"},
+        corr_window=2,
+        stop_loss_pct=0.1,
+        factor_lower_bound=0.0,
+    )
+
+    assert "510300" not in set(selected["symbol"])
+    assert selected["symbol"].tolist() == ["510500", "159915"]
+    assert selected.attrs["filter_events"] == [
+        {
+            "date": "2024-01-03",
+            "symbol": "510300",
+            "name": "ETF510300",
+            "filter": "stop_loss",
+            "condition": "daily_return < -stop_loss_pct",
+            "daily_return": pytest.approx(-0.12),
+            "stop_loss_pct": 0.1,
+            "score": 10.0,
+        }
+    ]
+    output = recommendation_output_frame(selected)
+    assert output["record_type"].tolist() == ["recommendation", "recommendation", "filtered"]
+    filtered_row = output[output["record_type"].eq("filtered")].iloc[0]
+    assert filtered_row["symbol"] == "510300"
+    assert filtered_row["filter"] == "stop_loss"
+    assert filtered_row["target_weight"] == 0.0
+
+
+def test_sharpe_corr_threshold_corr_filter_works_for_single_day_selection() -> None:
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    closes = {
+        "510300": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "510500": [200.0, 202.0, 204.0, 206.0, 208.0],
+        "159915": [100.0, 99.0, 101.0, 98.0, 100.0],
+    }
+    rows = []
+    for symbol, prices in closes.items():
+        for day, close in zip(dates, prices, strict=True):
+            rows.append({
+                "date": day,
+                "symbol": symbol,
+                "name": f"ETF{symbol}",
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1000,
+                "amount": close * 1000,
+                "turnover": 1.0,
+                "sharpe_25": 0.1,
+            })
+    factors = pd.DataFrame(rows)
+    factors.loc[
+        factors["date"].eq(dates[-1]),
+        "sharpe_25",
+    ] = [10.0, 9.0, 8.0]
+
+    selected = select_sharpe_corr_threshold(
+        factors,
+        StrategyConfig(top_n=2),
+        start=dates[-1],
+        end=dates[-1],
+        universe_symbols={"510300", "510500", "159915"},
+        corr_window=3,
+        corr_threshold=0.9,
+        factor_lower_bound=0.0,
+    )
+
+    assert selected["symbol"].tolist() == ["510300", "159915"]
+    assert selected.attrs["filter_events"] == [
+        {
+            "date": "2024-01-05",
+            "symbol": "510500",
+            "name": "ETF510500",
+            "filter": "correlation",
+            "condition": "correlation > corr_threshold",
+            "correlation": pytest.approx(1.0),
+            "corr_threshold": 0.9,
+            "selected_symbol": "510300",
+            "selected_name": "ETF510300",
+            "score": 9.0,
+        }
+    ]
 
 
 def test_backtest_trades_at_next_open_and_uses_open_to_open_returns() -> None:
