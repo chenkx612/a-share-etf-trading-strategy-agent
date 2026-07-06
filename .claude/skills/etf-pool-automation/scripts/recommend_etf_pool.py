@@ -19,8 +19,9 @@ from utils import (  # noqa: E402
     fill_default_start,
     generate_recommendations,
     log_step,
+    ProjectPaths,
+    read_daily,
     resolve_recommendation_date,
-    strict_recent_universe_backfill,
     write_summary,
 )
 
@@ -40,11 +41,7 @@ def main() -> None:
     args = parse_args()
     fill_default_start(args)
     automation_dir = automation_dir_from_args(args)
-    verified = strict_recent_universe_backfill(
-        args,
-        automation_dir / "selected_universe.csv",
-        label="selected universe",
-    )
+    verified = read_daily(ProjectPaths(Path(args.data_root)))
     recommendation_date = resolve_recommendation_date(args, verified, automation_dir / "selected_universe.csv")
     recommendation_path = generate_recommendations(args, automation_dir, recommendation_date)
     write_summary(args, automation_dir, recommendation_path, recommendation_date)

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,12 +35,9 @@ from quant_core.cli import (  # noqa: E402
 )
 from quant_core.config import STRATEGY_NAME  # noqa: E402
 from quant_core.data.market_data import (  # noqa: E402
-    AkshareMarketDataClient,
     ProjectPaths,
     expanded_universe as build_expanded_universe,
-    fetch_tencent_daily_if_stale,
     load_universe,
-    merge_and_store_daily,
     parse_symbol_list,
     resolve_complete_universe_date,
     write_table,
@@ -52,8 +49,8 @@ from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_thresho
 DEFAULT_RUN_ID = "current"
 DEFAULT_TOP_N = "4,5,6"
 DEFAULT_FEE_RATE = "0.0003"
-DEFAULT_SHARPE_WINDOW = "15,20,25,30,35"
-DEFAULT_FACTOR_LOWER_BOUND = "-1.0,-0.5,0.0,0.5,1.0"
+DEFAULT_SHARPE_WINDOW = "20,25,30"
+DEFAULT_FACTOR_LOWER_BOUND = "0.0,0.5,1.0"
 DEFAULT_CORR_WINDOW = "100"
 DEFAULT_CORR_THRESHOLD = "0.9"
 DEFAULT_STOP_LOSS_PCT = "0.1"
@@ -360,6 +357,7 @@ def run_pool_optimization(args: argparse.Namespace, candidates: str, run_id: str
     start_date = pd.Timestamp(args.start)
     end_date = pd.Timestamp(args.date)
     run_dir_path = run_dir(Path(args.root), run_id)
+    run_dir_path.mkdir(parents=True, exist_ok=True)
 
     all_results = []
     evaluations = []
@@ -627,41 +625,6 @@ def candidate_pool_frame(base_universe: pd.DataFrame, candidate_symbol: str | No
         "fund_size": pd.NA,
     }
     return pd.concat([out, pd.DataFrame([row])], ignore_index=True)
-
-
-def strict_recent_universe_backfill(
-    args: argparse.Namespace,
-    universe_csv: Path,
-    *,
-    label: str,
-    lookback_days: int = 10,
-) -> pd.DataFrame:
-    start_time = time.monotonic()
-    log_step(f"START {label} Tencent recent backfill")
-    paths = ProjectPaths(Path(args.data_root))
-    universe = pd.read_csv(universe_csv)
-    universe["symbol"] = universe["symbol"].astype(str)
-    end = datetime.strptime(args.date, "%Y-%m-%d").date()
-    start = max(datetime.strptime(args.start, "%Y-%m-%d").date(), end - timedelta(days=lookback_days))
-    market_data = AkshareMarketDataClient(adjust="qfq")
-    incoming, target_trade_date = fetch_tencent_daily_if_stale(
-        market_data,
-        universe,
-        start,
-        end,
-        paths=paths,
-        log=log_step,
-    )
-    if incoming.empty:
-        verified = read_daily(paths)
-    else:
-        verified = merge_and_store_daily(paths, incoming, label)
-    verified["symbol"] = verified["symbol"].astype(str)
-    log_step(
-        f"END {label} Tencent recent backfill ({time.monotonic() - start_time:.1f}s): "
-        f"target trade date={target_trade_date}; incoming rows={len(incoming)}; verified rows={len(verified)}"
-    )
-    return verified
 
 
 def resolve_recommendation_date(args: argparse.Namespace, daily: pd.DataFrame, universe_csv: Path) -> str:

@@ -19,6 +19,7 @@ from quant_core.config import (
 )
 from quant_core.data.market_data import (
     AkshareMarketDataClient,
+    DEFAULT_ADJUST,
     ProjectPaths,
     fetch_daily_if_stale,
     load_universe,
@@ -247,7 +248,8 @@ def resolve_data_universe(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
 
 
 def effective_adjust(args: argparse.Namespace) -> str:
-    return getattr(args, "adjust", None) or ""
+    adjust = getattr(args, "adjust", None)
+    return DEFAULT_ADJUST if adjust is None else adjust
 
 
 def load_strategy_universe(args: argparse.Namespace) -> pd.DataFrame:
@@ -275,6 +277,7 @@ def command_data_update(args: argparse.Namespace) -> None:
         parse_date(args.end),
         existing=existing,
         fetch_one=market_data.fetch_daily,
+        force_refresh=getattr(args, "force_refresh", False),
         log=print,
     )
     daily = merge_incremental(existing, incoming)
@@ -446,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     data_update.add_argument("--universe")
     data_update.add_argument("--universe-name", default="default")
     data_update.add_argument("--adjust")
+    data_update.add_argument("--force-refresh", action="store_true")
     data_update.set_defaults(func=command_data_update)
 
     factor = sub.add_parser("factor")

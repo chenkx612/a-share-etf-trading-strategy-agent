@@ -22,6 +22,8 @@ STANDARD_COLUMNS = [
     "turnover",
 ]
 
+DEFAULT_ADJUST = "qfq"
+
 
 def parquet_available() -> bool:
     try:
@@ -102,7 +104,7 @@ class ProjectPaths:
 class AkshareMarketDataClient:
     """AKShare-backed ETF daily data client with normalized output schema."""
 
-    adjust: str = ""
+    adjust: str = DEFAULT_ADJUST
 
     def fetch_daily(
         self,
@@ -336,10 +338,14 @@ def fetch_daily_if_stale(
     *,
     existing: pd.DataFrame | None,
     fetch_one: Callable[[pd.DataFrame, date, date], pd.DataFrame],
+    force_refresh: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, date]:
     target_trade_date = latest_trade_date_on_or_before(end)
-    stale_symbols = missing_symbols_for_date(existing, universe, target_trade_date)
+    if force_refresh:
+        stale_symbols = sorted(universe["symbol"].astype(str).unique().tolist())
+    else:
+        stale_symbols = missing_symbols_for_date(existing, universe, target_trade_date)
     if not stale_symbols:
         if log is not None:
             log(f"local daily data already covers latest trade date {target_trade_date}; skip fetch")
@@ -350,7 +356,10 @@ def fetch_daily_if_stale(
         log(f"refresh start adjusted from {start} to {effective_start} for five-year qfq refresh window")
     stale_universe = universe[universe["symbol"].astype(str).isin(stale_symbols)].copy()
     if log is not None:
-        log(f"refresh stale symbols for latest trade date {target_trade_date}: {stale_symbols}")
+        if force_refresh:
+            log(f"force refresh adjusted daily window for latest trade date {target_trade_date}: {stale_symbols}")
+        else:
+            log(f"refresh stale symbols for latest trade date {target_trade_date}: {stale_symbols}")
     incoming = fetch_one(stale_universe, effective_start, end)
     missing = missing_symbols_for_date(incoming, stale_universe, target_trade_date)
     if missing:

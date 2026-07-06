@@ -431,10 +431,12 @@ def test_data_update_does_not_create_outputs_directory(
             "turnover": 1,
         }
     ])
+    clients = []
 
     class DummyMarketDataClient:
         def __init__(self, adjust: str) -> None:
             self.adjust = adjust
+            clients.append(self)
 
         def fetch_daily(self, *args: object, **kwargs: object) -> pd.DataFrame:
             raise AssertionError("fetch_daily should be supplied to the stale-fetch helper only")
@@ -454,9 +456,11 @@ def test_data_update_does_not_create_outputs_directory(
             universe=str(universe_path),
             universe_name="sector-rotation",
             adjust=None,
+            force_refresh=False,
         )
     )
 
+    assert clients[0].adjust == "qfq"
     assert not (tmp_path / "outputs").exists()
     data_files = list((tmp_path / "data").iterdir())
     assert len(data_files) == 1
@@ -887,6 +891,60 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
     assert target_trade_date == TEST_DAY
     assert fetched_symbols == ["510300"]
     assert incoming["symbol"].tolist() == ["510300"]
+
+
+def test_fetch_daily_if_stale_force_refreshes_all_symbols_even_when_covered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
+    universe = pd.DataFrame([
+        {"symbol": "510300", "name": "沪深300ETF"},
+        {"symbol": "510500", "name": "中证500ETF"},
+    ])
+    existing = pd.DataFrame([
+        {
+            "date": pd.Timestamp(TEST_DATE),
+            "symbol": "510300",
+            "name": "沪深300ETF",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "amount": 1,
+            "turnover": 1,
+        },
+        {
+            "date": pd.Timestamp(TEST_DATE),
+            "symbol": "510500",
+            "name": "中证500ETF",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1,
+            "amount": 1,
+            "turnover": 1,
+        },
+    ])
+    fetched_symbols = []
+
+    def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+        fetched_symbols.extend(single["symbol"].astype(str).tolist())
+        return existing.copy()
+
+    incoming, target_trade_date = fetch_daily_if_stale(
+        universe,
+        date(2026, 1, 1),
+        TEST_END_DAY,
+        existing=existing,
+        fetch_one=fetch_one,
+        force_refresh=True,
+    )
+
+    assert target_trade_date == TEST_DAY
+    assert fetched_symbols == ["510300", "510500"]
+    assert incoming["symbol"].astype(str).tolist() == ["510300", "510500"]
 
 
 def test_fetch_daily_if_stale_refuses_partial_market_data_refresh(monkeypatch: pytest.MonkeyPatch) -> None:

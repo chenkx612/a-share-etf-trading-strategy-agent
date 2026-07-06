@@ -20,7 +20,6 @@ from utils import (  # noqa: E402
     require_reviewed_candidates,
     reset_run_dir,
     run_command,
-    strict_recent_universe_backfill,
     write_reviewed_candidate_outputs,
 )
 
@@ -62,13 +61,11 @@ def main() -> None:
             str(automation_dir / "expanded_refresh_universe.csv"),
             "--universe-name",
             "sector-rotation",
+            "--adjust",
+            "qfq",
+            "--force-refresh",
         ],
         "data update",
-    )
-    strict_recent_universe_backfill(
-        args,
-        automation_dir / "expanded_refresh_universe.csv",
-        label="expanded universe",
     )
     log_step(f"prepare stage complete ({time.monotonic() - whole_start:.1f}s)")
 
