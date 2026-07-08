@@ -1,6 +1,6 @@
 # Quant Agent
 
-Quant Agent 将量化框架基建和 Claude skill 工作流分开维护。`src/quant_core/` 提供数据、因子、策略、回测、报告和 CLI 等通用能力；具体任务、业务知识、脚本和运行产物放在 `.claude/skills/` 下的独立技能目录中。
+Quant Agent 将量化框架基建和 Agent skill 工作流分开维护。`src/quant_core/` 提供数据、因子、策略、回测、报告和 CLI 等通用能力；具体任务、业务知识、脚本和运行产物放在 `.agents/skills/` 下的独立技能目录中。
 
 ## Quick start
 
@@ -21,7 +21,7 @@ python3 -m quant_core.cli recommend today --universe path/to/universe.csv --date
 src/quant_core/      # Framework package and CLI implementation
 tests/               # Framework tests
 docs/                # Framework development docs only
-.claude/skills/      # Skill workflows, references, assets, scripts, and outputs
+.agents/skills/      # Skill workflows, references, assets, scripts, and outputs
 ```
 
 运行命令默认把本地日线缓存写到当前工作目录下的 `data/etf_daily.*`，把因子、回测和推荐等中间结果写到 `outputs/`。股票池不再保存在 `data/` 下；调用框架 CLI 时通过 `--universe path/to/universe.csv` 显式传入。
@@ -29,7 +29,7 @@ docs/                # Framework development docs only
 技能应显式把 `--root` 指向自己的 `outputs/` 子目录，避免在项目根目录产生中间结果：
 
 ```bash
-python3 -m quant_core.cli --root .claude/skills/etf-pool-automation/outputs/sector_rotation factor compute --start 2026-05-01 --end 2026-05-31
+python3 -m quant_core.cli --root .agents/skills/etf-pool-automation/outputs/sector_rotation factor compute --start 2026-05-01 --end 2026-05-31
 ```
 
 ## Docs

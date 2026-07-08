@@ -2,7 +2,7 @@
 
 This directory documents the framework under `src/quant_core/`.
 
-Do not store quantitative trading business knowledge, prompt references, strategy research notes, run logs, or generated reports here. Skill-specific input knowledge belongs under `.claude/skills/<skill-name>/references/`, independently runnable workflow scripts under `.claude/skills/<skill-name>/scripts/`, output templates under `.claude/skills/<skill-name>/assets/`, and generated artifacts under `.claude/skills/<skill-name>/outputs/`.
+Do not store quantitative trading business knowledge, prompt references, strategy research notes, run logs, or generated reports here. Skill-specific input knowledge belongs under `.agents/skills/<skill-name>/references/`, independently runnable workflow scripts under `.agents/skills/<skill-name>/scripts/`, output templates under `.agents/skills/<skill-name>/assets/`, and generated artifacts under `.agents/skills/<skill-name>/outputs/`.
 
 ## Contents
 

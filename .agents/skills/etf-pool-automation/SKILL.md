@@ -1,26 +1,22 @@
 ---
 name: etf-pool-automation
 description: Select large A-share ETF candidates with keyword review flags, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the sharpe-corr-threshold strategy, prune the worst contribution ETF when that improves Sortino, select/apply the final best pool, and output same-day recommendations from the final best pool and parameters.
-argument-hint: "[--date YYYY-MM-DD] [--apply] [optional candidate1[:name],candidate2[:name],candidate3[:name] override]"
 ---
 
 # ETF Pool Automation
 
-Run from repo root.
+Run from the repository root.
 
 ```bash
-cd /Users/chenkx/quant-agent
 TRADE_DATE="${TRADE_DATE:-$(date +%F)}"
-RUN_ID="current"
-RUN_DIR=".claude/skills/etf-pool-automation/outputs"
-DATA_ROOT="."
+RUN_DIR=".agents/skills/etf-pool-automation/outputs"
 ```
 
 ## Directory Roles
 
 - `references/`: input prompts, knowledge, and static reference data used by the skill. The fallback base `sector_rotation_universe.csv` belongs here.
 - `scripts/`: independently runnable scripts with their own CLI entry points for AI-callable stages. Shared helper code may live in `scripts/utils.py` or a clearly named `utils/` module; do not call helper modules directly as workflow stages.
-- `assets/`: output templates or reusable files copied into generated outputs. Do not store input knowledge or base universes here.
+- `outputs/`: generated run artifacts only. Treat it as disposable unless `--apply` backs up the previous base pool there.
 
 ## SOP
 
@@ -60,7 +56,7 @@ DATA_ROOT="."
 Stage 1, candidate discovery:
 
 ```bash
-python3 .claude/skills/etf-pool-automation/scripts/select_etf_candidates.py \
+python3 .agents/skills/etf-pool-automation/scripts/select_etf_candidates.py \
   --date "$TRADE_DATE" \
   --output-dir "$RUN_DIR"
 ```
@@ -72,7 +68,7 @@ Read `${RUN_DIR}/candidate_selected.csv` and `${RUN_DIR}/candidate_shortlist.csv
 Stage 3, prepare reviewed pool and data:
 
 ```bash
-python3 .claude/skills/etf-pool-automation/scripts/prepare_etf_pool_run.py \
+python3 .agents/skills/etf-pool-automation/scripts/prepare_etf_pool_run.py \
   --date "$TRADE_DATE" \
   --candidates "$CANDIDATES"
 ```
@@ -80,14 +76,14 @@ python3 .claude/skills/etf-pool-automation/scripts/prepare_etf_pool_run.py \
 Stage 4, optimize pools and pruning challenge:
 
 ```bash
-python3 .claude/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
+python3 .agents/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
   --date "$TRADE_DATE"
 ```
 
 Append `--apply` to the optimize command only when requested:
 
 ```bash
-python3 .claude/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
+python3 .agents/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
   --date "$TRADE_DATE" \
   --apply
 ```
@@ -95,13 +91,13 @@ python3 .claude/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
 Stage 5, generate recommendation and summary:
 
 ```bash
-python3 .claude/skills/etf-pool-automation/scripts/recommend_etf_pool.py \
+python3 .agents/skills/etf-pool-automation/scripts/recommend_etf_pool.py \
   --date "$TRADE_DATE"
 ```
 
 If any candidate is still missing after refresh, stop and report no market data.
 
-Data refresh only checks the existing local daily table under `DATA_ROOT`; there is no separate skill cache directory. `DATA_ROOT` defaults to the repository root, so daily bars live in the framework-level `data/etf_daily.*` file rather than under `.claude/skills/...`. The sector-rotation pool itself belongs to `references/sector_rotation_universe.csv`, not `data/`. Daily bars must use qfq adjusted prices. The prepare stage force-refreshes the expanded universe over the adjusted daily window, because qfq data can be restated after splits or distributions. The recommendation stage must not fetch market data; it only verifies the local table can provide a complete selected-universe recommendation date on or before `TRADE_DATE`. If a requested symbol is still missing from the local market data result, stop and report no market data for that symbol.
+Data refresh only checks the existing local daily table under `DATA_ROOT`; there is no separate skill cache directory. `DATA_ROOT` defaults to the repository root, so daily bars live in the framework-level `data/etf_daily.*` file rather than under `.agents/skills/...`. The sector-rotation pool itself belongs to `references/sector_rotation_universe.csv`, not `data/`. Daily bars must use qfq adjusted prices. The prepare stage force-refreshes the expanded universe over the adjusted daily window, because qfq data can be restated after splits or distributions. The recommendation stage must not fetch market data; it only verifies the local table can provide a complete selected-universe recommendation date on or before `TRADE_DATE`. If a requested symbol is still missing from the local market data result, stop and report no market data for that symbol.
 
 ## Script Responsibilities
 

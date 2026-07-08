@@ -15,7 +15,7 @@ The framework must not store skill state, prompt content, generated artifacts, t
 
 ## Dependency Direction
 
-Skills may import and call `quant_core`. `quant_core` must not import from `.claude/skills/`.
+Skills may import and call `quant_core`. `quant_core` must not import from `.agents/skills/`.
 
 CLI commands should accept an explicit `--root` when they create `data/` or `outputs/` artifacts. Skills are responsible for passing a root under their own `outputs/` directory.
 

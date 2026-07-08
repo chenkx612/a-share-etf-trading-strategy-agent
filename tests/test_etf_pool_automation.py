@@ -20,7 +20,7 @@ from quant_core.data.market_data import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SKILL_SCRIPT_DIR = REPO_ROOT / ".claude" / "skills" / "etf-pool-automation" / "scripts"
+SKILL_SCRIPT_DIR = REPO_ROOT / ".agents" / "skills" / "etf-pool-automation" / "scripts"
 TEST_DATE = "2026-06-12"
 TEST_DAY = date(2026, 6, 12)
 TEST_END_DAY = date(2026, 6, 14)
@@ -92,11 +92,11 @@ def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
     runner = load_skill_script("utils")
     selector = load_skill_script("select_etf_candidates")
 
-    assert runner.DEFAULT_ROOT == ".claude/skills/etf-pool-automation/outputs"
-    assert selector.DEFAULT_BASE_POOL == REPO_ROOT / ".claude" / "skills" / "etf-pool-automation" / "references" / "sector_rotation_universe.csv"
-    assert runner.run_dir(Path(runner.DEFAULT_ROOT), "current") == Path(".claude/skills/etf-pool-automation/outputs")
+    assert runner.DEFAULT_ROOT == ".agents/skills/etf-pool-automation/outputs"
+    assert selector.DEFAULT_BASE_POOL == REPO_ROOT / ".agents" / "skills" / "etf-pool-automation" / "references" / "sector_rotation_universe.csv"
+    assert runner.run_dir(Path(runner.DEFAULT_ROOT), "current") == Path(".agents/skills/etf-pool-automation/outputs")
     assert runner.run_dir(Path(runner.DEFAULT_ROOT), "reviewed") == Path(
-        ".claude/skills/etf-pool-automation/outputs/reviewed"
+        ".agents/skills/etf-pool-automation/outputs/reviewed"
     )
 
 
