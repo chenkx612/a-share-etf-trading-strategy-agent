@@ -1,15 +1,15 @@
 ---
-name: etf-pool-automation
-description: Select large A-share ETF candidates with keyword review flags, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the sharpe-corr-threshold strategy, prune the worst contribution ETF when that improves Sortino, select/apply the final best pool, and output same-day recommendations from the final best pool and parameters.
+name: etf-sharpe-topk
+description: Select large A-share ETF candidates with keyword review flags, require AI semantic de-duplication review before choosing exactly three candidates, compare each candidate with the current sector-rotation pool, optimize the sharpe-corr-threshold strategy, prune the worst contribution ETF when that improves Sortino, select/apply the final best pool, and output next-trading-day Top-K ETF recommendations from the final best pool and parameters.
 ---
 
-# ETF Pool Automation
+# ETF Sharpe Top-K
 
 Run from the repository root.
 
 ```bash
 TRADE_DATE="${TRADE_DATE:-$(date +%F)}"
-RUN_DIR=".agents/skills/etf-pool-automation/outputs"
+RUN_DIR=".agents/skills/etf-sharpe-topk/outputs"
 ```
 
 ## Directory Roles
@@ -56,7 +56,7 @@ RUN_DIR=".agents/skills/etf-pool-automation/outputs"
 Stage 1, candidate discovery:
 
 ```bash
-python3 .agents/skills/etf-pool-automation/scripts/select_etf_candidates.py \
+python3 .agents/skills/etf-sharpe-topk/scripts/select_etf_candidates.py \
   --date "$TRADE_DATE" \
   --output-dir "$RUN_DIR"
 ```
@@ -68,7 +68,7 @@ Read `${RUN_DIR}/candidate_selected.csv` and `${RUN_DIR}/candidate_shortlist.csv
 Stage 3, prepare reviewed pool and data:
 
 ```bash
-python3 .agents/skills/etf-pool-automation/scripts/prepare_etf_pool_run.py \
+python3 .agents/skills/etf-sharpe-topk/scripts/prepare_etf_pool_run.py \
   --date "$TRADE_DATE" \
   --candidates "$CANDIDATES"
 ```
@@ -76,14 +76,14 @@ python3 .agents/skills/etf-pool-automation/scripts/prepare_etf_pool_run.py \
 Stage 4, optimize pools and pruning challenge:
 
 ```bash
-python3 .agents/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
+python3 .agents/skills/etf-sharpe-topk/scripts/optimize_etf_pool.py \
   --date "$TRADE_DATE"
 ```
 
 Append `--apply` to the optimize command only when requested:
 
 ```bash
-python3 .agents/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
+python3 .agents/skills/etf-sharpe-topk/scripts/optimize_etf_pool.py \
   --date "$TRADE_DATE" \
   --apply
 ```
@@ -91,7 +91,7 @@ python3 .agents/skills/etf-pool-automation/scripts/optimize_etf_pool.py \
 Stage 5, generate recommendation and summary:
 
 ```bash
-python3 .agents/skills/etf-pool-automation/scripts/recommend_etf_pool.py \
+python3 .agents/skills/etf-sharpe-topk/scripts/recommend_etf_pool.py \
   --date "$TRADE_DATE"
 ```
 

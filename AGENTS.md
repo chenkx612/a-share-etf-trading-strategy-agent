@@ -13,7 +13,7 @@
 - `python3 -m quant_core.cli data update --universe path/to/universe.csv --start 2024-01-01 --end 2024-12-31`: fetch/update ETF daily data.
 - `python3 -m quant_core.cli factor compute --start 2024-01-01 --end 2024-12-31`: compute factor tables.
 - `python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31`: run the Sharpe/correlation/threshold strategy backtest.
-- `python3 -m quant_core.cli --root .agents/skills/etf-pool-automation/outputs/sector_rotation recommend today --universe .agents/skills/etf-pool-automation/outputs/sector_rotation/selected_universe.csv --date 2024-12-31 --top-n 10`: generate skill-scoped recommendations.
+- `python3 -m quant_core.cli --root .agents/skills/etf-sharpe-topk/outputs/sector_rotation recommend today --universe .agents/skills/etf-sharpe-topk/outputs/sector_rotation/selected_universe.csv --date 2024-12-31 --top-n 10`: generate skill-scoped recommendations.
 
 ## Coding Style & Naming Conventions
 

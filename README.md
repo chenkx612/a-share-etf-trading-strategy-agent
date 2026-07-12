@@ -29,7 +29,7 @@ docs/                # Framework development docs only
 技能应显式把 `--root` 指向自己的 `outputs/` 子目录，避免在项目根目录产生中间结果：
 
 ```bash
-python3 -m quant_core.cli --root .agents/skills/etf-pool-automation/outputs/sector_rotation factor compute --start 2026-05-01 --end 2026-05-31
+python3 -m quant_core.cli --root .agents/skills/etf-sharpe-topk/outputs/sector_rotation factor compute --start 2026-05-01 --end 2026-05-31
 ```
 
 ## Docs
