@@ -99,6 +99,8 @@ def test_run_once_uses_workspace_write_codex_and_evaluates_gate(tmp_path: Path) 
 
     result = json.loads(result_path.read_text(encoding="utf-8"))
     command = list(codex_commands[0])
+    assert command[command.index("--model") + 1] == "gpt-5.6-sol"
+    assert command[command.index("--config") + 1] == 'model_reasoning_effort="medium"'
     assert command[command.index("--sandbox") + 1] == "workspace-write"
     assert command[command.index("--ask-for-approval") + 1] == "never"
     assert "--json" in command

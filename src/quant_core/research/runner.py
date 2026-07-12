@@ -177,7 +177,9 @@ def run_once(
     codex = raw["codex"]
     timeout = int(codex["timeout_minutes"]) * 60
     codex_command = [
-        "codex", "--ask-for-approval", codex["approval_policy"], "exec",
+        "codex", "--model", "gpt-5.6-sol",
+        "--config", 'model_reasoning_effort="medium"',
+        "--ask-for-approval", codex["approval_policy"], "exec",
         "--ephemeral", "--skip-git-repo-check", "--sandbox", codex["sandbox"], "--json",
         "--output-schema", str(schema_path), "--output-last-message", str(agent_output_path),
         "--cd", str(root), "-",
