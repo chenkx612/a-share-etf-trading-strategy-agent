@@ -1,4 +1,4 @@
-# Automated Strategy Research Loop
+# Loop Harness
 
 ## 目标
 

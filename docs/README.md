@@ -8,4 +8,5 @@ Do not store quantitative trading business knowledge, prompt references, strateg
 
 - `architecture.md`: framework module boundaries and package layout.
 - `skill_contract.md`: skill directory responsibilities, stage boundaries, and dependency rules.
-- `strategy-research-loop.md`: goals, mechanisms, and implementation stages for automated strategy research.
+- `loop-harness.md`: Harness goals, workflow, components, and implementation stages.
+- `loop-harness-contracts.md`: task configuration and single-experiment result contracts.
