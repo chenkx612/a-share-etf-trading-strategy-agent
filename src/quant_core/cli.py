@@ -31,6 +31,7 @@ from quant_core.data.market_data import (
     write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
+from quant_core.research import run_once
 from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
 
 
@@ -436,6 +437,14 @@ def command_recommend_today(args: argparse.Namespace) -> None:
     print(f"wrote {len(selected)} recommendations to {out}")
 
 
+def command_research_run_once(args: argparse.Namespace) -> None:
+    result_path = run_once(args.task, args.experiment_id, args.output, workspace=args.root)
+    print(f"wrote experiment result to {result_path}")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if result.get("status") != "completed":
+        raise SystemExit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quant-agent")
     parser.add_argument("--root", default=".")
@@ -520,6 +529,14 @@ def build_parser() -> argparse.ArgumentParser:
     report_build = report_sub.add_parser("build")
     report_build.add_argument("--run-id", required=True)
     report_build.set_defaults(func=command_report_build)
+
+    research = sub.add_parser("research")
+    research_sub = research.add_subparsers(dest="command", required=True)
+    research_run_once = research_sub.add_parser("run-once")
+    research_run_once.add_argument("--task", required=True)
+    research_run_once.add_argument("--experiment-id", required=True)
+    research_run_once.add_argument("--output", required=True)
+    research_run_once.set_defaults(func=command_research_run_once)
     return parser
 
 

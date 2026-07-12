@@ -45,9 +45,21 @@ class ResearchTask:
     def from_mapping(cls, data: Mapping[str, Any]) -> ResearchTask:
         _required(data, "id", str, "task")
         _required(data, "goal", str, "task")
-        max_iterations = data.get("max_iterations")
-        if not isinstance(max_iterations, int) or isinstance(max_iterations, bool) or max_iterations < 1:
-            raise ValueError("task.max_iterations must be a positive integer")
+        budget = _required(data, "budget", dict, "task")
+        for key in ("max_rounds", "max_hours", "max_consecutive_failures"):
+            value = budget.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"task.budget.{key} must be a positive integer")
+
+        codex = _required(data, "codex", dict, "task")
+        sandbox = _required(codex, "sandbox", str, "task.codex")
+        if sandbox != "workspace-write":
+            raise ValueError("task.codex.sandbox must be 'workspace-write'")
+        if _required(codex, "approval_policy", str, "task.codex") != "never":
+            raise ValueError("task.codex.approval_policy must be 'never' for unattended execution")
+        timeout_minutes = codex.get("timeout_minutes")
+        if not isinstance(timeout_minutes, int) or isinstance(timeout_minutes, bool) or timeout_minutes < 1:
+            raise ValueError("task.codex.timeout_minutes must be a positive integer")
 
         source = _required(data, "data", dict, "task")
         _required(source, "universe", str, "task.data")
@@ -59,9 +71,18 @@ class ResearchTask:
         commands = _required(data, "commands", dict, "task")
         cls._string_list(commands, "test", required=True)
         cls._string_list(commands, "backtest", required=True)
+        metrics_path = _required(commands, "metrics_path", str, "task.commands")
+        backtest_template = " ".join(commands["backtest"])
+        for placeholder in ("{start}", "{end}", "{run_id}"):
+            if placeholder not in backtest_template:
+                raise ValueError(f"task.commands.backtest must contain {placeholder}")
+        if "{run_id}" not in metrics_path:
+            raise ValueError("task.commands.metrics_path must contain {run_id}")
 
         evaluation = _required(data, "evaluation", dict, "task")
         mode = _required(evaluation, "mode", str, "task.evaluation")
+        if mode != "fixed":
+            raise ValueError("task.evaluation.mode must be 'fixed'")
         _required(evaluation, "objective", str, "task.evaluation")
         constraints = _required(evaluation, "constraints", dict, "task.evaluation")
         if not constraints or not all(
@@ -72,29 +93,21 @@ class ResearchTask:
             for key, value in constraints.items()
         ):
             raise ValueError("task.evaluation.constraints must contain numeric limits")
-        if mode == "fixed":
-            fixed = _required(evaluation, "fixed", dict, "task.evaluation")
-            train = _period(_required(fixed, "train", dict, "task.evaluation.fixed"), "task.evaluation.fixed.train")
-            validation = _period(
-                _required(fixed, "validation", dict, "task.evaluation.fixed"),
-                "task.evaluation.fixed.validation",
-            )
-            if train[1] >= validation[0]:
-                raise ValueError("fixed train and validation periods must not overlap")
-        elif mode == "walk_forward":
-            walk = _required(evaluation, "walk_forward", dict, "task.evaluation")
-            research_period = _period(walk, "task.evaluation.walk_forward")
-            for key in ("train_months", "validation_months", "step_months"):
-                value = walk.get(key)
-                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                    raise ValueError(f"task.evaluation.walk_forward.{key} must be a positive integer")
-        else:
-            raise ValueError("task.evaluation.mode must be 'fixed' or 'walk_forward'")
+        fixed = _required(evaluation, "fixed", dict, "task.evaluation")
+        development = _period(
+            _required(fixed, "development", dict, "task.evaluation.fixed"),
+            "task.evaluation.fixed.development",
+        )
+        gate = _period(
+            _required(fixed, "gate", dict, "task.evaluation.fixed"),
+            "task.evaluation.fixed.gate",
+        )
+        if development[1] >= gate[0]:
+            raise ValueError("fixed development and gate periods must not overlap")
 
         test = _required(evaluation, "test", dict, "task.evaluation")
         test_period = _period(test, "task.evaluation.test")
-        research_end = validation[1] if mode == "fixed" else research_period[1]
-        if research_end >= test_period[0]:
+        if gate[1] >= test_period[0]:
             raise ValueError("test period must start after the research period")
 
         baseline = data.get("baseline")
@@ -140,18 +153,13 @@ class ExperimentResult:
             _required(changes, "summary", str, "result.changes")
             ResearchTask._string_list(changes, "files", required=True)
 
-            verification = _required(data, "verification", dict, "result")
-            for key in ("tests_passed", "backtest_completed"):
-                if not isinstance(verification.get(key), bool):
-                    raise ValueError(f"result.verification.{key} must be a boolean")
-
             metrics = _required(data, "metrics", dict, "result")
-            has_fixed = "train" in metrics and "validation" in metrics
-            has_walk_forward = "walk_forward" in metrics
-            if has_fixed == has_walk_forward:
-                raise ValueError("result.metrics must contain fixed or walk-forward metrics")
+            if "development" not in metrics or "gate" not in metrics:
+                raise ValueError("result.metrics must contain development and gate metrics")
             if "test" in metrics:
                 raise ValueError("result.metrics must not contain test metrics during the research loop")
+            if not all(isinstance(metrics[key], dict) for key in ("development", "gate")):
+                raise ValueError("result development and gate metrics must be objects")
         else:
             _required(data, "error", str, "result")
 

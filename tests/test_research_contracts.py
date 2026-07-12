@@ -9,17 +9,25 @@ def fixed_task() -> dict:
     return {
         "id": "etf-momentum",
         "goal": "Develop an ETF momentum strategy",
-        "max_iterations": 3,
+        "budget": {"max_rounds": 3, "max_hours": 4, "max_consecutive_failures": 2},
+        "codex": {"sandbox": "workspace-write", "approval_policy": "never", "timeout_minutes": 60},
         "data": {"universe": "universe.csv"},
         "scope": {"editable": ["src/quant_core/strategy/"], "forbidden": ["data/"]},
-        "commands": {"test": ["pytest"], "backtest": ["python3", "-m", "quant_core.cli"]},
+        "commands": {
+            "test": ["pytest"],
+            "backtest": [
+                "python3", "-m", "quant_core.cli",
+                "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}",
+            ],
+            "metrics_path": "outputs/backtests/{run_id}/metrics.json",
+        },
         "evaluation": {
             "mode": "fixed",
             "objective": "sortino",
             "constraints": {"max_drawdown": 0.20},
             "fixed": {
-                "train": {"start": "2018-01-01", "end": "2021-12-31"},
-                "validation": {"start": "2022-01-01", "end": "2024-12-31"},
+                "development": {"start": "2018-01-01", "end": "2021-12-31"},
+                "gate": {"start": "2022-01-01", "end": "2024-12-31"},
             },
             "test": {"start": "2025-01-01", "end": "2025-12-31"},
         },
@@ -32,12 +40,35 @@ def completed_result() -> dict:
         "status": "completed",
         "hypothesis": "Medium-term momentum persists",
         "changes": {"summary": "Add a momentum strategy", "files": ["strategy.py"]},
-        "verification": {"tests_passed": True, "backtest_completed": True},
         "metrics": {
-            "train": {"sortino": 1.4, "max_drawdown": -0.12},
-            "validation": {"sortino": 1.1, "max_drawdown": -0.16},
+            "development": {"sortino": 1.4, "max_drawdown": -0.12},
+            "gate": {"sortino": 1.1, "max_drawdown": -0.16},
         },
     }
+
+
+def test_task_requires_positive_budget() -> None:
+    payload = fixed_task()
+    payload["budget"]["max_rounds"] = 0
+
+    with pytest.raises(ValueError, match="max_rounds"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_unattended_codex_permissions() -> None:
+    payload = fixed_task()
+    payload["codex"]["approval_policy"] = "on-request"
+
+    with pytest.raises(ValueError, match="must be 'never'"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_rejects_danger_full_access() -> None:
+    payload = fixed_task()
+    payload["codex"]["sandbox"] = "danger-full-access"
+
+    with pytest.raises(ValueError, match="workspace-write"):
+        ResearchTask.from_mapping(payload)
 
 
 def test_fixed_task_allows_missing_baseline() -> None:
@@ -47,7 +78,7 @@ def test_fixed_task_allows_missing_baseline() -> None:
     assert task.evaluation_mode == "fixed"
 
 
-def test_walk_forward_task_is_supported() -> None:
+def test_walk_forward_task_is_rejected_until_implemented() -> None:
     payload = fixed_task()
     payload["evaluation"] = {
         "mode": "walk_forward",
@@ -63,7 +94,8 @@ def test_walk_forward_task_is_supported() -> None:
         "test": {"start": "2025-01-01", "end": "2025-12-31"},
     }
 
-    assert ResearchTask.from_mapping(payload).evaluation_mode == "walk_forward"
+    with pytest.raises(ValueError, match="must be 'fixed'"):
+        ResearchTask.from_mapping(payload)
 
 
 def test_test_period_must_follow_research_period() -> None:
@@ -96,7 +128,7 @@ def test_completed_result_rejects_test_metrics() -> None:
         ExperimentResult.from_mapping(payload)
 
 
-def test_walk_forward_result_is_supported() -> None:
+def test_walk_forward_result_is_rejected_until_implemented() -> None:
     payload = completed_result()
     payload["metrics"] = {
         "walk_forward": {
@@ -105,7 +137,8 @@ def test_walk_forward_result_is_supported() -> None:
         },
     }
 
-    ExperimentResult.from_mapping(payload)
+    with pytest.raises(ValueError, match="development and gate"):
+        ExperimentResult.from_mapping(payload)
 
 
 def test_failed_result_only_requires_error() -> None:

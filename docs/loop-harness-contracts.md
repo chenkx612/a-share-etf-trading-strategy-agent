@@ -2,13 +2,19 @@
 
 ## Task
 
-`task.toml` describes one research campaign. `baseline` is optional. `evaluation.mode` is `fixed` or `walk_forward`.
-Harness must withhold the `evaluation.test` section from Codex until the loop ends.
-
 ```toml
 id = "strategy-research"
 goal = "Develop a strategy from a testable hypothesis"
-max_iterations = 3
+
+[budget]
+max_rounds = 10
+max_hours = 4
+max_consecutive_failures = 3
+
+[codex]
+sandbox = "workspace-write"
+approval_policy = "never"
+timeout_minutes = 60
 
 [data]
 universe = "path/to/universe.csv"
@@ -18,8 +24,13 @@ editable = ["src/quant_core/strategy/", "tests/"]
 forbidden = ["src/quant_core/backtest/", "data/"]
 
 [commands]
-test = ["pytest"]
-backtest = ["python3", "-m", "quant_core.cli", "backtest", "run"]
+test = ["{python}", "-m", "pytest", "-q"]
+backtest = [
+  "{python}", "-m", "quant_core.cli", "backtest", "run",
+  "--universe", "{universe}", "--start", "{start}", "--end", "{end}",
+  "--run-id", "{run_id}"
+]
+metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
 [evaluation]
 mode = "fixed"
@@ -28,11 +39,11 @@ objective = "sortino"
 [evaluation.constraints]
 max_drawdown = 0.20
 
-[evaluation.fixed.train]
+[evaluation.fixed.development]
 start = "2018-01-01"
 end = "2021-12-31"
 
-[evaluation.fixed.validation]
+[evaluation.fixed.gate]
 start = "2022-01-01"
 end = "2024-12-31"
 
@@ -41,50 +52,45 @@ start = "2025-01-01"
 end = "2025-12-31"
 ```
 
-For walk-forward evaluation, replace `evaluation.fixed` with:
+`baseline` 可选。`{python}` 由 Harness 替换为自身解释器。
 
-```toml
-[evaluation]
-mode = "walk_forward"
-objective = "sortino"
+当前仅支持固定 development/gate 区间；walk-forward 在后续阶段实现。
 
-[evaluation.constraints]
-max_drawdown = 0.20
+`workspace-write` 允许 Codex 修改策略、创建测试并执行命令，但不能修改工作区外的文件。`approval_policy = "never"` 防止无人值守任务等待审批。
 
-[evaluation.walk_forward]
-start = "2018-01-01"
-end = "2024-12-31"
-train_months = 36
-validation_months = 12
-step_months = 12
-```
+运行前必须确保：
+
+- Python 依赖已经安装。
+- 数据和回测输出位于工作区内。
+- 测试与回测命令不依赖系统级修改。
 
 ## Result
 
-Harness writes `result.json` from Codex output and command results. It records facts only; Harness decides acceptance. Test metrics are never included during the loop.
+Harness 写入 `result.json`：
 
 ```json
 {
   "experiment_id": "experiment-001",
   "status": "completed",
-  "hypothesis": "A testable strategy hypothesis",
+  "hypothesis": "A testable hypothesis",
   "changes": {
-    "summary": "Implement the first strategy prototype",
+    "summary": "Implemented the candidate strategy",
     "files": ["src/quant_core/strategy/candidate.py"]
   },
-  "verification": {
-    "tests_passed": true,
-    "backtest_completed": true
-  },
   "metrics": {
-    "train": {
-      "sortino": 1.4,
-      "max_drawdown": -0.12
-    },
-    "validation": {
-      "sortino": 1.1,
-      "max_drawdown": -0.16
-    }
+    "development": {"sortino": 1.4},
+    "gate": {"sortino": 1.1}
   }
 }
+```
+
+Codex 的结构化输出、完整 JSONL 事件、测试日志和回测日志保存在实验目录中。
+
+## Run once
+
+```bash
+quant-agent --root <workspace> research run-once \
+  --task <task.toml> \
+  --experiment-id experiment-001 \
+  --output <experiment-dir>
 ```
