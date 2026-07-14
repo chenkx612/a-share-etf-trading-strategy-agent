@@ -2,12 +2,12 @@
 
 ## 目标
 
-用确定性 Python Harness 控制 Codex 长时间自动研发交易策略：
+用确定性 Python Harness 控制 OpenCode 长时间自动研发交易策略：
 
 - 从 0 到 1 开发新策略。
 - 从 1 到 N 优化已有策略。
 - 连续运行直到达成目标或耗尽预算。
-- 每轮使用独立 `codex exec` 会话。
+- 每轮使用独立 `opencode run` 会话。
 - 实验可评测、可记录、可恢复。
 
 ## 理想工作流
@@ -15,7 +15,7 @@
 ```text
 人工启动 Harness
 → 从 champion 创建候选
-→ codex exec 在开发集内循环研发
+→ opencode run 在开发集内循环研发
 → Harness 运行测试和门禁评测
 → 接受或拒绝候选
 → 保存状态
@@ -23,15 +23,15 @@
 → 达成目标或耗尽预算后停止
 ```
 
-Codex 负责单轮研发。Python Harness 负责外层循环、权限、超时、评测、版本和停止条件。
+OpenCode 负责单轮研发。Python Harness 负责外层循环、权限、超时、评测、版本和停止条件。
 
-阶段二不会把门禁区间写入 Codex Prompt。阶段三让 candidate 只包含开发期数据，但这属于
+阶段二不会把门禁区间写入 OpenCode Prompt。阶段三让 candidate 只包含开发期数据，但这属于
 研发流程隔离，不是限制工作区外读取的安全边界；强物理隔离留到长时间无人值守运行前实现。
 
 ## 所需技术
 
-- 任务配置：目标、数据、修改范围、评测规则、预算和 Codex 权限。
-- 单轮执行器：以独立 `workspace-write` 的 `codex exec` 会话运行研发任务。
+- 任务配置：目标、数据、修改范围、评测规则、预算和 OpenCode 模型。
+- 单轮执行器：以独立 `opencode run --auto --format json` 会话运行研发任务。
 - 评测器：独立运行测试、开发集和门禁集回测。
 - 实验存储：保存事件日志、代码差异、指标和结论。
 - 状态与版本：管理 baseline、champion、候选和失败恢复。
@@ -49,9 +49,9 @@ Codex 负责单轮研发。Python Harness 负责外层循环、权限、超时�
 
 ### 阶段二：打通单轮研发
 
-状态：已完成并通过真实 `codex exec` 演练。
+状态：已迁移为 OpenCode 执行器，自动化测试覆盖命令和事件解析。
 
-实现 `research run-once`：启动 Codex、允许其修改文件和执行命令、限制单轮超时、检查修改范围、执行门禁评测并生成结果。
+实现 `research run-once`：启动 OpenCode、允许其修改文件和执行命令、限制单轮超时、检查修改范围、执行门禁评测并生成结果。
 
 验收：一条命令生成完整实验目录和 `result.json`。
 
@@ -64,7 +64,7 @@ Codex 负责单轮研发。Python Harness 负责外层循环、权限、超时�
 满足约束且门禁目标优于 champion 的候选晋升；失败和拒绝的候选会被清理。
 gate 和 champion 回测在一次性 evaluator 副本中执行，评测产物不会写回 candidate 或 champion。
 版本快照只保存代码；任务初始化时冻结完整评测数据，并生成截止 `development.end` 的开发数据。
-candidate 只注入开发数据，Codex 结束后 evaluator 才换入完整数据。这样既避免每代 champion
+candidate 只注入开发数据，OpenCode 结束后 evaluator 才换入完整数据。这样既避免每代 champion
 重复保存大体积数据，也保证各轮使用同一数据基准。该机制不阻止进程主动读取 candidate 之外
 的路径，因此不作为强安全边界。
 

@@ -22,9 +22,8 @@ max_rounds = 3
 max_hours = 4
 max_consecutive_failures = 2
 
-[codex]
-sandbox = "workspace-write"
-approval_policy = "never"
+[opencode]
+model = "deepseek/deepseek-chat"
 timeout_minutes = 60
 
 [data]
@@ -83,18 +82,17 @@ def _command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) ->
     return 0
 
 
-def _codex_with_signal(signal: float):
+def _opencode_with_signal(signal: float):
     def run(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
         assert not (cwd / "managed-test.toml").exists()
         if (cwd / "data/etf_daily.csv").exists():
             daily = pd.read_csv(cwd / "data/etf_daily.csv")
             assert daily["date"].max() == "2021-12-31"
-        output = Path(command[command.index("--output-last-message") + 1])
-        output.write_text(json.dumps({
+        log_path.write_text(json.dumps({"type": "text", "part": {"text": json.dumps({
             "status": "completed",
             "hypothesis": "A higher signal improves Sortino",
             "summary": f"Set signal to {signal}",
-        }), encoding="utf-8")
+        })}}) + "\n", encoding="utf-8")
         (cwd / "strategy.py").write_text(f"{signal}\n", encoding="utf-8")
         return 0
 
@@ -153,7 +151,7 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
         "experiment-001",
         workspace=tmp_path,
         command_runner=_command,
-        codex_runner=_codex_with_signal(0.9),
+        opencode_runner=_opencode_with_signal(0.9),
     )
     first_decision = json.loads((first_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
@@ -166,7 +164,7 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
         "experiment-002",
         workspace=tmp_path,
         command_runner=_command,
-        codex_runner=_codex_with_signal(1.2),
+        opencode_runner=_opencode_with_signal(1.2),
     )
     second_decision = json.loads((second_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
@@ -184,7 +182,7 @@ def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     task = _task(tmp_path)
 
-    def failed_codex(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
+    def failed_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
         (cwd / "strategy.py").write_text("99.0\n", encoding="utf-8")
         return 1
 
@@ -193,7 +191,7 @@ def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
         "experiment-failed",
         workspace=tmp_path,
         command_runner=_command,
-        codex_runner=failed_codex,
+        opencode_runner=failed_opencode,
     )
     decision = json.loads((result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))

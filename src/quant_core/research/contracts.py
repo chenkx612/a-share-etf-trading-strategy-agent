@@ -51,15 +51,14 @@ class ResearchTask:
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"task.budget.{key} must be a positive integer")
 
-        codex = _required(data, "codex", dict, "task")
-        sandbox = _required(codex, "sandbox", str, "task.codex")
-        if sandbox != "workspace-write":
-            raise ValueError("task.codex.sandbox must be 'workspace-write'")
-        if _required(codex, "approval_policy", str, "task.codex") != "never":
-            raise ValueError("task.codex.approval_policy must be 'never' for unattended execution")
-        timeout_minutes = codex.get("timeout_minutes")
+        opencode = _required(data, "opencode", dict, "task")
+        model = _required(opencode, "model", str, "task.opencode")
+        provider, separator, model_name = model.partition("/")
+        if not separator or not provider or not model_name:
+            raise ValueError("task.opencode.model must use provider/model format")
+        timeout_minutes = opencode.get("timeout_minutes")
         if not isinstance(timeout_minutes, int) or isinstance(timeout_minutes, bool) or timeout_minutes < 1:
-            raise ValueError("task.codex.timeout_minutes must be a positive integer")
+            raise ValueError("task.opencode.timeout_minutes must be a positive integer")
 
         source = _required(data, "data", dict, "task")
         _required(source, "universe", str, "task.data")

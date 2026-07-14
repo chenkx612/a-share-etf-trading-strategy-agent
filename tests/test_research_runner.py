@@ -16,9 +16,8 @@ max_rounds = 3
 max_hours = 4
 max_consecutive_failures = 2
 
-[codex]
-sandbox = "workspace-write"
-approval_policy = "never"
+[opencode]
+model = "deepseek/deepseek-chat"
 timeout_minutes = 60
 
 [data]
@@ -54,24 +53,29 @@ end = "2025-12-31"
 """
 
 
-def test_run_once_uses_workspace_write_codex_and_evaluates_gate(tmp_path: Path) -> None:
+def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK_TOML, encoding="utf-8")
-    codex_commands: list[Sequence[str]] = []
+    opencode_commands: list[Sequence[str]] = []
 
-    def fake_codex(
+    def fake_opencode(
         command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
     ) -> int:
-        codex_commands.append(command)
+        opencode_commands.append(command)
         assert "2022-01-01" not in prompt
         assert "2025-01-01" not in prompt
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        output_path.write_text(
+        agent_output = {
+            "status": "completed",
+            "hypothesis": "Momentum persists",
+            "summary": "Add momentum strategy",
+        }
+        log_path.write_text(
             json.dumps({
-                "status": "completed",
-                "hypothesis": "Momentum persists",
-                "summary": "Add momentum strategy",
-            }),
+                "type": "text",
+                "part": {
+                    "text": f"Done.\n```json\n{json.dumps(agent_output)}\n```\nMetadata: {{\"ignored\": true}}",
+                },
+            }) + "\n",
             encoding="utf-8",
         )
         (cwd / "strategy.py").write_text("SIGNAL = 'momentum'\n", encoding="utf-8")
@@ -94,15 +98,16 @@ def test_run_once_uses_workspace_write_codex_and_evaluates_gate(tmp_path: Path) 
         tmp_path / "experiment-001",
         workspace=tmp_path,
         command_runner=fake_command,
-        codex_runner=fake_codex,
+        opencode_runner=fake_opencode,
     )
 
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    command = list(codex_commands[0])
-    assert command[command.index("--model") + 1] == "gpt-5.6-sol"
-    assert command[command.index("--config") + 1] == 'model_reasoning_effort="medium"'
-    assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert command[command.index("--ask-for-approval") + 1] == "never"
-    assert "--json" in command
+    command = list(opencode_commands[0])
+    assert command[:2] == ["opencode", "run"]
+    assert command[command.index("--model") + 1] == "deepseek/deepseek-chat"
+    assert command[command.index("--format") + 1] == "json"
+    assert command[command.index("--dir") + 1] == str(tmp_path)
+    assert "--auto" in command
+    assert json.loads((result_path.parent / "agent-output.json").read_text(encoding="utf-8"))["status"] == "completed"
     assert result["status"] == "completed"
     assert result["metrics"]["gate"]["sortino"] == 1.2

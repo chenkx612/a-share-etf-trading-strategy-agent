@@ -11,9 +11,8 @@ max_rounds = 10
 max_hours = 4
 max_consecutive_failures = 3
 
-[codex]
-sandbox = "workspace-write"
-approval_policy = "never"
+[opencode]
+model = "deepseek/deepseek-chat"
 timeout_minutes = 60
 
 [data]
@@ -62,7 +61,9 @@ end = "2025-12-31"
 
 当前仅支持固定 development/gate 区间；walk-forward 在后续阶段实现。
 
-`workspace-write` 允许 Codex 修改策略、创建测试并执行命令，但不能修改工作区外的文件。`approval_policy = "never"` 防止无人值守任务等待审批。
+`model` 使用 OpenCode 的 `provider/model` 格式。Harness 以 `opencode run --auto --format json`
+启动无人值守任务，并通过 `OPENCODE_PERMISSION` 禁止访问工作区外目录和运行中提问。
+OpenCode 的权限规则不是操作系统级沙箱；高风险任务应在容器或隔离的 worktree 中运行。
 
 运行前必须确保：
 
@@ -90,7 +91,7 @@ Harness 写入 `result.json`：
 }
 ```
 
-Codex 的结构化输出、完整 JSONL 事件、测试日志和回测日志保存在实验目录中。
+OpenCode 的结构化输出、完整 JSONL 事件、测试日志和回测日志保存在实验目录中。
 
 ## Run once
 

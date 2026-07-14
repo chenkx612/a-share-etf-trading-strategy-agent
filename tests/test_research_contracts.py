@@ -11,7 +11,7 @@ def fixed_task() -> dict:
         "id": "etf-momentum",
         "goal": "Develop an ETF momentum strategy",
         "budget": {"max_rounds": 3, "max_hours": 4, "max_consecutive_failures": 2},
-        "codex": {"sandbox": "workspace-write", "approval_policy": "never", "timeout_minutes": 60},
+        "opencode": {"model": "deepseek/deepseek-chat", "timeout_minutes": 60},
         "data": {"universe": "universe.csv"},
         "scope": {"editable": ["src/quant_core/strategy/"], "forbidden": ["data/"]},
         "commands": {
@@ -56,19 +56,27 @@ def test_task_requires_positive_budget() -> None:
         ResearchTask.from_mapping(payload)
 
 
-def test_task_requires_unattended_codex_permissions() -> None:
+def test_task_requires_opencode_model() -> None:
     payload = fixed_task()
-    payload["codex"]["approval_policy"] = "on-request"
+    payload["opencode"]["model"] = ""
 
-    with pytest.raises(ValueError, match="must be 'never'"):
+    with pytest.raises(ValueError, match="opencode.model"):
         ResearchTask.from_mapping(payload)
 
 
-def test_task_rejects_danger_full_access() -> None:
+def test_task_requires_opencode_provider_model_format() -> None:
     payload = fixed_task()
-    payload["codex"]["sandbox"] = "danger-full-access"
+    payload["opencode"]["model"] = "deepseek-chat"
 
-    with pytest.raises(ValueError, match="workspace-write"):
+    with pytest.raises(ValueError, match="provider/model"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_positive_opencode_timeout() -> None:
+    payload = fixed_task()
+    payload["opencode"]["timeout_minutes"] = 0
+
+    with pytest.raises(ValueError, match="opencode.timeout_minutes"):
         ResearchTask.from_mapping(payload)
 
 
@@ -164,7 +172,7 @@ def test_failed_result_only_requires_error() -> None:
     result = ExperimentResult.from_mapping({
         "experiment_id": "experiment-001",
         "status": "failed",
-        "error": "Codex session timed out",
+        "error": "OpenCode session timed out",
     })
 
     assert result.experiment_id == "experiment-001"

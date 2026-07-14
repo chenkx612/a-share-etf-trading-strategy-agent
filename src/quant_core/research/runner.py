@@ -24,17 +24,7 @@ from quant_core.research.workspace import (
 
 
 CommandRunner = Callable[[Sequence[str], Path, Path, int], int]
-
-AGENT_OUTPUT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["completed", "blocked"]},
-        "hypothesis": {"type": "string", "minLength": 1},
-        "summary": {"type": "string", "minLength": 1},
-    },
-    "required": ["status", "hypothesis", "summary"],
-    "additionalProperties": False,
-}
+AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 
 
 def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) -> int:
@@ -59,7 +49,7 @@ def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int
     return completed.returncode
 
 
-def _run_codex(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
+def _run_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
     def terminate(process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
             return
@@ -78,6 +68,11 @@ def _run_codex(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, t
 
     try:
         with log_path.open("w", encoding="utf-8") as log:
+            permissions = json.dumps({
+                "external_directory": "deny",
+                "question": "deny",
+            })
+            env = {**os.environ, "OPENCODE_PERMISSION": permissions}
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
@@ -86,6 +81,7 @@ def _run_codex(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, t
                 stderr=subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
+                env=env,
             )
             try:
                 process.communicate(input=prompt, timeout=timeout)
@@ -161,8 +157,55 @@ def _prompt(task: ResearchTask, development_command: Sequence[str], test_command
         f"Objective: {raw['evaluation']['objective']}",
         f"Constraints: {json.dumps(raw['evaluation']['constraints'], ensure_ascii=False)}",
         "Use only the development period. Do not inspect gate or test periods.",
-        "Finish with the required JSON status, hypothesis, and summary. Do not report gate metrics or an acceptance decision.",
+        "Your final response must be exactly one JSON object with string fields status, hypothesis, and summary.",
+        'Set status to either "completed" or "blocked". Do not wrap the JSON in Markdown.',
+        "Do not report gate metrics or an acceptance decision.",
     ])
+
+
+def _is_agent_output(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"status", "hypothesis", "summary"}
+        and value.get("status") in {"completed", "blocked"}
+        and all(
+            isinstance(value.get(key), str) and bool(value[key].strip())
+            for key in ("hypothesis", "summary")
+        )
+    )
+
+
+def _parse_opencode_output(log_path: Path) -> dict[str, Any] | None:
+    """Extract the last valid agent result from OpenCode's final text event."""
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    text: str | None = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "text":
+            continue
+        part = event.get("part")
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            text = part["text"]
+    if text is None:
+        return None
+    decoder = json.JSONDecoder()
+    result: dict[str, Any] | None = None
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            output, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if _is_agent_output(output):
+            result = output
+    return result
 
 
 def _write_failed(output_dir: Path, experiment_id: str, error: str) -> Path:
@@ -181,7 +224,7 @@ def run_once(
     workspace: str | Path = ".",
     gate_runtime: str | Path | None = None,
     command_runner: CommandRunner = _run_command,
-    codex_runner: Callable[[Sequence[str], str, Path, Path, int], int] = _run_codex,
+    opencode_runner: AgentRunner = _run_opencode,
 ) -> Path:
     task = ResearchTask.load(task_path)
     root = Path(workspace).resolve()
@@ -189,9 +232,7 @@ def run_once(
         raise FileNotFoundError(f"Workspace does not exist: {root}")
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    schema_path = out / "agent-output-schema.json"
     agent_output_path = out / "agent-output.json"
-    schema_path.write_text(json.dumps(AGENT_OUTPUT_SCHEMA, indent=2), encoding="utf-8")
 
     raw = task.raw
     fixed = raw["evaluation"]["fixed"]
@@ -199,42 +240,31 @@ def run_once(
     development_command = _format_command(raw["commands"]["backtest"], development_values)
     test_command = _format_command(raw["commands"]["test"], development_values)
     prompt = _prompt(task, development_command, test_command)
-    codex = raw["codex"]
-    timeout = int(codex["timeout_minutes"]) * 60
-    codex_command = [
-        "codex", "--model", "gpt-5.6-sol",
-        "--config", 'model_reasoning_effort="medium"',
-        "--ask-for-approval", codex["approval_policy"], "exec",
-        "--ephemeral", "--skip-git-repo-check", "--sandbox", codex["sandbox"], "--json",
-        "--output-schema", str(schema_path), "--output-last-message", str(agent_output_path),
-        "--cd", str(root), "-",
+    opencode = raw["opencode"]
+    timeout = int(opencode["timeout_minutes"]) * 60
+    opencode_command = [
+        "opencode", "run", "--auto", "--format", "json",
+        "--model", opencode["model"], "--dir", str(root),
     ]
 
     before = _snapshot(root, out)
-    exit_code = codex_runner(
-        codex_command,
+    events_path = out / "opencode-events.jsonl"
+    exit_code = opencode_runner(
+        opencode_command,
         prompt,
         root,
-        out / "codex-events.jsonl",
+        events_path,
         timeout,
     )
     if exit_code != 0:
-        reason = "Codex timed out" if exit_code == 124 else "Codex session failed"
+        reason = "OpenCode timed out" if exit_code == 124 else "OpenCode session failed"
         return _write_failed(out, experiment_id, reason)
-    if not agent_output_path.exists():
-        return _write_failed(out, experiment_id, "Codex did not produce agent-output.json")
-
-    try:
-        agent_output = json.loads(agent_output_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return _write_failed(out, experiment_id, "Codex produced invalid agent output")
-    if not isinstance(agent_output, dict) or agent_output.get("status") not in {"completed", "blocked"} or not all(
-        isinstance(agent_output.get(key), str) and agent_output[key].strip()
-        for key in ("hypothesis", "summary")
-    ):
-        return _write_failed(out, experiment_id, "Codex produced invalid agent output")
+    agent_output = _parse_opencode_output(events_path)
+    if agent_output is None:
+        return _write_failed(out, experiment_id, "OpenCode produced invalid agent output")
+    write_json_atomic(agent_output_path, agent_output)
     if agent_output["status"] == "blocked":
-        return _write_failed(out, experiment_id, f"Codex was blocked: {agent_output['summary']}")
+        return _write_failed(out, experiment_id, f"OpenCode was blocked: {agent_output['summary']}")
 
     after = _snapshot(root, out)
     changed = _changed_files(before, after)
@@ -246,7 +276,7 @@ def run_once(
     if invalid:
         return _write_failed(out, experiment_id, f"Changes outside editable scope: {', '.join(invalid)}")
     if not changed:
-        return _write_failed(out, experiment_id, "Codex completed without code changes")
+        return _write_failed(out, experiment_id, "OpenCode completed without code changes")
 
     if command_runner(test_command, root, out / "tests.log", timeout) != 0:
         return _write_failed(out, experiment_id, "Tests failed")
@@ -299,7 +329,7 @@ def _evaluate_existing(
     command_runner: CommandRunner,
 ) -> dict[str, Any]:
     raw = task.raw
-    timeout = int(raw["codex"]["timeout_minutes"]) * 60
+    timeout = int(raw["opencode"]["timeout_minutes"]) * 60
     metrics: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="quant-champion-") as temporary:
         evaluation_root = Path(temporary) / "workspace"
@@ -407,7 +437,7 @@ def run_managed_once(
     workspace: str | Path = ".",
     research_root: str | Path = ".research",
     command_runner: CommandRunner = _run_command,
-    codex_runner: Callable[[Sequence[str], str, Path, Path, int], int] = _run_codex,
+    opencode_runner: AgentRunner = _run_opencode,
 ) -> Path:
     """Run one isolated candidate and promote it only when it beats the champion."""
     task_file = Path(task_path).resolve()
@@ -429,7 +459,7 @@ def run_managed_once(
         workspace=candidate,
         gate_runtime=manager.evaluation_runtime,
         command_runner=command_runner,
-        codex_runner=codex_runner,
+        opencode_runner=opencode_runner,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     decision_path = experiment / "decision.json"

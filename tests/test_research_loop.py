@@ -18,9 +18,8 @@ max_rounds = {max_rounds}
 max_hours = {max_hours}
 max_consecutive_failures = {max_failures}
 
-[codex]
-sandbox = "workspace-write"
-approval_policy = "never"
+[opencode]
+model = "deepseek/deepseek-chat"
 timeout_minutes = 60
 
 [data]
