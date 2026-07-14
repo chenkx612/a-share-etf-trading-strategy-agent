@@ -42,6 +42,9 @@ max_drawdown = 0.20
 [evaluation.acceptance]
 minimum_improvement = 0.01
 
+[evaluation.target]
+objective_at_least = 1.50
+
 [evaluation.fixed.development]
 start = "2018-01-01"
 end = "2021-12-31"
@@ -114,3 +117,16 @@ quant-agent --root <workspace> research run-managed \
 Git commit。行情和因子输入在任务初始化时冻结；candidate 只获得截止 `development.end` 的数据，
 gate 和 champion 使用带完整数据的一次性 evaluator 副本。这里的数据隔离用于避免正常研发流程
 接触门禁数据，不构成限制工作区外读取的安全边界。
+
+## Automated loop
+
+```bash
+quant-agent --root <workspace> research loop \
+  --task <task.toml> \
+  --research-root .research
+```
+
+循环状态保存在 `.research/<task-id>/loop-state.json`。循环在达到 `max_rounds`、`max_hours` 或
+`max_consecutive_failures` 后停止；配置 `evaluation.target.objective_at_least` 时，champion 的 gate
+目标指标达到阈值且满足约束也会停止。总时长用于判断是否启动下一轮，不会缩短已经开始的单轮
+超时。`rejected` 不计入连续失败；中断的未完成轮次在恢复时计为 `failed`。

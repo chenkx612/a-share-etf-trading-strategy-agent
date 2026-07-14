@@ -87,7 +87,13 @@ candidate 只注入开发数据，Codex 结束后 evaluator 才换入完整数�
 
 ### 阶段四：自动多轮循环
 
-实现自动续轮、总时长、最大轮数、连续失败和中断恢复。
+状态：已完成。按当前资源约束不做数小时真实长跑验收。
+
+`research loop` 在 `run-managed` 外层自动续轮。`.research/<task-id>/state.json` 继续管理
+champion，新增 `loop-state.json` 保存当前循环的轮数、累计运行时间、连续失败、当前实验和停止原因。
+`rejected` 是正常研究结果，不计为失败；只有 `failed` 增加连续失败计数。中断后已有决策的轮次会
+补记结果，没有决策的轮次记为一次中断失败。可选的 `evaluation.target.objective_at_least` 用于在
+champion 的 gate 指标达到目标且满足约束时提前停止。
 
 验收：一次启动可持续运行数小时，直到达成目标或耗尽预算。
 

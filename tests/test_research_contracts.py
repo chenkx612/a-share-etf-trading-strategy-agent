@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from quant_core.research import ExperimentResult, ResearchTask
+from quant_core.research.runner import target_reached
 
 
 def fixed_task() -> dict:
@@ -112,6 +113,24 @@ def test_task_requires_numeric_constraints() -> None:
 
     with pytest.raises(ValueError, match="numeric limits"):
         ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_numeric_target() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["target"] = {"objective_at_least": "high"}
+
+    with pytest.raises(ValueError, match="objective_at_least"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_target_requires_gate_constraints_to_pass() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["target"] = {"objective_at_least": 1.5}
+    task = ResearchTask.from_mapping(payload)
+
+    assert not target_reached(task, {
+        "gate": {"sortino": 1.6, "max_drawdown": -0.30},
+    })
 
 
 def test_completed_result_keeps_test_metrics_hidden() -> None:

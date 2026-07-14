@@ -68,7 +68,7 @@ def copy_runtime_inputs(source: Path, destination: Path, *, end: date | None = N
         _filter_tables(destination / "outputs" / "factors", end)
 
 
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
@@ -174,7 +174,7 @@ class ResearchWorkspace:
             shutil.rmtree(temporary, ignore_errors=True)
         state["pending_promotion"] = None
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _atomic_json(self.state_path, state)
+        write_json_atomic(self.state_path, state)
         return state
 
     def _prepare_runtime(self, state: dict[str, Any], development_end: date | None) -> None:
@@ -187,7 +187,7 @@ class ResearchWorkspace:
             state["development_end"] = expected
             state["champion_metrics"] = None
             state["champion_metrics_key"] = None
-            _atomic_json(self.state_path, state)
+            write_json_atomic(self.state_path, state)
 
     def initialize(self, development_end: date | None = None) -> dict[str, Any]:
         if self.state_path.exists():
@@ -213,7 +213,7 @@ class ResearchWorkspace:
             "last_experiment_id": None,
             "pending_promotion": None,
         }
-        _atomic_json(self.state_path, state)
+        write_json_atomic(self.state_path, state)
         self._prepare_runtime(state, development_end)
         return state
 
@@ -262,7 +262,7 @@ class ResearchWorkspace:
         if champion_metrics is not None:
             state["champion_metrics"] = dict(champion_metrics)
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _atomic_json(self.state_path, state)
+        write_json_atomic(self.state_path, state)
 
     def promote(
         self,
@@ -281,7 +281,7 @@ class ResearchWorkspace:
             "champion_number": number,
             "metrics": dict(metrics),
         }
-        _atomic_json(self.state_path, state)
+        write_json_atomic(self.state_path, state)
         _copy_tree(candidate, temporary)
         os.replace(temporary, destination)
         state["champion"] = destination.relative_to(self.root).as_posix()

@@ -100,6 +100,13 @@ class ResearchTask:
             minimum = acceptance.get("minimum_improvement", 0.0)
             if not isinstance(minimum, (int, float)) or isinstance(minimum, bool) or minimum < 0:
                 raise ValueError("task.evaluation.acceptance.minimum_improvement must be non-negative")
+        target = evaluation.get("target")
+        if target is not None:
+            if not isinstance(target, dict):
+                raise ValueError("task.evaluation.target must be a table")
+            threshold = target.get("objective_at_least")
+            if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+                raise ValueError("task.evaluation.target.objective_at_least must be numeric")
         fixed = _required(evaluation, "fixed", dict, "task.evaluation")
         development = _period(
             _required(fixed, "development", dict, "task.evaluation.fixed"),

@@ -18,6 +18,7 @@ from quant_core.research.workspace import (
     ResearchWorkspace,
     copy_runtime_inputs,
     remove_runtime_inputs,
+    write_json_atomic,
     write_patch,
 )
 
@@ -59,6 +60,22 @@ def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int
 
 
 def _run_codex(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
+    def terminate(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            process.wait()
+
     try:
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
@@ -73,13 +90,11 @@ def _run_codex(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, t
             try:
                 process.communicate(input=prompt, timeout=timeout)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                terminate(process)
                 return 124
+            except KeyboardInterrupt:
+                terminate(process)
+                raise
             return process.returncode
     except OSError as exc:
         log_path.write_text(str(exc), encoding="utf-8")
@@ -154,7 +169,7 @@ def _write_failed(output_dir: Path, experiment_id: str, error: str) -> Path:
     result_path = output_dir / "result.json"
     payload = {"experiment_id": experiment_id, "status": "failed", "error": error}
     ExperimentResult.from_mapping(payload)
-    result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(result_path, payload)
     return result_path
 
 
@@ -271,7 +286,7 @@ def run_once(
     }
     ExperimentResult.from_mapping(payload)
     result_path = out / "result.json"
-    result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(result_path, payload)
     return result_path
 
 
@@ -314,6 +329,24 @@ def _constraint_passes(name: str, value: Any, limit: Any) -> bool:
     if name == "max_drawdown":
         return abs(float(value)) <= float(limit)
     return float(value) <= float(limit)
+
+
+def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> bool:
+    target = task.raw["evaluation"].get("target")
+    if not isinstance(target, dict) or not isinstance(metrics, Mapping):
+        return False
+    gate = metrics.get("gate")
+    if not isinstance(gate, Mapping):
+        return False
+    evaluation = task.raw["evaluation"]
+    objective = gate.get(str(evaluation["objective"]))
+    threshold = target["objective_at_least"]
+    if not isinstance(objective, (int, float)) or isinstance(objective, bool):
+        return False
+    return float(objective) >= float(threshold) and all(
+        _constraint_passes(name, gate.get(name), limit)
+        for name, limit in evaluation["constraints"].items()
+    )
 
 
 def _decide(task: ResearchTask, champion: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -402,7 +435,7 @@ def run_managed_once(
     decision_path = experiment / "decision.json"
     if result.get("status") != "completed":
         decision = {"experiment_id": experiment_id, "decision": "failed", "reasons": [result.get("error")]}
-        decision_path.write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(decision_path, decision)
         manager.reject(candidate, state, experiment_id)
         return result_path
 
@@ -421,13 +454,13 @@ def run_managed_once(
             )
         except RuntimeError as exc:
             decision = {"experiment_id": experiment_id, "decision": "failed", "reasons": [str(exc)]}
-            decision_path.write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_json_atomic(decision_path, decision)
             manager.reject(candidate, state, experiment_id)
             return _write_failed(experiment, experiment_id, str(exc))
 
     state["champion_metrics_key"] = metrics_key
     decision = {"experiment_id": experiment_id, **_decide(task, champion_metrics, result["metrics"])}
-    decision_path.write_text(json.dumps(decision, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(decision_path, decision)
     if decision["decision"] == "accepted":
         manager.promote(candidate, state, experiment_id, result["metrics"])
     else:

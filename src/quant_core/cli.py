@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 from datetime import date, datetime
 from pathlib import Path
+from types import FrameType
 from typing import Iterable
 
 import pandas as pd
@@ -31,7 +33,7 @@ from quant_core.data.market_data import (
     write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
-from quant_core.research import run_managed_once, run_once
+from quant_core.research import run_loop, run_managed_once, run_once
 from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
 
 
@@ -460,6 +462,32 @@ def command_research_run_managed(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def command_research_loop(args: argparse.Namespace) -> None:
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupt(_signum: int, _frame: FrameType | None) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        state_path = run_loop(
+            args.task,
+            workspace=args.root,
+            research_root=args.research_root,
+        )
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    print(f"wrote loop state to {state_path}")
+    print(f"stop reason: {state['stop_reason']}")
+    print(
+        f"rounds: {state['rounds_completed']} "
+        f"(accepted={state['accepted']}, rejected={state['rejected']}, failed={state['failed']})"
+    )
+    if state["stop_reason"] == "interrupted":
+        raise SystemExit(130)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quant-agent")
     parser.add_argument("--root", default=".")
@@ -557,6 +585,10 @@ def build_parser() -> argparse.ArgumentParser:
     research_run_managed.add_argument("--experiment-id", required=True)
     research_run_managed.add_argument("--research-root", default=".research")
     research_run_managed.set_defaults(func=command_research_run_managed)
+    research_loop = research_sub.add_parser("loop")
+    research_loop.add_argument("--task", required=True)
+    research_loop.add_argument("--research-root", default=".research")
+    research_loop.set_defaults(func=command_research_loop)
     return parser
 
 
