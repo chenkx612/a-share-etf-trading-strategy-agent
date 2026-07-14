@@ -93,6 +93,13 @@ class ResearchTask:
             for key, value in constraints.items()
         ):
             raise ValueError("task.evaluation.constraints must contain numeric limits")
+        acceptance = evaluation.get("acceptance")
+        if acceptance is not None:
+            if not isinstance(acceptance, dict):
+                raise ValueError("task.evaluation.acceptance must be a table")
+            minimum = acceptance.get("minimum_improvement", 0.0)
+            if not isinstance(minimum, (int, float)) or isinstance(minimum, bool) or minimum < 0:
+                raise ValueError("task.evaluation.acceptance.minimum_improvement must be non-negative")
         fixed = _required(evaluation, "fixed", dict, "task.evaluation")
         development = _period(
             _required(fixed, "development", dict, "task.evaluation.fixed"),

@@ -25,7 +25,8 @@
 
 Codex 负责单轮研发。Python Harness 负责外层循环、权限、超时、评测、版本和停止条件。
 
-阶段二不会把门禁区间写入 Codex Prompt；门禁数据的物理隔离由阶段三候选工作区负责。
+阶段二不会把门禁区间写入 Codex Prompt。阶段三让 candidate 只包含开发期数据，但这属于
+研发流程隔离，不是限制工作区外读取的安全边界；强物理隔离留到长时间无人值守运行前实现。
 
 ## 所需技术
 
@@ -40,7 +41,7 @@ Codex 负责单轮研发。Python Harness 负责外层循环、权限、超时�
 
 ### 阶段一：定义契约
 
-状态：已完成。
+状态：MVP 已完成。
 
 定义 `task.toml` 和 `result.json`。
 
@@ -56,7 +57,31 @@ Codex 负责单轮研发。Python Harness 负责外层循环、权限、超时�
 
 ### 阶段三：管理候选版本
 
-实现 baseline、champion、候选隔离、接受、拒绝和恢复。
+状态：已完成。
+
+按 `task.id` 在 `.research/<task-id>/` 隔离研发任务。baseline、champion 和 candidate
+使用文件快照管理，不创建 Git commit。受管理单轮从 champion 创建 candidate，评测后仅将
+满足约束且门禁目标优于 champion 的候选晋升；失败和拒绝的候选会被清理。
+gate 和 champion 回测在一次性 evaluator 副本中执行，评测产物不会写回 candidate 或 champion。
+版本快照只保存代码；任务初始化时冻结完整评测数据，并生成截止 `development.end` 的开发数据。
+candidate 只注入开发数据，Codex 结束后 evaluator 才换入完整数据。这样既避免每代 champion
+重复保存大体积数据，也保证各轮使用同一数据基准。该机制不阻止进程主动读取 candidate 之外
+的路径，因此不作为强安全边界。
+
+```text
+.research/<task-id>/
+├── state.json
+├── runtime/
+│   ├── development/
+│   └── evaluation/
+├── versions/
+├── candidates/
+└── experiments/<experiment-id>/
+```
+
+每个实验永久保存 `result.json`、`decision.json` 和已有的执行日志；成功产生合法候选修改时额外
+保存 `candidate.patch`。最终 champion 仍是研发中间结果，只有人工明确采用后才进入真实工作区
+和 Git。
 
 验收：失败实验不会污染下一轮。
 

@@ -31,7 +31,7 @@ from quant_core.data.market_data import (
     write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
-from quant_core.research import run_once
+from quant_core.research import run_managed_once, run_once
 from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
 
 
@@ -445,6 +445,21 @@ def command_research_run_once(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def command_research_run_managed(args: argparse.Namespace) -> None:
+    result_path = run_managed_once(
+        args.task,
+        args.experiment_id,
+        workspace=args.root,
+        research_root=args.research_root,
+    )
+    decision_path = result_path.parent / "decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    print(f"wrote managed experiment to {result_path.parent}")
+    print(f"decision: {decision['decision']}")
+    if decision["decision"] == "failed":
+        raise SystemExit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quant-agent")
     parser.add_argument("--root", default=".")
@@ -537,6 +552,11 @@ def build_parser() -> argparse.ArgumentParser:
     research_run_once.add_argument("--experiment-id", required=True)
     research_run_once.add_argument("--output", required=True)
     research_run_once.set_defaults(func=command_research_run_once)
+    research_run_managed = research_sub.add_parser("run-managed")
+    research_run_managed.add_argument("--task", required=True)
+    research_run_managed.add_argument("--experiment-id", required=True)
+    research_run_managed.add_argument("--research-root", default=".research")
+    research_run_managed.set_defaults(func=command_research_run_managed)
     return parser
 
 
