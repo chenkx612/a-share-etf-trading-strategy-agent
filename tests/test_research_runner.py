@@ -37,7 +37,7 @@ mode = "fixed"
 objective = "sortino"
 
 [evaluation.constraints]
-max_drawdown = 0.20
+max_drawdown = { operator = "abs<=", threshold = 0.20 }
 
 [evaluation.fixed.development]
 start = "2018-01-01"
@@ -64,10 +64,19 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         opencode_commands.append(command)
         assert "2022-01-01" not in prompt
         assert "2025-01-01" not in prompt
+        assert "Gate objective used to compare candidate with champion: sortino" in prompt
+        assert "Minimum objective improvement required for acceptance: 0.0" in prompt
+        assert (
+            'Hard gate constraints: [{"metric": "max_drawdown", "operator": "abs<=", '
+            '"threshold": 0.2}]'
+        ) in prompt
         agent_output = {
             "status": "completed",
+            "previous_feedback": "",
             "hypothesis": "Momentum persists",
-            "summary": "Add momentum strategy",
+            "attempts": "Added and tested one medium-term momentum signal.",
+            "development_effect": "Development Sortino improved while drawdown stayed within the limit.",
+            "candidate": "Add momentum strategy",
         }
         log_path.write_text(
             json.dumps({
@@ -110,4 +119,40 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     assert "--auto" in command
     assert json.loads((result_path.parent / "agent-output.json").read_text(encoding="utf-8"))["status"] == "completed"
     assert result["status"] == "completed"
+    assert "feedback" not in result
+    assert result["attempts"].startswith("Added and tested")
+    assert result["candidate"] == "Add momentum strategy"
     assert result["metrics"]["gate"]["sortino"] == 1.2
+
+
+def test_run_once_accepts_compact_blocked_output(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+
+    def blocked_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": json.dumps({
+                "status": "blocked",
+                "previous_feedback": "",
+                "error": "No viable development hypothesis",
+            })},
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    result_path = run_once(
+        task_path,
+        "experiment-blocked",
+        tmp_path / "experiment-blocked",
+        workspace=tmp_path,
+        opencode_runner=blocked_opencode,
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result == {
+        "experiment_id": "experiment-blocked",
+        "status": "failed",
+        "error": "OpenCode was blocked: No viable development hypothesis",
+    }

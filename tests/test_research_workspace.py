@@ -43,7 +43,7 @@ mode = "fixed"
 objective = "sortino"
 
 [evaluation.constraints]
-max_drawdown = 0.20
+max_drawdown = {{ operator = "abs<=", threshold = 0.20 }}
 
 [evaluation.acceptance]
 minimum_improvement = 0.05
@@ -82,16 +82,25 @@ def _command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) ->
     return 0
 
 
-def _opencode_with_signal(signal: float):
+def _opencode_with_signal(
+    signal: float,
+    expected_history: str | None = None,
+    previous_feedback: str = "",
+):
     def run(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
         assert not (cwd / "managed-test.toml").exists()
+        if expected_history is not None:
+            assert expected_history in prompt
         if (cwd / "data/etf_daily.csv").exists():
             daily = pd.read_csv(cwd / "data/etf_daily.csv")
             assert daily["date"].max() == "2021-12-31"
         log_path.write_text(json.dumps({"type": "text", "part": {"text": json.dumps({
             "status": "completed",
+            "previous_feedback": previous_feedback,
             "hypothesis": "A higher signal improves Sortino",
-            "summary": f"Set signal to {signal}",
+            "attempts": f"Tested signal value {signal}.",
+            "development_effect": f"Development Sortino was {signal}.",
+            "candidate": f"Set signal to {signal}",
         })}}) + "\n", encoding="utf-8")
         (cwd / "strategy.py").write_text(f"{signal}\n", encoding="utf-8")
         return 0
@@ -164,7 +173,11 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
         "experiment-002",
         workspace=tmp_path,
         command_runner=_command,
-        opencode_runner=_opencode_with_signal(1.2),
+        opencode_runner=_opencode_with_signal(
+            1.2,
+            '"decision":"rejected"',
+            "The lower signal implementation did not improve the objective.",
+        ),
     )
     second_decision = json.loads((second_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
@@ -176,6 +189,13 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert not (champion / "outputs/backtests/experiment-002-gate").exists()
     assert "-1.0" in (second_result.parent / "candidate.patch").read_text(encoding="utf-8")
     assert "+1.2" in (second_result.parent / "candidate.patch").read_text(encoding="utf-8")
+    first_record = json.loads(first_result.read_text(encoding="utf-8"))
+    second_record = json.loads(second_result.read_text(encoding="utf-8"))
+    assert first_record["candidate"] == "Set signal to 0.9"
+    assert first_record["attempts"] == "Tested signal value 0.9."
+    assert first_record["feedback"].startswith("The lower signal")
+    assert "feedback" not in second_record
+    assert not (tmp_path / ".research/managed-test/research-memory.json").exists()
 
 
 def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:

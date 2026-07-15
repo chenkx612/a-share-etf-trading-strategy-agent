@@ -182,6 +182,12 @@ def run_loop(
             state["stop_reason"] = "interrupted"
             _save(loop_state_path, state)
             return loop_state_path
+        except Exception:
+            state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
+            state["status"] = "interrupted"
+            state["stop_reason"] = "runner_error"
+            _save(loop_state_path, state)
+            raise
 
         state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
         decision_path = result_path.parent / "decision.json"

@@ -25,6 +25,7 @@ from quant_core.research.workspace import (
 
 CommandRunner = Callable[[Sequence[str], Path, Path, int], int]
 AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
+_RESEARCH_HISTORY_LIMIT = 12
 
 
 def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) -> int:
@@ -144,35 +145,164 @@ def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: 
     }
 
 
-def _prompt(task: ResearchTask, development_command: Sequence[str], test_command: Sequence[str]) -> str:
+def _constraint_rule(constraint: Mapping[str, Any]) -> tuple[str, float]:
+    return str(constraint["operator"]), float(constraint["threshold"])
+
+
+def _constraint_descriptions(constraints: Mapping[str, Any]) -> list[dict[str, Any]]:
+    descriptions: list[dict[str, Any]] = []
+    for name, constraint in constraints.items():
+        operator, threshold = _constraint_rule(constraint)
+        descriptions.append({"metric": name, "operator": operator, "threshold": threshold})
+    return descriptions
+
+
+def _prompt(
+    task: ResearchTask,
+    development_command: Sequence[str],
+    test_command: Sequence[str],
+    research_history: Sequence[Mapping[str, Any]],
+) -> str:
     raw = task.raw
+    evaluation = raw["evaluation"]
+    minimum_improvement = evaluation.get("acceptance", {}).get("minimum_improvement", 0.0)
+    target = evaluation.get("target", {}).get("objective_at_least")
+    history = (
+        json.dumps(list(research_history), ensure_ascii=False, separators=(",", ":"))
+        if research_history
+        else "(no prior experiments)"
+    )
     return "\n".join([
         "Complete one quantitative strategy research round.",
         f"Goal: {raw['goal']}",
+        "Use the full prior research history internally when choosing this round's hypothesis.",
+        "At the start, write previous_feedback only for the most recent prior round whose gate decision is now available.",
+        "Keep previous_feedback concise; do not write a new comprehensive feedback summary for the full history.",
+        "If there is no prior round, set previous_feedback to an empty string.",
+        "Treat accepted/rejected as evidence about a specific implementation, not proof that an entire idea is true or false.",
+        "A failed round is inconclusive. Do not repeat a rejected implementation unchanged.",
+        f"Prior research history (sanitized; exact gate metrics are intentionally omitted): {history}",
         "Propose one falsifiable hypothesis. Iterate internally until completed or blocked.",
         f"Editable paths: {', '.join(raw['scope']['editable'])}",
         f"Forbidden paths: {', '.join(raw['scope'].get('forbidden', [])) or '(none)'}",
         f"Test command: {' '.join(test_command)}",
         f"Development backtest command: {' '.join(development_command)}",
-        f"Objective: {raw['evaluation']['objective']}",
-        f"Constraints: {json.dumps(raw['evaluation']['constraints'], ensure_ascii=False)}",
+        f"Gate objective used to compare candidate with champion: {evaluation['objective']}",
+        f"Minimum objective improvement required for acceptance: {minimum_improvement}",
+        f"Hard gate constraints: {json.dumps(_constraint_descriptions(evaluation['constraints']), ensure_ascii=False)}",
+        f"Optional absolute target for stopping the loop: {target if target is not None else '(none)'}",
+        "A candidate is accepted only when every hard gate constraint passes and its gate objective improves over champion by the required amount.",
         "Use only the development period. Do not inspect gate or test periods.",
-        "Your final response must be exactly one JSON object with string fields status, hypothesis, and summary.",
+        "If completed, your final response must be exactly one JSON object with string fields status, previous_feedback, hypothesis, attempts, development_effect, and candidate.",
+        "If blocked, return exactly string fields status, previous_feedback, and error instead.",
+        "In previous_feedback, distinguish the previous round's observed outcome from possible causes.",
+        "In attempts, summarize approaches and variants tried on the development set during this round, including variants not retained in the final candidate.",
+        "Attempts does not refer to a gate rejection or to whether the candidate becomes champion.",
+        "In development_effect, summarize this round's development-set evidence only; do not mention gate results.",
+        "In candidate, unambiguously describe the exact final candidate submitted to the Harness for gate evaluation.",
+        "Clearly distinguish that submitted candidate from development variants listed in attempts but not retained.",
         'Set status to either "completed" or "blocked". Do not wrap the JSON in Markdown.',
         "Do not report gate metrics or an acceptance decision.",
     ])
 
 
 def _is_agent_output(value: object) -> bool:
+    if not isinstance(value, dict) or not isinstance(value.get("previous_feedback"), str):
+        return False
+    if value.get("status") == "blocked":
+        return (
+            set(value) == {"status", "previous_feedback", "error"}
+            and isinstance(value.get("error"), str)
+            and bool(value["error"].strip())
+        )
     return (
-        isinstance(value, dict)
-        and set(value) == {"status", "hypothesis", "summary"}
-        and value.get("status") in {"completed", "blocked"}
+        value.get("status") == "completed"
+        and set(value) == {
+            "status", "previous_feedback", "hypothesis", "attempts", "development_effect", "candidate",
+        }
         and all(
             isinstance(value.get(key), str) and bool(value[key].strip())
-            for key in ("hypothesis", "summary")
+            for key in ("hypothesis", "attempts", "development_effect", "candidate")
         )
     )
+
+
+def _scalar_metrics(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): item
+        for key, item in list(value.items())[:20]
+        if isinstance(item, (str, int, float, bool)) or item is None
+    }
+
+
+def _load_research_history(experiments: Path) -> list[dict[str, Any]]:
+    """Build a compact history without exposing exact gate metrics to the research agent."""
+    history: list[dict[str, Any]] = []
+    if not experiments.exists():
+        return history
+    for experiment in sorted(path for path in experiments.iterdir() if path.is_dir()):
+        result_path = experiment / "result.json"
+        decision_path = experiment / "decision.json"
+        if not result_path.exists() or not decision_path.exists():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        entry: dict[str, Any] = {
+            "experiment_id": experiment.name,
+            "status": result.get("status"),
+            "decision": decision.get("decision"),
+            "feedback": result.get("feedback"),
+        }
+        reasons = decision.get("reasons")
+        if isinstance(reasons, list):
+            entry["decision_reasons"] = [str(reason) for reason in reasons[:5]]
+        if result.get("status") == "completed":
+            entry.update({
+                "hypothesis": result.get("hypothesis"),
+                "attempts": result.get("attempts"),
+                "development_effect": result.get("development_effect"),
+                "candidate": result.get("candidate"),
+                "changed_files": result.get("changes", {}).get("files", []),
+                "development_metrics": _scalar_metrics(result.get("metrics", {}).get("development")),
+            })
+        else:
+            entry["error"] = result.get("error")
+            agent_output_path = experiment / "agent-output.json"
+            try:
+                agent_output = json.loads(agent_output_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                agent_output = None
+            if isinstance(agent_output, dict) and agent_output.get("status") == "completed":
+                for key in ("hypothesis", "attempts", "development_effect", "candidate"):
+                    entry[key] = agent_output.get(key)
+        history.append(entry)
+    return history[-_RESEARCH_HISTORY_LIMIT:]
+
+
+def _fill_previous_feedback(
+    manager: ResearchWorkspace,
+    research_history: Sequence[Mapping[str, Any]],
+    feedback: str,
+) -> None:
+    if not research_history or not feedback.strip():
+        return
+    previous_id = research_history[-1].get("experiment_id")
+    if not isinstance(previous_id, str):
+        return
+    result_path = manager.experiments / previous_id / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if isinstance(result.get("feedback"), str) and result["feedback"].strip():
+        return
+    result["feedback"] = feedback.strip()
+    write_json_atomic(result_path, result)
 
 
 def _parse_opencode_output(log_path: Path) -> dict[str, Any] | None:
@@ -223,6 +353,7 @@ def run_once(
     *,
     workspace: str | Path = ".",
     gate_runtime: str | Path | None = None,
+    research_history: Sequence[Mapping[str, Any]] = (),
     command_runner: CommandRunner = _run_command,
     opencode_runner: AgentRunner = _run_opencode,
 ) -> Path:
@@ -239,7 +370,7 @@ def run_once(
     development_values = _values(task, fixed["development"], f"{experiment_id}-development", root)
     development_command = _format_command(raw["commands"]["backtest"], development_values)
     test_command = _format_command(raw["commands"]["test"], development_values)
-    prompt = _prompt(task, development_command, test_command)
+    prompt = _prompt(task, development_command, test_command, research_history)
     opencode = raw["opencode"]
     timeout = int(opencode["timeout_minutes"]) * 60
     opencode_command = [
@@ -264,7 +395,7 @@ def run_once(
         return _write_failed(out, experiment_id, "OpenCode produced invalid agent output")
     write_json_atomic(agent_output_path, agent_output)
     if agent_output["status"] == "blocked":
-        return _write_failed(out, experiment_id, f"OpenCode was blocked: {agent_output['summary']}")
+        return _write_failed(out, experiment_id, f"OpenCode was blocked: {agent_output['error']}")
 
     after = _snapshot(root, out)
     changed = _changed_files(before, after)
@@ -311,7 +442,10 @@ def run_once(
         "experiment_id": experiment_id,
         "status": "completed",
         "hypothesis": agent_output["hypothesis"],
-        "changes": {"summary": agent_output["summary"], "files": changed},
+        "attempts": agent_output["attempts"],
+        "development_effect": agent_output["development_effect"],
+        "candidate": agent_output["candidate"],
+        "changes": {"files": changed},
         "metrics": metrics,
     }
     ExperimentResult.from_mapping(payload)
@@ -353,12 +487,15 @@ def _evaluate_existing(
     return metrics
 
 
-def _constraint_passes(name: str, value: Any, limit: Any) -> bool:
+def _constraint_passes(value: Any, constraint: Mapping[str, Any]) -> bool:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
-    if name == "max_drawdown":
-        return abs(float(value)) <= float(limit)
-    return float(value) <= float(limit)
+    operator, threshold = _constraint_rule(constraint)
+    if operator == ">=":
+        return float(value) >= threshold
+    if operator == "abs<=":
+        return abs(float(value)) <= threshold
+    return float(value) <= threshold
 
 
 def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> bool:
@@ -374,8 +511,8 @@ def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> boo
     if not isinstance(objective, (int, float)) or isinstance(objective, bool):
         return False
     return float(objective) >= float(threshold) and all(
-        _constraint_passes(name, gate.get(name), limit)
-        for name, limit in evaluation["constraints"].items()
+        _constraint_passes(gate.get(name), constraint)
+        for name, constraint in evaluation["constraints"].items()
     )
 
 
@@ -388,10 +525,16 @@ def _decide(task: ResearchTask, champion: Mapping[str, Any], candidate: Mapping[
     minimum_improvement = float(acceptance.get("minimum_improvement", 0.0))
     constraints: dict[str, Any] = {}
     constraints_passed = True
-    for name, limit in evaluation["constraints"].items():
+    for name, constraint in evaluation["constraints"].items():
         actual = candidate.get("gate", {}).get(name)
-        passed = _constraint_passes(name, actual, limit)
-        constraints[name] = {"limit": limit, "actual": actual, "passed": passed}
+        operator, threshold = _constraint_rule(constraint)
+        passed = _constraint_passes(actual, constraint)
+        constraints[name] = {
+            "operator": operator,
+            "threshold": threshold,
+            "actual": actual,
+            "passed": passed,
+        }
         constraints_passed = constraints_passed and passed
     objective_passed = (
         isinstance(champion_value, (int, float))
@@ -449,6 +592,7 @@ def run_managed_once(
     manager = ResearchWorkspace(source, managed_root, task.task_id)
     development_end = task.raw["evaluation"]["fixed"]["development"]["end"]
     candidate, experiment, state = manager.create_candidate(experiment_id, date.fromisoformat(development_end))
+    research_history = _load_research_history(manager.experiments)
     if source in task_file.parents:
         candidate_task = candidate / task_file.relative_to(source)
         candidate_task.unlink(missing_ok=True)
@@ -458,10 +602,15 @@ def run_managed_once(
         experiment,
         workspace=candidate,
         gate_runtime=manager.evaluation_runtime,
+        research_history=research_history,
         command_runner=command_runner,
         opencode_runner=opencode_runner,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    agent_output_path = experiment / "agent-output.json"
+    if agent_output_path.exists():
+        agent_output = json.loads(agent_output_path.read_text(encoding="utf-8"))
+        _fill_previous_feedback(manager, research_history, str(agent_output["previous_feedback"]))
     decision_path = experiment / "decision.json"
     if result.get("status") != "completed":
         decision = {"experiment_id": experiment_id, "decision": "failed", "reasons": [result.get("error")]}
@@ -486,7 +635,8 @@ def run_managed_once(
             decision = {"experiment_id": experiment_id, "decision": "failed", "reasons": [str(exc)]}
             write_json_atomic(decision_path, decision)
             manager.reject(candidate, state, experiment_id)
-            return _write_failed(experiment, experiment_id, str(exc))
+            failed_path = _write_failed(experiment, experiment_id, str(exc))
+            return failed_path
 
     state["champion_metrics_key"] = metrics_key
     decision = {"experiment_id": experiment_id, **_decide(task, champion_metrics, result["metrics"])}

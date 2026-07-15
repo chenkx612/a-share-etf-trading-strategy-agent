@@ -84,14 +84,29 @@ class ResearchTask:
             raise ValueError("task.evaluation.mode must be 'fixed'")
         _required(evaluation, "objective", str, "task.evaluation")
         constraints = _required(evaluation, "constraints", dict, "task.evaluation")
-        if not constraints or not all(
-            isinstance(key, str)
-            and key
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            for key, value in constraints.items()
-        ):
-            raise ValueError("task.evaluation.constraints must contain numeric limits")
+        if not constraints:
+            raise ValueError("task.evaluation.constraints must not be empty")
+        for name, constraint in constraints.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("task.evaluation.constraints must use non-empty metric names")
+            if not isinstance(constraint, dict):
+                raise ValueError(
+                    f"task.evaluation.constraints.{name} must be an operator/threshold table"
+                )
+            if set(constraint) != {"operator", "threshold"}:
+                raise ValueError(
+                    f"task.evaluation.constraints.{name} must contain exactly operator and threshold"
+                )
+            operator = constraint.get("operator")
+            threshold = constraint.get("threshold")
+            if operator not in {">=", "<=", "abs<="}:
+                raise ValueError(
+                    f"task.evaluation.constraints.{name}.operator must be one of >=, <=, abs<="
+                )
+            if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+                raise ValueError(
+                    f"task.evaluation.constraints.{name}.threshold must be numeric"
+                )
         acceptance = evaluation.get("acceptance")
         if acceptance is not None:
             if not isinstance(acceptance, dict):
@@ -123,9 +138,10 @@ class ResearchTask:
         if gate[1] >= test_period[0]:
             raise ValueError("test period must start after the research period")
 
-        baseline = data.get("baseline")
-        if baseline is not None and not isinstance(baseline, dict):
-            raise ValueError("task.baseline must be a table when provided")
+        if "baseline" in data:
+            raise ValueError(
+                "task.baseline is not supported; the initial baseline is the current workspace snapshot"
+            )
 
         return cls(raw=dict(data))
 
@@ -160,10 +176,17 @@ class ExperimentResult:
         status = _required(data, "status", str, "result")
         if status not in {"completed", "failed"}:
             raise ValueError("result.status must be 'completed' or 'failed'")
+        feedback = data.get("feedback")
+        if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
+            raise ValueError("result.feedback must be a non-empty str when present")
         if status == "completed":
             _required(data, "hypothesis", str, "result")
+            _required(data, "attempts", str, "result")
+            _required(data, "development_effect", str, "result")
+            _required(data, "candidate", str, "result")
             changes = _required(data, "changes", dict, "result")
-            _required(changes, "summary", str, "result.changes")
+            if set(changes) != {"files"}:
+                raise ValueError("result.changes must contain exactly files")
             ResearchTask._string_list(changes, "files", required=True)
 
             metrics = _required(data, "metrics", dict, "result")

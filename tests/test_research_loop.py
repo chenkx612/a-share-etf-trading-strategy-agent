@@ -5,6 +5,8 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from quant_core.research import run_loop
 from quant_core.research.workspace import ResearchWorkspace
 
@@ -39,7 +41,7 @@ mode = "fixed"
 objective = "sortino"
 
 [evaluation.constraints]
-max_drawdown = 0.20
+max_drawdown = {{ operator = "abs<=", threshold = 0.20 }}
 
 [evaluation.fixed.development]
 start = "2018-01-01"
@@ -260,3 +262,21 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
     resumed = json.loads(resumed_path.read_text(encoding="utf-8"))
     assert resumed["stop_reason"] == "max_consecutive_failures"
     assert resumed["rounds_completed"] == 1
+
+
+def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    times = iter([10.0, 130.0])
+
+    def fail(task_path: Path, experiment_id: str, *, workspace: Path, research_root: Path) -> Path:
+        raise RuntimeError("runner bug")
+
+    with pytest.raises(RuntimeError, match="runner bug"):
+        run_loop(task, workspace=tmp_path, managed_runner=fail, monotonic=lambda: next(times))
+
+    state = json.loads(
+        (tmp_path / ".research/loop-test/loop-state.json").read_text(encoding="utf-8")
+    )
+    assert state["status"] == "interrupted"
+    assert state["stop_reason"] == "runner_error"
+    assert state["elapsed_seconds"] == 120.0

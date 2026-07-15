@@ -18,6 +18,7 @@
 → opencode run 在开发集内循环研发
 → Harness 运行测试和门禁评测
 → 接受或拒绝候选
+→ 保存受控研究记忆
 → 保存状态
 → 自动启动下一轮
 → 达成目标或耗尽预算后停止
@@ -91,6 +92,13 @@ candidate 只注入开发数据，OpenCode 结束后 evaluator 才换入完整�
 
 `research loop` 在 `run-managed` 外层自动续轮。`.research/<task-id>/state.json` 继续管理
 champion，新增 `loop-state.json` 保存当前循环的轮数、累计运行时间、连续失败、当前实验和停止原因。
+每轮会直接从已有实验记录构建研究历史。下一轮 OpenCode 先读取最近的受控研究历史，
+只为上一轮补齐一条简短 `feedback`，更早历史仅用于隐式推理，然后再提出新假设。本轮结束时必须
+记录假设、开发集阶段尝试过的方案、开发集效果和最终候选结果，供后续轮次快速理解。研发 Prompt
+会明确 objective、相对 champion 的最小改善要求和全部硬约束，但历史不包含精确 gate 指标或 gate
+区间；`rejected` 只表示该次具体实现没有胜出，`failed` 不形成策略结论。
+硬约束使用显式 `>=`、`<=` 或 `abs<=` 运算符，因此既能表达年化收益率下限，也能表达最大回撤、
+换手率等上限。
 `rejected` 是正常研究结果，不计为失败；只有 `failed` 增加连续失败计数。中断后已有决策的轮次会
 补记结果，没有决策的轮次记为一次中断失败。可选的 `evaluation.target.objective_at_least` 用于在
 champion 的 gate 指标达到目标且满足约束时提前停止。

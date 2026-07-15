@@ -36,7 +36,8 @@ mode = "fixed"
 objective = "sortino"
 
 [evaluation.constraints]
-max_drawdown = 0.20
+annual_return = { operator = ">=", threshold = 0.10 }
+max_drawdown = { operator = "abs<=", threshold = 0.20 }
 
 [evaluation.acceptance]
 minimum_improvement = 0.01
@@ -57,9 +58,13 @@ start = "2025-01-01"
 end = "2025-12-31"
 ```
 
-`baseline` 可选。`{python}` 由 Harness 替换为自身解释器。
+`{python}` 由 Harness 替换为自身解释器。初始 baseline 固定为任务首次初始化时的工作区快照，
+不提供额外的 `[baseline]` 配置。
 
 当前仅支持固定 development/gate 区间；walk-forward 在后续阶段实现。
+
+硬约束必须使用显式的 `operator`/`threshold` 表达式，支持 `>=`、`<=` 和 `abs<=`，不接受省略
+运算方向的纯数字配置。
 
 `model` 使用 OpenCode 的 `provider/model` 格式。Harness 以 `opencode run --auto --format json`
 启动无人值守任务，并通过 `OPENCODE_PERMISSION` 禁止访问工作区外目录和运行中提问。
@@ -79,9 +84,12 @@ Harness 写入 `result.json`：
 {
   "experiment_id": "experiment-001",
   "status": "completed",
+  "feedback": "Filled by the next round after this round's gate decision is available",
   "hypothesis": "A testable hypothesis",
+  "attempts": "Tested the base signal and one volatility-filtered variant",
+  "development_effect": "The filtered variant improved development stability",
+  "candidate": "Retained the volatility-filtered candidate implementation",
   "changes": {
-    "summary": "Implemented the candidate strategy",
     "files": ["src/quant_core/strategy/candidate.py"]
   },
   "metrics": {
@@ -92,6 +100,11 @@ Harness 写入 `result.json`：
 ```
 
 OpenCode 的结构化输出、完整 JSONL 事件、测试日志和回测日志保存在实验目录中。
+一轮结束时还没有自己的 gate 结论，因此该轮的 `feedback` 先留空，由下一轮 AI 在开头根据已产生的
+受控决策补齐。每轮只强制补上一轮的简短反馈，更早记录仅作为隐式推理上下文。`attempts` 记录本轮在
+开发集上试过的方案和变体，不表示 gate 拒绝或未晋升 champion；`development_effect` 记录开发集效果，
+`candidate` 记录实际提交给 Harness 做 gate 评测的最终候选方案。Harness 不会向研发 AI 注入精确
+gate 指标或 gate 区间。
 
 ## Run once
 
@@ -130,4 +143,5 @@ quant-agent --root <workspace> research loop \
 循环状态保存在 `.research/<task-id>/loop-state.json`。循环在达到 `max_rounds`、`max_hours` 或
 `max_consecutive_failures` 后停止；配置 `evaluation.target.objective_at_least` 时，champion 的 gate
 目标指标达到阈值且满足约束也会停止。总时长用于判断是否启动下一轮，不会缩短已经开始的单轮
-超时。`rejected` 不计入连续失败；中断的未完成轮次在恢复时计为 `failed`。
+超时。`rejected` 不计入连续失败；中断的未完成轮次在恢复时计为 `failed`。后续轮次直接从各实验的
+`result.json`、`decision.json` 和 `agent-output.json` 动态构建受控研究历史，不维护重复的记忆文件。
