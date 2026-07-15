@@ -21,7 +21,8 @@ max_hours = {max_hours}
 max_consecutive_failures = {max_failures}
 
 [opencode]
-model = "deepseek/deepseek-chat"
+model = "xai/grok-4.5"
+variant = "high"
 timeout_minutes = 60
 
 [data]

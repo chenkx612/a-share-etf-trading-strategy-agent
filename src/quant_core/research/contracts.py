@@ -56,6 +56,9 @@ class ResearchTask:
         provider, separator, model_name = model.partition("/")
         if not separator or not provider or not model_name:
             raise ValueError("task.opencode.model must use provider/model format")
+        variant = opencode.get("variant")
+        if variant is not None and (not isinstance(variant, str) or not variant.strip()):
+            raise ValueError("task.opencode.variant must be a non-empty string when provided")
         timeout_minutes = opencode.get("timeout_minutes")
         if not isinstance(timeout_minutes, int) or isinstance(timeout_minutes, bool) or timeout_minutes < 1:
             raise ValueError("task.opencode.timeout_minutes must be a positive integer")

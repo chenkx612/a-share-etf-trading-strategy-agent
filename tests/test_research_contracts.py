@@ -11,7 +11,7 @@ def fixed_task() -> dict:
         "id": "etf-momentum",
         "goal": "Develop an ETF momentum strategy",
         "budget": {"max_rounds": 3, "max_hours": 4, "max_consecutive_failures": 2},
-        "opencode": {"model": "deepseek/deepseek-chat", "timeout_minutes": 60},
+        "opencode": {"model": "xai/grok-4.5", "variant": "high", "timeout_minutes": 60},
         "data": {"universe": "universe.csv"},
         "scope": {"editable": ["src/quant_core/strategy/"], "forbidden": ["data/"]},
         "commands": {
@@ -84,6 +84,21 @@ def test_task_requires_positive_opencode_timeout() -> None:
 
     with pytest.raises(ValueError, match="opencode.timeout_minutes"):
         ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_non_empty_opencode_variant_when_provided() -> None:
+    payload = fixed_task()
+    payload["opencode"]["variant"] = ""
+
+    with pytest.raises(ValueError, match="opencode.variant"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_allows_model_without_variant() -> None:
+    payload = fixed_task()
+    payload["opencode"] = {"model": "opencode/hy3-free", "timeout_minutes": 60}
+
+    ResearchTask.from_mapping(payload)
 
 
 def test_fixed_task_allows_missing_baseline() -> None:

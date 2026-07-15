@@ -377,6 +377,8 @@ def run_once(
         "opencode", "run", "--auto", "--format", "json",
         "--model", opencode["model"], "--dir", str(root),
     ]
+    if variant := opencode.get("variant"):
+        opencode_command.extend(["--variant", variant])
 
     before = _snapshot(root, out)
     events_path = out / "opencode-events.jsonl"

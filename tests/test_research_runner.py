@@ -17,7 +17,8 @@ max_hours = 4
 max_consecutive_failures = 2
 
 [opencode]
-model = "deepseek/deepseek-chat"
+model = "xai/grok-4.5"
+variant = "high"
 timeout_minutes = 60
 
 [data]
@@ -113,7 +114,8 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     result = json.loads(result_path.read_text(encoding="utf-8"))
     command = list(opencode_commands[0])
     assert command[:2] == ["opencode", "run"]
-    assert command[command.index("--model") + 1] == "deepseek/deepseek-chat"
+    assert command[command.index("--model") + 1] == "xai/grok-4.5"
+    assert command[command.index("--variant") + 1] == "high"
     assert command[command.index("--format") + 1] == "json"
     assert command[command.index("--dir") + 1] == str(tmp_path)
     assert "--auto" in command

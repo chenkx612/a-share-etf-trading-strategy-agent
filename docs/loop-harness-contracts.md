@@ -12,7 +12,8 @@ max_hours = 4
 max_consecutive_failures = 3
 
 [opencode]
-model = "deepseek/deepseek-chat"
+model = "xai/grok-4.5"
+variant = "high"
 timeout_minutes = 60
 
 [data]
@@ -66,9 +67,26 @@ end = "2025-12-31"
 硬约束必须使用显式的 `operator`/`threshold` 表达式，支持 `>=`、`<=` 和 `abs<=`，不接受省略
 运算方向的纯数字配置。
 
-`model` 使用 OpenCode 的 `provider/model` 格式。Harness 以 `opencode run --auto --format json`
-启动无人值守任务，并通过 `OPENCODE_PERMISSION` 禁止访问工作区外目录和运行中提问。
+`model` 使用 OpenCode 的 `provider/model` 格式。支持推理强度的模型通过 `variant` 选择档位；
+Harness 将其传给 `opencode run --variant`。Harness 以 `opencode run --auto --format json` 启动
+无人值守任务，并通过 `OPENCODE_PERMISSION` 禁止访问工作区外目录和运行中提问。
 OpenCode 的权限规则不是操作系统级沙箱；高风险任务应在容器或隔离的 worktree 中运行。
+
+可用的模型配置示例：
+
+| 模型 | `model` 配置 | 最大推理强度 | Provider |
+| --- | --- | --- | --- |
+| Grok 4.5 | `xai/grok-4.5` | `variant = "high"` | xAI |
+| DeepSeek V4 Pro | `deepseek/deepseek-v4-pro` | `variant = "max"` | DeepSeek |
+| HY3 Free | `opencode/hy3-free` | 不支持配置，省略 `variant` | OpenCode Zen |
+
+任务配置默认选用模型支持的最大推理强度：Grok 4.5 使用 `high`，DeepSeek V4 Pro 使用 `max`。
+切换模型时必须同时填写表中对应的 `variant`。HY3 Free 当前没有可配置的推理强度，因此应
+省略 `variant`，Harness 也不会传递 `--variant`。
+
+同一模型通过不同 Provider 调用时，其认证方式、价格和限额可能不同。使用前先执行
+`opencode auth list` 检查对应 Provider 的认证，再通过 `opencode models <provider>` 确认当前
+OpenCode 版本识别的模型 ID；模型目录可能随 Provider 更新。
 
 运行前必须确保：
 
