@@ -60,14 +60,22 @@ OpenCode 负责单轮研发。Python Harness 负责外层循环、权限、超�
 
 状态：已完成。
 
-按 `task.id` 在 `.research/<task-id>/` 隔离研发任务。baseline、champion 和 candidate
-使用文件快照管理，不创建 Git commit。受管理单轮从 champion 创建 candidate，评测后仅将
-满足约束且门禁目标优于 champion 的候选晋升；失败和拒绝的候选会被清理。
-gate 和 champion 回测在一次性 evaluator 副本中执行，评测产物不会写回 candidate 或 champion。
-版本快照只保存代码；任务初始化时冻结完整评测数据，并生成截止 `development.end` 的开发数据。
-candidate 只注入开发数据，OpenCode 结束后 evaluator 才换入完整数据。这样既避免每代 champion
-重复保存大体积数据，也保证各轮使用同一数据基准。该机制不阻止进程主动读取 candidate 之外
-的路径，因此不作为强安全边界。
+按 `task.id` 在 `.research/<task-id>/` 隔离研发任务。Harness 用临时 Git commit 捕获启动时的
+工作区状态，不修改当前分支或 index；每轮从 seed/champion commit 创建 detached worktree。
+评测后仅将满足约束且门禁目标优于 champion 的候选提交并推进任务专属 champion ref；失败和
+拒绝的 worktree 会被删除。
+candidate 最初只注入开发数据；OpenCode 退出后，Harness 才在该 worktree 中换入完整数据运行
+gate。已有 champion 需要重新评测时使用一次性 evaluator worktree。commit 只保存代码；任务
+初始化时冻结完整评测数据，并生成截止 `development.end` 的开发数据。这样既避免重复保存大体积
+数据，也保证各轮使用同一数据基准。该机制不阻止进程主动读取 candidate 之外的路径，因此不作为
+强安全边界。
+
+0→1 任务可配置无 baseline。首个 champion 产生前，候选从同一初始框架快照创建，只按目标指标
+有效性和硬约束判定；还可从该快照排除已有策略实现。首个合格候选晋升后，再启用相对 champion
+的改善要求。
+
+0→1 任务通过固定 research evaluator 调用候选的标准 `select` 接口，候选不能修改 evaluator、
+回测引擎或指标计算。这样策略研发与评测实现解耦，也避免通过修改 CLI 影响 Gate 结果。
 
 ```text
 .research/<task-id>/
@@ -75,14 +83,16 @@ candidate 只注入开发数据，OpenCode 结束后 evaluator 才换入完整�
 ├── runtime/
 │   ├── development/
 │   └── evaluation/
-├── versions/
-├── candidates/
+├── worktrees/
+│   ├── candidates/
+│   └── evaluators/
 └── experiments/<experiment-id>/
 ```
 
 每个实验永久保存 `result.json`、`decision.json` 和已有的执行日志；成功产生合法候选修改时额外
-保存 `candidate.patch`。最终 champion 仍是研发中间结果，只有人工明确采用后才进入真实工作区
-和 Git。
+保存 `candidate.patch`。最终 champion 由 `refs/quant-research/.../champion` 指向，仍不会自动
+合并或应用到当前工作分支。seed commit 由独立 ref 保留，避免在首个 champion 产生前被 Git GC
+清理。
 
 验收：失败实验不会污染下一轮。
 

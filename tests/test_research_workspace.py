@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
 from typing import Sequence
@@ -63,9 +63,26 @@ end = "2025-12-31"
 """
 
 
+def _init_repo(root: Path) -> None:
+    if (root / ".git").exists():
+        return
+    (root / ".gitignore").write_text(".research/\ndata/\noutputs/\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run([
+        "git", "-C", str(root), "-c", "user.name=Test", "-c",
+        "user.email=test@example.invalid", "commit", "-q", "-m", "init",
+    ], check=True)
+
+
+def _git_text(root: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+
 def _task(root: Path, task_id: str = "managed-test") -> Path:
     path = root / f"{task_id}.toml"
     path.write_text(TASK.format(task_id=task_id), encoding="utf-8")
+    _init_repo(root)
     return path
 
 
@@ -124,16 +141,16 @@ def test_workspaces_are_isolated_by_task_id(tmp_path: Path) -> None:
     (tmp_path / "outputs/factors/factors.csv").write_text("date,value\n", encoding="utf-8")
     (tmp_path / "outputs/backtests/old-run").mkdir(parents=True)
     (tmp_path / "outputs/backtests/old-run/metrics.json").write_text("{}", encoding="utf-8")
+    _init_repo(tmp_path)
     first = ResearchWorkspace(tmp_path, tmp_path / ".research", "multi-factor")
     second = ResearchWorkspace(tmp_path, tmp_path / ".research", "macd-timing")
 
-    first.initialize(date(2021, 12, 31))
-    second.initialize()
+    first_state = first.initialize(date(2021, 12, 31))
+    second_state = second.initialize()
 
     assert first.state_path != second.state_path
-    assert first.champion_path().exists()
-    assert second.champion_path().exists()
-    assert not (first.champion_path() / "outputs").exists()
+    assert isinstance(first_state["champion_commit"], str)
+    assert isinstance(second_state["champion_commit"], str)
     assert (first.evaluation_runtime / "outputs/factors/factors.csv").exists()
 
     candidate, _experiment, _state = first.create_candidate("experiment-001", date(2021, 12, 31))
@@ -145,6 +162,26 @@ def test_workspaces_are_isolated_by_task_id(tmp_path: Path) -> None:
         "2021-12-31",
         "2024-01-02",
     ]
+    assert (candidate / ".git").is_file()
+    first.reject(candidate, first_state, "cleanup")
+
+
+def test_seed_commit_captures_dirty_workspace_without_changing_branch_or_index(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    (tmp_path / "strategy.py").write_text("1.5\n", encoding="utf-8")
+    head_before = _git_text(tmp_path, "rev-parse", "HEAD")
+    status_before = _git_text(tmp_path, "status", "--short")
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "dirty-seed")
+
+    candidate, _experiment, state = manager.create_candidate("experiment-001")
+
+    assert (candidate / "strategy.py").read_text(encoding="utf-8") == "1.5\n"
+    assert state["seed_commit"] != head_before
+    assert _git_text(tmp_path, "rev-parse", state["seed_ref"]) == state["seed_commit"]
+    assert _git_text(tmp_path, "rev-parse", "HEAD") == head_before
+    assert _git_text(tmp_path, "status", "--short") == status_before
+    manager.reject(candidate, state, "cleanup")
 
 
 def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None:
@@ -166,8 +203,8 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     first_decision = json.loads((first_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
     assert first_decision["decision"] == "rejected"
-    assert state["champion"] == "versions/baseline"
-    assert not (tmp_path / ".research/managed-test/candidates/experiment-001").exists()
+    assert state["champion_commit"] == state["seed_commit"]
+    assert not (tmp_path / ".research/managed-test/worktrees/candidates/experiment-001").exists()
 
     second_result = run_managed_once(
         task,
@@ -182,12 +219,9 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     )
     second_decision = json.loads((second_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
-    champion = tmp_path / ".research/managed-test" / state["champion"]
     assert second_decision["decision"] == "accepted"
-    assert state["champion"] == "versions/champion-001"
-    assert (champion / "strategy.py").read_text(encoding="utf-8") == "1.2\n"
-    assert not (champion / "outputs/backtests/experiment-002-development").exists()
-    assert not (champion / "outputs/backtests/experiment-002-gate").exists()
+    assert state["champion_commit"] != state["seed_commit"]
+    assert _git_text(tmp_path, "show", f'{state["champion_commit"]}:strategy.py') == "1.2"
     assert "-1.0" in (second_result.parent / "candidate.patch").read_text(encoding="utf-8")
     assert "+1.2" in (second_result.parent / "candidate.patch").read_text(encoding="utf-8")
     first_record = json.loads(first_result.read_text(encoding="utf-8"))
@@ -197,6 +231,70 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert first_record["feedback"].startswith("The lower signal")
     assert "feedback" not in second_record
     assert not (tmp_path / ".research/managed-test/research-memory.json").exists()
+
+
+def test_no_baseline_rejects_until_first_candidate_passes_constraints(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task = _task(tmp_path)
+    task.write_text(
+        task.read_text(encoding="utf-8")
+        .replace(
+            '[data]\nuniverse = "universe.csv"',
+            '[baseline]\nmode = "none"\nexclude = ["strategy.py"]\n\n'
+            '[data]\nuniverse = "universe.csv"',
+        )
+        .replace('threshold = 0.20', 'threshold = 0.05'),
+        encoding="utf-8",
+    )
+
+    def constraint_command(
+        command: Sequence[str], cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        if command[0] != "backtest":
+            return 0
+        signal = float((cwd / "strategy.py").read_text(encoding="utf-8").strip())
+        run_id = command[command.index("--run-id") + 1]
+        metrics_path = cwd / "outputs/backtests" / run_id / "metrics.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(json.dumps({
+            "sortino": signal,
+            "max_drawdown": -0.10 if signal < 1.0 else -0.04,
+        }), encoding="utf-8")
+        return 0
+
+    rejected_result = run_managed_once(
+        task,
+        "experiment-001",
+        workspace=tmp_path,
+        command_runner=constraint_command,
+        opencode_runner=_opencode_with_signal(0.9),
+    )
+    rejected_decision = json.loads(
+        (rejected_result.parent / "decision.json").read_text(encoding="utf-8")
+    )
+    state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
+    assert rejected_decision["decision"] == "rejected"
+    assert state["champion_commit"] is None
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "cat-file", "-e", f'{state["seed_commit"]}:strategy.py'],
+        check=False,
+    ).returncode != 0
+    assert not (rejected_result.parent / "champion-development.log").exists()
+
+    accepted_result = run_managed_once(
+        task,
+        "experiment-002",
+        workspace=tmp_path,
+        command_runner=constraint_command,
+        opencode_runner=_opencode_with_signal(1.2, '"decision":"rejected"'),
+    )
+    accepted_decision = json.loads(
+        (accepted_result.parent / "decision.json").read_text(encoding="utf-8")
+    )
+    state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
+    assert accepted_decision["decision"] == "accepted"
+    assert isinstance(state["champion_commit"], str)
+    assert not (accepted_result.parent / "champion-development.log").exists()
 
 
 def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
@@ -216,14 +314,15 @@ def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
     )
     decision = json.loads((result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/state.json").read_text(encoding="utf-8"))
-    champion = tmp_path / ".research/managed-test" / state["champion"]
     assert decision["decision"] == "failed"
-    assert (champion / "strategy.py").read_text(encoding="utf-8") == "1.0\n"
-    assert not (tmp_path / ".research/managed-test/candidates/experiment-failed").exists()
+    assert state["champion_commit"] == state["seed_commit"]
+    assert _git_text(tmp_path, "show", f'{state["champion_commit"]}:strategy.py') == "1.0"
+    assert not (tmp_path / ".research/managed-test/worktrees/candidates/experiment-failed").exists()
 
 
 def test_new_round_cleans_candidate_left_by_interrupted_run(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
     manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "recovery-test")
     manager.initialize()
     stale = manager.candidates / "interrupted"
@@ -238,6 +337,7 @@ def test_new_round_cleans_candidate_left_by_interrupted_run(tmp_path: Path) -> N
 
 def test_experiment_id_cannot_escape_task_workspace(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
     manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "safe-task")
 
     with pytest.raises(ValueError, match="experiment id"):
@@ -246,15 +346,20 @@ def test_experiment_id_cannot_escape_task_workspace(tmp_path: Path) -> None:
 
 def test_recovery_commits_a_promoted_champion_after_state_write_was_interrupted(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
     manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "recovery-commit")
     state = manager.initialize()
-    destination = manager.versions / "champion-001"
-    shutil.copytree(manager.champion_path(state), destination)
-    (destination / "strategy.py").write_text("2.0\n", encoding="utf-8")
+    candidate, _experiment, _state = manager.create_candidate("experiment-001")
+    (candidate / "strategy.py").write_text("2.0\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(candidate), "add", "strategy.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(candidate), "-c", "user.name=Test", "-c",
+        "user.email=test@example.invalid", "commit", "-q", "-m", "candidate",
+    ], check=True)
+    commit = _git_text(candidate, "rev-parse", "HEAD")
     state["pending_promotion"] = {
         "experiment_id": "experiment-001",
-        "champion": "versions/champion-001",
-        "temporary": "versions/.champion-001.tmp",
+        "commit": commit,
         "champion_number": 1,
         "metrics": {"gate": {"sortino": 2.0}},
     }
@@ -262,21 +367,20 @@ def test_recovery_commits_a_promoted_champion_after_state_write_was_interrupted(
 
     recovered = manager.initialize()
 
-    assert recovered["champion"] == "versions/champion-001"
+    assert recovered["champion_commit"] == commit
     assert recovered["pending_promotion"] is None
-    assert (manager.champion_path(recovered) / "strategy.py").read_text(encoding="utf-8") == "2.0\n"
+    assert _git_text(tmp_path, "show", f"{commit}:strategy.py") == "2.0"
+    manager._remove_worktree(candidate)
 
 
 def test_recovery_rolls_back_a_promotion_without_a_completed_version(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
     manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "recovery-rollback")
     state = manager.initialize()
-    temporary = manager.versions / ".champion-001.tmp"
-    shutil.copytree(manager.champion_path(state), temporary)
     state["pending_promotion"] = {
         "experiment_id": "experiment-001",
-        "champion": "versions/champion-001",
-        "temporary": "versions/.champion-001.tmp",
+        "commit": "0" * 40,
         "champion_number": 1,
         "metrics": {"gate": {"sortino": 2.0}},
     }
@@ -284,6 +388,5 @@ def test_recovery_rolls_back_a_promotion_without_a_completed_version(tmp_path: P
 
     recovered = manager.initialize()
 
-    assert recovered["champion"] == "versions/baseline"
+    assert recovered["champion_commit"] == recovered["seed_commit"]
     assert recovered["pending_promotion"] is None
-    assert not temporary.exists()

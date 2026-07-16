@@ -111,7 +111,11 @@ def run_loop(
         managed_root = source / managed_root
     manager = ResearchWorkspace(source, managed_root, task.task_id)
     development_end = task.raw["evaluation"]["fixed"]["development"]["end"]
-    manager.initialize(date.fromisoformat(development_end))
+    manager.initialize(
+        date.fromisoformat(development_end),
+        task.baseline_mode,
+        task.baseline_exclude,
+    )
     loop_state_path = manager.root / "loop-state.json"
     fingerprint = _task_fingerprint(task_file)
 

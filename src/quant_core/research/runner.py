@@ -4,10 +4,8 @@ import hashlib
 import json
 import os
 import signal
-import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
@@ -19,7 +17,6 @@ from quant_core.research.workspace import (
     copy_runtime_inputs,
     remove_runtime_inputs,
     write_json_atomic,
-    write_patch,
 )
 
 
@@ -162,6 +159,7 @@ def _prompt(
     development_command: Sequence[str],
     test_command: Sequence[str],
     research_history: Sequence[Mapping[str, Any]],
+    has_champion: bool,
 ) -> str:
     raw = task.raw
     evaluation = raw["evaluation"]
@@ -171,6 +169,17 @@ def _prompt(
         json.dumps(list(research_history), ensure_ascii=False, separators=(",", ":"))
         if research_history
         else "(no prior experiments)"
+    )
+    comparison_guidance = (
+        f"Gate objective used to compare candidate with champion: {evaluation['objective']}\n"
+        f"Minimum objective improvement required for acceptance: {minimum_improvement}\n"
+        "A candidate is accepted only when every hard gate constraint passes and its gate objective "
+        "improves over champion by the required amount."
+        if has_champion
+        else
+        f"There is no champion yet. The first candidate with a numeric gate {evaluation['objective']} "
+        "that passes every hard gate constraint becomes the initial champion. The configured minimum "
+        "improvement does not apply until a champion exists."
     )
     return "\n".join([
         "Complete one quantitative strategy research round.",
@@ -187,11 +196,9 @@ def _prompt(
         f"Forbidden paths: {', '.join(raw['scope'].get('forbidden', [])) or '(none)'}",
         f"Test command: {' '.join(test_command)}",
         f"Development backtest command: {' '.join(development_command)}",
-        f"Gate objective used to compare candidate with champion: {evaluation['objective']}",
-        f"Minimum objective improvement required for acceptance: {minimum_improvement}",
+        comparison_guidance,
         f"Hard gate constraints: {json.dumps(_constraint_descriptions(evaluation['constraints']), ensure_ascii=False)}",
         f"Optional absolute target for stopping the loop: {target if target is not None else '(none)'}",
-        "A candidate is accepted only when every hard gate constraint passes and its gate objective improves over champion by the required amount.",
         "Use only the development period. Do not inspect gate or test periods.",
         "If completed, your final response must be exactly one JSON object with string fields status, previous_feedback, hypothesis, attempts, development_effect, and candidate.",
         "If blocked, return exactly string fields status, previous_feedback, and error instead.",
@@ -354,6 +361,7 @@ def run_once(
     workspace: str | Path = ".",
     gate_runtime: str | Path | None = None,
     research_history: Sequence[Mapping[str, Any]] = (),
+    has_champion: bool | None = None,
     command_runner: CommandRunner = _run_command,
     opencode_runner: AgentRunner = _run_opencode,
 ) -> Path:
@@ -370,7 +378,13 @@ def run_once(
     development_values = _values(task, fixed["development"], f"{experiment_id}-development", root)
     development_command = _format_command(raw["commands"]["backtest"], development_values)
     test_command = _format_command(raw["commands"]["test"], development_values)
-    prompt = _prompt(task, development_command, test_command, research_history)
+    prompt = _prompt(
+        task,
+        development_command,
+        test_command,
+        research_history,
+        task.baseline_mode != "none" if has_champion is None else has_champion,
+    )
     opencode = raw["opencode"]
     timeout = int(opencode["timeout_minutes"]) * 60
     opencode_command = [
@@ -415,30 +429,22 @@ def run_once(
         return _write_failed(out, experiment_id, "Tests failed")
     metrics: dict[str, Any] = {}
     for label in ("development", "gate"):
-        temporary: tempfile.TemporaryDirectory[str] | None = None
         evaluation_root = root
         if label == "gate":
-            temporary = tempfile.TemporaryDirectory(prefix="quant-gate-")
-            evaluation_root = Path(temporary.name) / "workspace"
-            shutil.copytree(root, evaluation_root, symlinks=True)
             if gate_runtime is not None:
-                remove_runtime_inputs(evaluation_root)
-                copy_runtime_inputs(Path(gate_runtime), evaluation_root)
+                remove_runtime_inputs(root)
+                copy_runtime_inputs(Path(gate_runtime), root)
+        values = _values(task, fixed[label], f"{experiment_id}-{label}", evaluation_root)
+        command = _format_command(raw["commands"]["backtest"], values)
+        if command_runner(command, evaluation_root, out / f"{label}.log", timeout) != 0:
+            return _write_failed(out, experiment_id, f"{label} backtest failed")
+        metrics_path = evaluation_root / str(raw["commands"]["metrics_path"]).format_map(values)
+        if not metrics_path.exists():
+            return _write_failed(out, experiment_id, f"Missing {label} metrics")
         try:
-            values = _values(task, fixed[label], f"{experiment_id}-{label}", evaluation_root)
-            command = _format_command(raw["commands"]["backtest"], values)
-            if command_runner(command, evaluation_root, out / f"{label}.log", timeout) != 0:
-                return _write_failed(out, experiment_id, f"{label} backtest failed")
-            metrics_path = evaluation_root / str(raw["commands"]["metrics_path"]).format_map(values)
-            if not metrics_path.exists():
-                return _write_failed(out, experiment_id, f"Missing {label} metrics")
-            try:
-                metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                return _write_failed(out, experiment_id, f"Invalid {label} metrics")
-        finally:
-            if temporary is not None:
-                temporary.cleanup()
+            metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return _write_failed(out, experiment_id, f"Invalid {label} metrics")
 
     payload = {
         "experiment_id": experiment_id,
@@ -467,25 +473,22 @@ def _evaluate_existing(
     raw = task.raw
     timeout = int(raw["opencode"]["timeout_minutes"]) * 60
     metrics: dict[str, Any] = {}
-    with tempfile.TemporaryDirectory(prefix="quant-champion-") as temporary:
-        evaluation_root = Path(temporary) / "workspace"
-        shutil.copytree(workspace, evaluation_root, symlinks=True)
-        copy_runtime_inputs(runtime_source, evaluation_root)
-        for label in ("development", "gate"):
-            values = _values(
-                task,
-                raw["evaluation"]["fixed"][label],
-                f"{experiment_id}-champion-{label}",
-                evaluation_root,
-            )
-            command = _format_command(raw["commands"]["backtest"], values)
-            if command_runner(command, evaluation_root, output_dir / f"champion-{label}.log", timeout) != 0:
-                raise RuntimeError(f"champion {label} backtest failed")
-            metrics_path = evaluation_root / str(raw["commands"]["metrics_path"]).format_map(values)
-            try:
-                metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as exc:
-                raise RuntimeError(f"invalid champion {label} metrics") from exc
+    copy_runtime_inputs(runtime_source, workspace)
+    for label in ("development", "gate"):
+        values = _values(
+            task,
+            raw["evaluation"]["fixed"][label],
+            f"{experiment_id}-champion-{label}",
+            workspace,
+        )
+        command = _format_command(raw["commands"]["backtest"], values)
+        if command_runner(command, workspace, output_dir / f"champion-{label}.log", timeout) != 0:
+            raise RuntimeError(f"champion {label} backtest failed")
+        metrics_path = workspace / str(raw["commands"]["metrics_path"]).format_map(values)
+        try:
+            metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(f"invalid champion {label} metrics") from exc
     return metrics
 
 
@@ -518,10 +521,14 @@ def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> boo
     )
 
 
-def _decide(task: ResearchTask, champion: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+def _decide(
+    task: ResearchTask,
+    champion: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
     evaluation = task.raw["evaluation"]
     objective = str(evaluation["objective"])
-    champion_value = champion.get("gate", {}).get(objective)
+    champion_value = champion.get("gate", {}).get(objective) if champion is not None else None
     candidate_value = candidate.get("gate", {}).get(objective)
     acceptance = evaluation.get("acceptance", {})
     minimum_improvement = float(acceptance.get("minimum_improvement", 0.0))
@@ -538,11 +545,13 @@ def _decide(task: ResearchTask, champion: Mapping[str, Any], candidate: Mapping[
             "passed": passed,
         }
         constraints_passed = constraints_passed and passed
-    objective_passed = (
+    candidate_objective_is_numeric = (
+        isinstance(candidate_value, (int, float)) and not isinstance(candidate_value, bool)
+    )
+    objective_passed = candidate_objective_is_numeric if champion is None else (
         isinstance(champion_value, (int, float))
         and not isinstance(champion_value, bool)
-        and isinstance(candidate_value, (int, float))
-        and not isinstance(candidate_value, bool)
+        and candidate_objective_is_numeric
         and float(candidate_value) >= float(champion_value) + minimum_improvement
         and (minimum_improvement > 0 or float(candidate_value) > float(champion_value))
     )
@@ -550,7 +559,9 @@ def _decide(task: ResearchTask, champion: Mapping[str, Any], candidate: Mapping[
     reasons: list[str] = []
     if not constraints_passed:
         reasons.append("gate constraints failed")
-    if not objective_passed:
+    if not objective_passed and champion is None:
+        reasons.append("gate objective is not numeric")
+    elif not objective_passed:
         reasons.append("gate objective did not improve over champion")
     return {
         "decision": "accepted" if accepted else "rejected",
@@ -593,7 +604,13 @@ def run_managed_once(
         managed_root = source / managed_root
     manager = ResearchWorkspace(source, managed_root, task.task_id)
     development_end = task.raw["evaluation"]["fixed"]["development"]["end"]
-    candidate, experiment, state = manager.create_candidate(experiment_id, date.fromisoformat(development_end))
+    candidate, experiment, state = manager.create_candidate(
+        experiment_id,
+        date.fromisoformat(development_end),
+        task.baseline_mode,
+        task.baseline_exclude,
+    )
+    has_champion = isinstance(state.get("champion_commit"), str)
     research_history = _load_research_history(manager.experiments)
     if source in task_file.parents:
         candidate_task = candidate / task_file.relative_to(source)
@@ -605,6 +622,7 @@ def run_managed_once(
         workspace=candidate,
         gate_runtime=manager.evaluation_runtime,
         research_history=research_history,
+        has_champion=has_champion,
         command_runner=command_runner,
         opencode_runner=opencode_runner,
     )
@@ -620,14 +638,24 @@ def run_managed_once(
         manager.reject(candidate, state, experiment_id)
         return result_path
 
-    write_patch(manager.champion_path(state), candidate, task.raw["scope"]["editable"], experiment / "candidate.patch")
+    manager.write_candidate_patch(
+        candidate,
+        state,
+        task.raw["scope"]["editable"],
+        experiment / "candidate.patch",
+    )
     metrics_key = _metrics_key(task)
-    champion_metrics = state.get("champion_metrics") if state.get("champion_metrics_key") == metrics_key else None
-    if not isinstance(champion_metrics, dict):
+    champion_metrics = (
+        state.get("champion_metrics")
+        if has_champion and state.get("champion_metrics_key") == metrics_key
+        else None
+    )
+    if has_champion and not isinstance(champion_metrics, dict):
+        evaluator = manager.create_champion_evaluator(experiment_id, state)
         try:
             champion_metrics = _evaluate_existing(
                 task,
-                manager.champion_path(state),
+                evaluator,
                 manager.evaluation_runtime,
                 experiment_id,
                 experiment,
@@ -639,13 +667,23 @@ def run_managed_once(
             manager.reject(candidate, state, experiment_id)
             failed_path = _write_failed(experiment, experiment_id, str(exc))
             return failed_path
+        finally:
+            manager.remove_evaluator(evaluator)
 
-    state["champion_metrics_key"] = metrics_key
     decision = {"experiment_id": experiment_id, **_decide(task, champion_metrics, result["metrics"])}
     write_json_atomic(decision_path, decision)
     if decision["decision"] == "accepted":
-        manager.promote(candidate, state, experiment_id, result["metrics"])
+        state["champion_metrics_key"] = metrics_key
+        manager.promote(
+            candidate,
+            state,
+            experiment_id,
+            result["metrics"],
+            task.raw["scope"]["editable"],
+        )
     else:
-        state["champion_metrics"] = champion_metrics
+        if has_champion:
+            state["champion_metrics"] = champion_metrics
+            state["champion_metrics_key"] = metrics_key
         manager.reject(candidate, state, experiment_id)
     return result_path

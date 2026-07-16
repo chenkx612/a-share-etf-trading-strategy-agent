@@ -70,6 +70,16 @@ class ResearchTask:
         cls._string_list(scope, "editable", required=True)
         cls._string_list(scope, "forbidden", required=False)
 
+        baseline = data.get("baseline")
+        if baseline is not None:
+            if not isinstance(baseline, dict) or not set(baseline) <= {"mode", "exclude"}:
+                raise ValueError("task.baseline may contain only mode and exclude")
+            if baseline.get("mode") not in {"workspace", "none"}:
+                raise ValueError("task.baseline.mode must be 'workspace' or 'none'")
+            cls._string_list(baseline, "exclude", required=False)
+            if baseline.get("exclude") and baseline.get("mode") != "none":
+                raise ValueError("task.baseline.exclude requires mode = 'none'")
+
         commands = _required(data, "commands", dict, "task")
         cls._string_list(commands, "test", required=True)
         cls._string_list(commands, "backtest", required=True)
@@ -136,15 +146,13 @@ class ResearchTask:
         if development[1] >= gate[0]:
             raise ValueError("fixed development and gate periods must not overlap")
 
-        test = _required(evaluation, "test", dict, "task.evaluation")
-        test_period = _period(test, "task.evaluation.test")
-        if gate[1] >= test_period[0]:
-            raise ValueError("test period must start after the research period")
-
-        if "baseline" in data:
-            raise ValueError(
-                "task.baseline is not supported; the initial baseline is the current workspace snapshot"
-            )
+        test = evaluation.get("test")
+        if test is not None:
+            if not isinstance(test, dict):
+                raise ValueError("task.evaluation.test must be a table")
+            test_period = _period(test, "task.evaluation.test")
+            if gate[1] >= test_period[0]:
+                raise ValueError("test period must start after the research period")
 
         return cls(raw=dict(data))
 
@@ -163,6 +171,14 @@ class ResearchTask:
     @property
     def evaluation_mode(self) -> str:
         return str(self.raw["evaluation"]["mode"])
+
+    @property
+    def baseline_mode(self) -> str:
+        return str(self.raw.get("baseline", {}).get("mode", "workspace"))
+
+    @property
+    def baseline_exclude(self) -> list[str]:
+        return list(self.raw.get("baseline", {}).get("exclude", []))
 
 
 @dataclass(frozen=True)

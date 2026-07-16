@@ -16,6 +16,12 @@ model = "xai/grok-4.5"
 variant = "high"
 timeout_minutes = 60
 
+[baseline]
+mode = "workspace"
+# For strict from-zero strategy research:
+# mode = "none"
+# exclude = ["src/quant_core/strategy/"]
+
 [data]
 universe = "path/to/universe.csv"
 
@@ -59,10 +65,13 @@ start = "2025-01-01"
 end = "2025-12-31"
 ```
 
-`{python}` 由 Harness 替换为自身解释器。初始 baseline 固定为任务首次初始化时的工作区快照，
-不提供额外的 `[baseline]` 配置。
+`{python}` 由 Harness 替换为自身解释器。`baseline.mode` 默认为 `workspace`，即把任务首次初始化
+时的工作区快照作为初始 champion。0→1 研发可设置 `mode = "none"`：首个目标指标有效且满足全部
+硬约束的候选成为初始 champion，之后才应用 `minimum_improvement`。可通过 `exclude` 从初始
+候选中移除已有策略实现，同时保留数据、回测和 CLI 等基础设施。
 
 当前仅支持固定 development/gate 区间；walk-forward 在后续阶段实现。
+`evaluation.test` 为可选保留区间，研发循环不会读取或评测该区间。
 
 硬约束必须使用显式的 `operator`/`threshold` 表达式，支持 `>=`、`<=` 和 `abs<=`，不接受省略
 运算方向的纯数字配置。
@@ -144,11 +153,21 @@ quant-agent --root <workspace> research run-managed \
   --research-root .research
 ```
 
-研发状态保存到 `.research/<task-id>/`。每轮 candidate 从该任务的当前 champion 文件快照创建；
-候选满足门禁约束且目标指标至少改善 `minimum_improvement` 时晋升，否则清理。Harness 不会创建
-Git commit。行情和因子输入在任务初始化时冻结；candidate 只获得截止 `development.end` 的数据，
+研发状态保存到 `.research/<task-id>/`。Harness 用临时 Git commit 捕获任务启动时的工作区状态，
+不修改当前分支或 index；每轮 candidate 是从当前 champion commit 创建的 detached worktree。
+候选满足门禁约束且目标指标至少改善 `minimum_improvement` 时提交并推进任务专属 champion ref，
+否则删除 worktree。行情和因子输入在任务初始化时冻结；candidate 只获得截止 `development.end` 的数据，
 gate 和 champion 使用带完整数据的一次性 evaluator 副本。这里的数据隔离用于避免正常研发流程
 接触门禁数据，不构成限制工作区外读取的安全边界。
+
+当 `baseline.mode = "none"` 时，首个 champion 产生前，每轮 candidate 都从同一 seed commit
+创建，不执行基线回测；`baseline.exclude` 指定的现有实现不会进入该快照。不满足硬约束的候选会
+被拒绝且不会改变该快照。
+
+严格的 0→1 任务应使用 Harness 提供的固定 evaluator，而不是候选可修改的 CLI。候选实现
+`quant_core.strategy.research_candidate.select(daily, universe, start, end)`，返回包含 `date`、
+`symbol`、`target_weight` 的 DataFrame；evaluator 负责校验标的、日期和权重，并用不可编辑的
+回测引擎生成指标。
 
 ## Automated loop
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime, timezone
@@ -15,20 +17,31 @@ import pandas as pd
 
 
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_IGNORED_NAMES = {".git", ".research", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-_RUNTIME_ROOTS = {"data", "outputs"}
+_GIT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "Quant Research Harness",
+    "GIT_AUTHOR_EMAIL": "quant-research@example.invalid",
+    "GIT_COMMITTER_NAME": "Quant Research Harness",
+    "GIT_COMMITTER_EMAIL": "quant-research@example.invalid",
+}
 
 
-def _copy_tree(source: Path, destination: Path, extra_ignored: set[str] | None = None) -> None:
-    ignored = _IGNORED_NAMES | (extra_ignored or set())
-
-    def ignore(directory: str, names: list[str]) -> set[str]:
-        excluded = {name for name in names if name in ignored or name.endswith(".pyc")}
-        if Path(directory).resolve() == source.resolve():
-            excluded.update(name for name in names if name in _RUNTIME_ROOTS)
-        return excluded
-
-    shutil.copytree(source, destination, ignore=ignore, symlinks=True)
+def _git(
+    root: Path,
+    *args: str,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env={**os.environ, **(env or {})},
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return completed.stdout.strip()
 
 
 def _filter_tables(root: Path, end: date) -> None:
@@ -74,41 +87,6 @@ def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _files(root: Path, prefixes: Sequence[str]) -> dict[str, Path]:
-    found: dict[str, Path] = {}
-    for prefix in prefixes:
-        target = root / prefix.rstrip("/")
-        if target.is_file():
-            found[target.relative_to(root).as_posix()] = target
-        elif target.is_dir():
-            for path in target.rglob("*"):
-                if path.is_file():
-                    found[path.relative_to(root).as_posix()] = path
-    return found
-
-
-def write_patch(base: Path, candidate: Path, editable: Sequence[str], destination: Path) -> None:
-    before = _files(base, editable)
-    after = _files(candidate, editable)
-    lines: list[str] = []
-    for relative in sorted(before.keys() | after.keys()):
-        old = before.get(relative)
-        new = after.get(relative)
-        try:
-            old_lines = old.read_text(encoding="utf-8").splitlines(keepends=True) if old else []
-            new_lines = new.read_text(encoding="utf-8").splitlines(keepends=True) if new else []
-        except UnicodeDecodeError:
-            lines.append(f"Binary file changed: {relative}\n")
-            continue
-        lines.extend(difflib.unified_diff(
-            old_lines,
-            new_lines,
-            fromfile=f"a/{relative}" if old else "/dev/null",
-            tofile=f"b/{relative}" if new else "/dev/null",
-        ))
-    destination.write_text("".join(lines), encoding="utf-8")
-
-
 @dataclass
 class ResearchWorkspace:
     source: Path
@@ -120,11 +98,12 @@ class ResearchWorkspace:
         self.research_root = self.research_root.resolve()
         if not _SAFE_TASK_ID.fullmatch(self.task_id):
             raise ValueError("task.id may contain only letters, numbers, '.', '_' and '-'")
+        repository = Path(_git(self.source, "rev-parse", "--show-toplevel")).resolve()
+        if repository != self.source:
+            raise ValueError("research workspace must be the Git repository root")
         if self.research_root == self.source:
             raise ValueError("research root must not be the source workspace")
-        if self.source in self.research_root.parents:
-            return
-        if self.research_root in self.source.parents:
+        if self.source not in self.research_root.parents and self.research_root in self.source.parents:
             raise ValueError("research root must not contain the source workspace")
 
     @property
@@ -137,15 +116,15 @@ class ResearchWorkspace:
 
     @property
     def candidates(self) -> Path:
-        return self.root / "candidates"
+        return self.root / "worktrees" / "candidates"
+
+    @property
+    def evaluators(self) -> Path:
+        return self.root / "worktrees" / "evaluators"
 
     @property
     def experiments(self) -> Path:
         return self.root / "experiments"
-
-    @property
-    def versions(self) -> Path:
-        return self.root / "versions"
 
     @property
     def runtime(self) -> Path:
@@ -159,19 +138,85 @@ class ResearchWorkspace:
     def evaluation_runtime(self) -> Path:
         return self.runtime / "evaluation"
 
+    @property
+    def champion_ref(self) -> str:
+        digest = hashlib.sha256(self.task_id.encode()).hexdigest()[:12]
+        return f"refs/quant-research/{digest}/champion"
+
+    @property
+    def seed_ref(self) -> str:
+        digest = hashlib.sha256(self.task_id.encode()).hexdigest()[:12]
+        return f"refs/quant-research/{digest}/seed"
+
+    def _snapshot_commit(self, excluded_paths: Sequence[str]) -> str:
+        excluded = [*excluded_paths, "data", "outputs"]
+        if self.source in self.research_root.parents:
+            excluded.append(self.research_root.relative_to(self.source).as_posix())
+        with tempfile.TemporaryDirectory(prefix="quant-index-") as temporary:
+            index = Path(temporary) / "index"
+            env = {"GIT_INDEX_FILE": str(index), **_GIT_IDENTITY}
+            _git(self.source, "read-tree", "HEAD", env=env)
+            _git(self.source, "add", "-A", env=env)
+            for path in excluded:
+                _git(
+                    self.source,
+                    "rm",
+                    "-r",
+                    "--cached",
+                    "--ignore-unmatch",
+                    "--",
+                    path.rstrip("/"),
+                    env=env,
+                )
+            tree = _git(self.source, "write-tree", env=env)
+            parent = _git(self.source, "rev-parse", "HEAD")
+            return _git(
+                self.source,
+                "commit-tree",
+                tree,
+                "-p",
+                parent,
+                "-m",
+                f"Research seed for {self.task_id}",
+                env=env,
+            )
+
+    def _add_worktree(self, path: Path, commit: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _git(self.source, "worktree", "add", "--detach", str(path), commit)
+
+    def _remove_worktree(self, path: Path) -> None:
+        if path.exists():
+            if (path / ".git").exists():
+                _git(self.source, "worktree", "remove", "--force", str(path))
+            else:
+                shutil.rmtree(path)
+        _git(self.source, "worktree", "prune")
+
+    def _cleanup_worktrees(self, root: Path) -> None:
+        if not root.exists():
+            return
+        for path in list(root.iterdir()):
+            if path.is_dir():
+                self._remove_worktree(path)
+            else:
+                path.unlink()
+
     def _recover_promotion(self, state: dict[str, Any]) -> dict[str, Any]:
         pending = state.get("pending_promotion")
         if not isinstance(pending, dict):
             return state
-        destination = self.root / str(pending["champion"])
-        temporary = self.root / str(pending["temporary"])
-        if destination.exists():
-            state["champion"] = str(pending["champion"])
+        commit = str(pending["commit"])
+        try:
+            _git(self.source, "cat-file", "-e", f"{commit}^{{commit}}")
+        except RuntimeError:
+            pass
+        else:
+            _git(self.source, "update-ref", self.champion_ref, commit)
+            state["champion_commit"] = commit
             state["champion_number"] = int(pending["champion_number"])
             state["champion_metrics"] = pending["metrics"]
             state["last_experiment_id"] = str(pending["experiment_id"])
-        else:
-            shutil.rmtree(temporary, ignore_errors=True)
         state["pending_promotion"] = None
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         write_json_atomic(self.state_path, state)
@@ -189,30 +234,44 @@ class ResearchWorkspace:
             state["champion_metrics_key"] = None
             write_json_atomic(self.state_path, state)
 
-    def initialize(self, development_end: date | None = None) -> dict[str, Any]:
+    def initialize(
+        self,
+        development_end: date | None = None,
+        baseline_mode: str = "workspace",
+        baseline_exclude: Sequence[str] = (),
+    ) -> dict[str, Any]:
         if self.state_path.exists():
             state = self._recover_promotion(self.load_state())
+            if state.get("baseline_mode", "workspace") != baseline_mode:
+                raise ValueError("task baseline mode changed after research workspace initialization")
+            if state.get("baseline_exclude", []) != list(baseline_exclude):
+                raise ValueError("task baseline exclusions changed after research workspace initialization")
+            _git(self.source, "update-ref", self.seed_ref, str(state["seed_commit"]))
             self._prepare_runtime(state, development_end)
             return state
-        self.versions.mkdir(parents=True, exist_ok=True)
+
         self.candidates.mkdir(parents=True, exist_ok=True)
+        self.evaluators.mkdir(parents=True, exist_ok=True)
         self.experiments.mkdir(parents=True, exist_ok=True)
-        baseline = self.versions / "baseline"
-        extra_ignored: set[str] = set()
-        if self.source in self.research_root.parents:
-            extra_ignored.add(self.research_root.relative_to(self.source).parts[0])
-        _copy_tree(self.source, baseline, extra_ignored)
+        seed_commit = self._snapshot_commit(baseline_exclude)
         state: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": self.task_id,
-            "baseline": "versions/baseline",
-            "champion": "versions/baseline",
+            "baseline_mode": baseline_mode,
+            "baseline_exclude": list(baseline_exclude),
+            "seed_commit": seed_commit,
+            "seed_ref": self.seed_ref,
+            "champion_commit": seed_commit if baseline_mode == "workspace" else None,
+            "champion_ref": self.champion_ref,
             "champion_number": 0,
             "champion_metrics": None,
             "champion_metrics_key": None,
             "last_experiment_id": None,
             "pending_promotion": None,
         }
+        if baseline_mode == "workspace":
+            _git(self.source, "update-ref", self.champion_ref, seed_commit)
+        _git(self.source, "update-ref", self.seed_ref, seed_commit)
         write_json_atomic(self.state_path, state)
         self._prepare_runtime(state, development_end)
         return state
@@ -221,36 +280,63 @@ class ResearchWorkspace:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
+        if state.get("schema_version") != 2:
+            raise ValueError("research workspace uses an incompatible pre-worktree schema")
         return state
 
-    def champion_path(self, state: Mapping[str, Any] | None = None) -> Path:
+    def candidate_base_commit(self, state: Mapping[str, Any] | None = None) -> str:
         current = state or self.load_state()
-        return self.root / str(current["champion"])
+        champion = current.get("champion_commit")
+        return str(champion if isinstance(champion, str) else current["seed_commit"])
 
     def create_candidate(
         self,
         experiment_id: str,
         development_end: date | None = None,
+        baseline_mode: str = "workspace",
+        baseline_exclude: Sequence[str] = (),
     ) -> tuple[Path, Path, dict[str, Any]]:
         if not _SAFE_TASK_ID.fullmatch(experiment_id):
             raise ValueError("experiment id may contain only letters, numbers, '.', '_' and '-'")
-        state = self.initialize(development_end)
-        # Parallel workers are outside the MVP. Anything left here is from an interrupted run.
-        for stale in self.candidates.iterdir():
-            if stale.is_dir():
-                shutil.rmtree(stale)
-            else:
-                stale.unlink()
-        for stale in self.versions.glob(".champion-*.tmp"):
-            shutil.rmtree(stale, ignore_errors=True)
+        state = self.initialize(development_end, baseline_mode, baseline_exclude)
+        self._cleanup_worktrees(self.candidates)
         candidate = self.candidates / experiment_id
         experiment = self.experiments / experiment_id
         if candidate.exists() or experiment.exists():
             raise FileExistsError(f"Experiment already exists: {experiment_id}")
-        _copy_tree(self.champion_path(state), candidate)
+        self._add_worktree(candidate, self.candidate_base_commit(state))
         copy_runtime_inputs(self.development_runtime, candidate)
         experiment.mkdir(parents=True)
         return candidate, experiment, state
+
+    def create_champion_evaluator(self, experiment_id: str, state: Mapping[str, Any]) -> Path:
+        commit = state.get("champion_commit")
+        if not isinstance(commit, str):
+            raise RuntimeError("research task does not have a champion yet")
+        self._cleanup_worktrees(self.evaluators)
+        evaluator = self.evaluators / experiment_id
+        self._add_worktree(evaluator, commit)
+        return evaluator
+
+    def remove_evaluator(self, evaluator: Path) -> None:
+        self._remove_worktree(evaluator)
+
+    def write_candidate_patch(
+        self,
+        candidate: Path,
+        state: Mapping[str, Any],
+        editable: Sequence[str],
+        destination: Path,
+    ) -> None:
+        patch = _git(
+            candidate,
+            "diff",
+            "--binary",
+            self.candidate_base_commit(state),
+            "--",
+            *editable,
+        )
+        destination.write_text(patch + ("\n" if patch else ""), encoding="utf-8")
 
     def record_state(
         self,
@@ -270,27 +356,37 @@ class ResearchWorkspace:
         state: dict[str, Any],
         experiment_id: str,
         metrics: Mapping[str, Any],
-    ) -> Path:
+        editable: Sequence[str],
+    ) -> str:
+        _git(candidate, "add", "-A", "--", *editable)
+        _git(
+            candidate,
+            "-c",
+            f"user.name={_GIT_IDENTITY['GIT_AUTHOR_NAME']}",
+            "-c",
+            f"user.email={_GIT_IDENTITY['GIT_AUTHOR_EMAIL']}",
+            "commit",
+            "-m",
+            f"Research {self.task_id}: {experiment_id}",
+            env=_GIT_IDENTITY,
+        )
+        commit = _git(candidate, "rev-parse", "HEAD")
         number = int(state["champion_number"]) + 1
-        destination = self.versions / f"champion-{number:03d}"
-        temporary = self.versions / f".champion-{number:03d}.tmp"
         state["pending_promotion"] = {
             "experiment_id": experiment_id,
-            "champion": destination.relative_to(self.root).as_posix(),
-            "temporary": temporary.relative_to(self.root).as_posix(),
+            "commit": commit,
             "champion_number": number,
             "metrics": dict(metrics),
         }
         write_json_atomic(self.state_path, state)
-        _copy_tree(candidate, temporary)
-        os.replace(temporary, destination)
-        state["champion"] = destination.relative_to(self.root).as_posix()
+        _git(self.source, "update-ref", self.champion_ref, commit)
+        state["champion_commit"] = commit
         state["champion_number"] = number
         state["pending_promotion"] = None
         self.record_state(state, experiment_id, metrics)
-        shutil.rmtree(candidate)
-        return destination
+        self._remove_worktree(candidate)
+        return commit
 
     def reject(self, candidate: Path, state: dict[str, Any], experiment_id: str) -> None:
         self.record_state(state, experiment_id)
-        shutil.rmtree(candidate, ignore_errors=True)
+        self._remove_worktree(candidate)

@@ -106,13 +106,32 @@ def test_fixed_task_allows_missing_baseline() -> None:
 
     assert task.task_id == "etf-momentum"
     assert task.evaluation_mode == "fixed"
+    assert task.baseline_mode == "workspace"
 
 
-def test_task_rejects_unused_baseline_configuration() -> None:
+def test_task_supports_no_baseline() -> None:
     payload = fixed_task()
-    payload["baseline"] = {"strategy": "legacy"}
+    payload["baseline"] = {"mode": "none", "exclude": ["src/quant_core/strategy/"]}
 
-    with pytest.raises(ValueError, match="not supported"):
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.baseline_mode == "none"
+    assert task.baseline_exclude == ["src/quant_core/strategy/"]
+
+
+def test_task_rejects_unknown_baseline_mode() -> None:
+    payload = fixed_task()
+    payload["baseline"] = {"mode": "legacy"}
+
+    with pytest.raises(ValueError, match="baseline.mode"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_rejects_exclusions_for_workspace_baseline() -> None:
+    payload = fixed_task()
+    payload["baseline"] = {"mode": "workspace", "exclude": ["strategy.py"]}
+
+    with pytest.raises(ValueError, match="requires mode"):
         ResearchTask.from_mapping(payload)
 
 
@@ -144,6 +163,13 @@ def test_test_period_must_follow_research_period() -> None:
 
     with pytest.raises(ValueError, match="must start after"):
         ResearchTask.from_mapping(payload)
+
+
+def test_task_allows_no_test_period() -> None:
+    payload = fixed_task()
+    del payload["evaluation"]["test"]
+
+    ResearchTask.from_mapping(payload)
 
 
 def test_task_requires_non_empty_constraints() -> None:
@@ -241,6 +267,21 @@ def test_decision_enforces_lower_bound_constraints() -> None:
     assert accepted["decision"] == "accepted"
     assert rejected["decision"] == "rejected"
     assert rejected["constraints"]["annual_return"]["operator"] == ">="
+
+
+def test_first_candidate_needs_constraints_but_not_relative_improvement() -> None:
+    payload = fixed_task()
+    payload["baseline"] = {"mode": "none"}
+    payload["evaluation"]["acceptance"] = {"minimum_improvement": 0.50}
+    task = ResearchTask.from_mapping(payload)
+
+    accepted = _decide(task, None, {"gate": {"sortino": 0.2, "max_drawdown": -0.10}})
+    rejected = _decide(task, None, {"gate": {"sortino": 2.0, "max_drawdown": -0.30}})
+
+    assert accepted["decision"] == "accepted"
+    assert accepted["objective"]["champion"] is None
+    assert rejected["decision"] == "rejected"
+    assert rejected["reasons"] == ["gate constraints failed"]
 
 
 def test_completed_result_keeps_test_metrics_hidden() -> None:

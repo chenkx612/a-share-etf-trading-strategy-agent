@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -58,6 +59,18 @@ end = "2025-12-31"
 """
 
 
+def _init_repo(root: Path) -> None:
+    if (root / ".git").exists():
+        return
+    (root / ".gitignore").write_text(".research/\ndata/\noutputs/\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run([
+        "git", "-C", str(root), "-c", "user.name=Test", "-c",
+        "user.email=test@example.invalid", "commit", "-q", "-m", "init",
+    ], check=True)
+
+
 def _task(
     root: Path,
     *,
@@ -75,6 +88,7 @@ def _task(
     if target is not None:
         content += f"\n[evaluation.target]\nobjective_at_least = {target}\n"
     path.write_text(content, encoding="utf-8")
+    _init_repo(root)
     return path
 
 
