@@ -14,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from utils import (  # noqa: E402
     add_common_run_args,
     automation_dir_from_args,
+    default_data_start,
     fill_default_start,
     log_step,
     prepare_reviewed_candidates,
@@ -54,7 +55,7 @@ def main() -> None:
             "data",
             "update",
             "--start",
-            args.start,
+            default_data_start(args.date),
             "--end",
             args.date,
             "--universe",
@@ -63,7 +64,6 @@ def main() -> None:
             "sector-rotation",
             "--adjust",
             "qfq",
-            "--force-refresh",
         ],
         "data update",
     )

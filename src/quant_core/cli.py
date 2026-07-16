@@ -25,9 +25,9 @@ from quant_core.data.market_data import (
     ProjectPaths,
     fetch_daily_if_stale,
     load_universe,
-    merge_incremental,
     read_daily,
     read_table,
+    replace_symbol_history,
     universe_symbols,
     validate_daily,
     write_table,
@@ -280,10 +280,12 @@ def command_data_update(args: argparse.Namespace) -> None:
         parse_date(args.end),
         existing=existing,
         fetch_one=market_data.fetch_daily,
-        force_refresh=getattr(args, "force_refresh", False),
         log=print,
     )
-    daily = merge_incremental(existing, incoming)
+    if incoming.empty:
+        print(f"local daily data unchanged through {target_trade_date}")
+        return
+    daily = replace_symbol_history(existing, incoming)
     problems = validate_daily(daily)
     daily_path = write_table(daily, paths.data_daily)
     print(f"wrote {len(daily)} rows to {daily_path}")
@@ -501,7 +503,6 @@ def build_parser() -> argparse.ArgumentParser:
     data_update.add_argument("--universe")
     data_update.add_argument("--universe-name", default="default")
     data_update.add_argument("--adjust")
-    data_update.add_argument("--force-refresh", action="store_true")
     data_update.set_defaults(func=command_data_update)
 
     factor = sub.add_parser("factor")

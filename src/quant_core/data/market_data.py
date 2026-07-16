@@ -293,6 +293,14 @@ def merge_incremental(existing: pd.DataFrame | None, incoming: pd.DataFrame) -> 
     )
 
 
+def replace_symbol_history(existing: pd.DataFrame | None, incoming: pd.DataFrame) -> pd.DataFrame:
+    if existing is None or existing.empty or incoming.empty:
+        return merge_incremental(existing, incoming)
+    refreshed_symbols = set(incoming["symbol"].astype(str))
+    retained = existing[~existing["symbol"].astype(str).isin(refreshed_symbols)]
+    return merge_incremental(retained, incoming)
+
+
 def latest_trade_date_on_or_before(target: date) -> date:
     try:
         import akshare as ak
@@ -338,14 +346,10 @@ def fetch_daily_if_stale(
     *,
     existing: pd.DataFrame | None,
     fetch_one: Callable[[pd.DataFrame, date, date], pd.DataFrame],
-    force_refresh: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, date]:
     target_trade_date = latest_trade_date_on_or_before(end)
-    if force_refresh:
-        stale_symbols = sorted(universe["symbol"].astype(str).unique().tolist())
-    else:
-        stale_symbols = missing_symbols_for_date(existing, universe, target_trade_date)
+    stale_symbols = missing_symbols_for_date(existing, universe, target_trade_date)
     if not stale_symbols:
         if log is not None:
             log(f"local daily data already covers latest trade date {target_trade_date}; skip fetch")
@@ -356,10 +360,7 @@ def fetch_daily_if_stale(
         log(f"refresh start adjusted from {start} to {effective_start} for five-year qfq refresh window")
     stale_universe = universe[universe["symbol"].astype(str).isin(stale_symbols)].copy()
     if log is not None:
-        if force_refresh:
-            log(f"force refresh adjusted daily window for latest trade date {target_trade_date}: {stale_symbols}")
-        else:
-            log(f"refresh stale symbols for latest trade date {target_trade_date}: {stale_symbols}")
+        log(f"replace stale symbol histories for latest trade date {target_trade_date}: {stale_symbols}")
     incoming = fetch_one(stale_universe, effective_start, end)
     missing = missing_symbols_for_date(incoming, stale_universe, target_trade_date)
     if missing:
@@ -433,7 +434,7 @@ def merge_and_store_daily(paths: ProjectPaths, incoming: pd.DataFrame, label: st
         existing_raw = read_daily(paths)
     except FileNotFoundError:
         existing_raw = None
-    merged = merge_incremental(existing_raw, incoming)
+    merged = replace_symbol_history(existing_raw, incoming)
     problems = validate_daily(merged)
     write_table(merged, paths.data_daily)
     if problems:

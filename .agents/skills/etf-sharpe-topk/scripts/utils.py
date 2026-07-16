@@ -108,11 +108,19 @@ def automation_dir_from_args(args: argparse.Namespace) -> Path:
 
 
 def default_start(trade_date: str) -> str:
+    return years_before(trade_date, 3)
+
+
+def default_data_start(trade_date: str) -> str:
+    return years_before(trade_date, 5)
+
+
+def years_before(trade_date: str, years: int) -> str:
     parsed = datetime.strptime(trade_date, "%Y-%m-%d").date()
     try:
-        return parsed.replace(year=parsed.year - 3).isoformat()
+        return parsed.replace(year=parsed.year - years).isoformat()
     except ValueError:
-        return parsed.replace(year=parsed.year - 3, day=28).isoformat()
+        return parsed.replace(year=parsed.year - years, day=28).isoformat()
 
 
 def reset_run_dir(path: Path) -> None:

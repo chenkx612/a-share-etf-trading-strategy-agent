@@ -100,6 +100,15 @@ def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
     )
 
 
+def test_etf_pool_uses_five_year_data_window_and_three_year_backtest_window() -> None:
+    runner = load_skill_script("utils")
+
+    assert runner.default_data_start("2026-06-12") == "2021-06-12"
+    assert runner.default_start("2026-06-12") == "2023-06-12"
+    assert runner.default_data_start("2024-02-29") == "2019-02-28"
+    assert runner.default_start("2024-02-29") == "2021-02-28"
+
+
 def test_selector_loads_base_chinese_names_from_skill_reference_csv(tmp_path: Path) -> None:
     selector = load_skill_script("select_etf_candidates")
     base_path = tmp_path / "sector_rotation_universe.csv"
@@ -456,7 +465,6 @@ def test_data_update_does_not_create_outputs_directory(
             universe=str(universe_path),
             universe_name="sector-rotation",
             adjust=None,
-            force_refresh=False,
         )
     )
 
@@ -465,6 +473,87 @@ def test_data_update_does_not_create_outputs_directory(
     data_files = list((tmp_path / "data").iterdir())
     assert len(data_files) == 1
     assert data_files[0].stem == "etf_daily"
+
+
+def test_data_update_replaces_refreshed_symbol_history_and_keeps_current_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    universe_path = tmp_path / "universe.csv"
+    pd.DataFrame([
+        {"symbol": "510300", "name": "沪深300ETF"},
+        {"symbol": "510500", "name": "中证500ETF"},
+    ]).to_csv(universe_path, index=False)
+    existing = pd.DataFrame([
+        {"date": "2020-01-02", "symbol": "510300", "name": "沪深300ETF", "close": 1.0},
+        {"date": TEST_DATE, "symbol": "510500", "name": "中证500ETF", "close": 2.0},
+    ])
+    incoming = pd.DataFrame([
+        {"date": TEST_DATE, "symbol": "510300", "name": "沪深300ETF", "close": 3.0},
+    ])
+    written: list[pd.DataFrame] = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "AkshareMarketDataClient",
+        lambda adjust: argparse.Namespace(fetch_daily=lambda *args, **kwargs: pd.DataFrame()),
+    )
+    monkeypatch.setattr(cli_module, "read_daily", lambda paths: existing.copy())
+    monkeypatch.setattr(
+        cli_module,
+        "fetch_daily_if_stale",
+        lambda *args, **kwargs: (incoming.copy(), TEST_DAY),
+    )
+    monkeypatch.setattr(cli_module, "write_table", lambda frame, path: written.append(frame.copy()) or path)
+
+    cli_module.command_data_update(
+        argparse.Namespace(
+            root=str(tmp_path),
+            start="2021-06-12",
+            end=TEST_DATE,
+            universe=str(universe_path),
+            universe_name="sector-rotation",
+            adjust="qfq",
+        )
+    )
+
+    assert len(written) == 1
+    refreshed = written[0][written[0]["symbol"].astype(str).eq("510300")]
+    current = written[0][written[0]["symbol"].astype(str).eq("510500")]
+    assert pd.to_datetime(refreshed["date"]).tolist() == [pd.Timestamp(TEST_DATE)]
+    assert pd.to_datetime(current["date"]).tolist() == [pd.Timestamp(TEST_DATE)]
+
+
+def test_data_update_does_not_rewrite_cache_when_all_symbols_are_current(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    universe_path = tmp_path / "universe.csv"
+    pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}]).to_csv(universe_path, index=False)
+    existing = pd.DataFrame([{"date": TEST_DATE, "symbol": "510300", "close": 1.0}])
+
+    monkeypatch.setattr(cli_module, "read_daily", lambda paths: existing.copy())
+    monkeypatch.setattr(
+        cli_module,
+        "fetch_daily_if_stale",
+        lambda *args, **kwargs: (pd.DataFrame(), TEST_DAY),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "write_table",
+        lambda *args, **kwargs: pytest.fail("current cache must not be rewritten"),
+    )
+
+    cli_module.command_data_update(
+        argparse.Namespace(
+            root=str(tmp_path),
+            start="2021-06-12",
+            end=TEST_DATE,
+            universe=str(universe_path),
+            universe_name="sector-rotation",
+            adjust="qfq",
+        )
+    )
 
 
 def test_recommendation_outputs_are_copied_directly_to_automation_dir(tmp_path: Path) -> None:
@@ -891,60 +980,6 @@ def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(
     assert target_trade_date == TEST_DAY
     assert fetched_symbols == ["510300"]
     assert incoming["symbol"].tolist() == ["510300"]
-
-
-def test_fetch_daily_if_stale_force_refreshes_all_symbols_even_when_covered(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
-    universe = pd.DataFrame([
-        {"symbol": "510300", "name": "沪深300ETF"},
-        {"symbol": "510500", "name": "中证500ETF"},
-    ])
-    existing = pd.DataFrame([
-        {
-            "date": pd.Timestamp(TEST_DATE),
-            "symbol": "510300",
-            "name": "沪深300ETF",
-            "open": 1.0,
-            "high": 1.0,
-            "low": 1.0,
-            "close": 1.0,
-            "volume": 1,
-            "amount": 1,
-            "turnover": 1,
-        },
-        {
-            "date": pd.Timestamp(TEST_DATE),
-            "symbol": "510500",
-            "name": "中证500ETF",
-            "open": 1.0,
-            "high": 1.0,
-            "low": 1.0,
-            "close": 1.0,
-            "volume": 1,
-            "amount": 1,
-            "turnover": 1,
-        },
-    ])
-    fetched_symbols = []
-
-    def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-        fetched_symbols.extend(single["symbol"].astype(str).tolist())
-        return existing.copy()
-
-    incoming, target_trade_date = fetch_daily_if_stale(
-        universe,
-        date(2026, 1, 1),
-        TEST_END_DAY,
-        existing=existing,
-        fetch_one=fetch_one,
-        force_refresh=True,
-    )
-
-    assert target_trade_date == TEST_DAY
-    assert fetched_symbols == ["510300", "510500"]
-    assert incoming["symbol"].astype(str).tolist() == ["510300", "510500"]
 
 
 def test_fetch_daily_if_stale_refuses_partial_market_data_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
