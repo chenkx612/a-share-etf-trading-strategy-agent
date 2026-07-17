@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/quant_core/` contains the framework package and CLI entry point. Core modules are split by responsibility: `data/` for market data download/cache and table IO helpers, `factors/` for factor calculation, `strategy/` for selection logic, and `backtest/` for simulation. Shared strategy defaults live in `config.py`, and lightweight report output lives in the CLI.
+`src/quant_core/` contains the framework package and CLI entry point. Core modules are split by responsibility: `data/` for market data download/cache and table IO helpers, `factors/` for factor calculation, `strategy/` for selection logic, and `backtest/` for simulation. Each strategy module owns its trading logic and tunable parameter defaults. Fixed simulation settings live in `config.py`, and lightweight report output lives in the CLI.
 
 `tests/` holds pytest coverage for framework behavior. `docs/` contains framework development documentation only; do not put quantitative trading business knowledge there. Skill-specific prompts, knowledge, scripts, templates, stock-pool definitions, and intermediate outputs live under `.agents/skills/<skill-name>/`.
 

@@ -1,26 +1,72 @@
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 import pandas as pd
 
-from quant_core.config import (
-    SHARPE_CORR_THRESHOLD_CORR_THRESHOLD,
-    SHARPE_CORR_THRESHOLD_CORR_WINDOW,
-    SHARPE_CORR_THRESHOLD_LOWER_BOUND,
-    SHARPE_CORR_THRESHOLD_STOP_LOSS_PCT,
-    StrategyConfig,
-)
+from quant_core.factors import compute_factors
+
+
+STRATEGY_NAME = "sharpe-corr-threshold"
+
+
+@dataclass(frozen=True)
+class SharpeCorrThresholdParams:
+    top_n: int = 5
+    sharpe_window: int = 25
+    factor_lower_bound: float = 0.0
+    corr_window: int = 100
+    corr_threshold: float = 0.9
+    stop_loss_pct: float = 0.1
+
+    def __post_init__(self) -> None:
+        if isinstance(self.top_n, bool) or not isinstance(self.top_n, int) or self.top_n <= 0:
+            raise ValueError("top_n must be a positive integer")
+        if (
+            isinstance(self.sharpe_window, bool)
+            or not isinstance(self.sharpe_window, int)
+            or self.sharpe_window <= 0
+        ):
+            raise ValueError("sharpe_window must be a positive integer")
+        if isinstance(self.corr_window, bool) or not isinstance(self.corr_window, int) or self.corr_window <= 0:
+            raise ValueError("corr_window must be a positive integer")
+        if not math.isfinite(self.factor_lower_bound):
+            raise ValueError("factor_lower_bound must be finite")
+        if not math.isfinite(self.corr_threshold) or not -1.0 <= self.corr_threshold <= 1.0:
+            raise ValueError("corr_threshold must be between -1 and 1")
+        if not math.isfinite(self.stop_loss_pct) or not 0.0 <= self.stop_loss_pct <= 1.0:
+            raise ValueError("stop_loss_pct must be between 0 and 1")
+
+    @property
+    def factor_name(self) -> str:
+        return f"sharpe_{self.sharpe_window}"
+
+
+def select(
+    daily: pd.DataFrame,
+    universe: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Candidate-compatible entry point for the research evaluator."""
+    params = SharpeCorrThresholdParams()
+    factors = compute_factors(daily, sharpe_windows=[params.sharpe_window])
+    return select_sharpe_corr_threshold(
+        factors,
+        params,
+        start=start,
+        end=end,
+        universe_symbols=set(universe["symbol"].astype(str)),
+    )
 
 
 def select_sharpe_corr_threshold(
     factors: pd.DataFrame,
-    config: StrategyConfig,
+    params: SharpeCorrThresholdParams,
     start: pd.Timestamp | None = None,
     end: pd.Timestamp | None = None,
     universe_symbols: set[str] | None = None,
-    corr_window: int | None = None,
-    corr_threshold: float | None = None,
-    stop_loss_pct: float | None = None,
-    factor_lower_bound: float | None = None,
 ) -> pd.DataFrame:
     if factors.empty:
         return pd.DataFrame(columns=["date", "symbol", "name", "score", "target_weight"])
@@ -33,22 +79,14 @@ def select_sharpe_corr_threshold(
     if df.empty:
         return pd.DataFrame(columns=["date", "symbol", "name", "score", "target_weight"])
 
-    corr_window = SHARPE_CORR_THRESHOLD_CORR_WINDOW if corr_window is None else corr_window
-    corr_threshold = SHARPE_CORR_THRESHOLD_CORR_THRESHOLD if corr_threshold is None else corr_threshold
-    stop_loss_pct = SHARPE_CORR_THRESHOLD_STOP_LOSS_PCT if stop_loss_pct is None else stop_loss_pct
-    factor_lower_bound = (
-        SHARPE_CORR_THRESHOLD_LOWER_BOUND if factor_lower_bound is None else factor_lower_bound
-    )
-
-    score_col = config.factor_name
+    score_col = params.factor_name
     prices = df.pivot(index="date", columns="symbol", values="close").sort_index().ffill()
     daily_rets = prices.pct_change().fillna(0.0)
-    rolling_corr = daily_rets.rolling(corr_window).corr()
+    rolling_corr = daily_rets.rolling(params.corr_window).corr()
 
     rows: list[dict[str, object]] = []
     filter_events: list[dict[str, object]] = []
     signal_dates: list[pd.Timestamp] = []
-    prev_selected: list[str] = []
     names = df.drop_duplicates("symbol").set_index("symbol")["name"].to_dict()
     available_symbols = sorted(df["symbol"].unique().tolist())
 
@@ -64,7 +102,7 @@ def select_sharpe_corr_threshold(
         stopped_assets = {
             asset
             for asset in day_scores.index
-            if asset in daily_rets.columns and daily_rets.loc[date, asset] < -stop_loss_pct
+            if asset in daily_rets.columns and daily_rets.loc[date, asset] < -params.stop_loss_pct
         }
         for asset in sorted(stopped_assets):
             filter_events.append({
@@ -74,13 +112,12 @@ def select_sharpe_corr_threshold(
                 "filter": "stop_loss",
                 "condition": "daily_return < -stop_loss_pct",
                 "daily_return": float(daily_rets.loc[date, asset]),
-                "stop_loss_pct": float(stop_loss_pct),
+                "stop_loss_pct": float(params.stop_loss_pct),
                 "score": float(day_scores.loc[asset]),
             })
         day_scores = day_scores.drop(stopped_assets, errors="ignore")
-        day_scores = day_scores[day_scores > factor_lower_bound]
+        day_scores = day_scores[day_scores > params.factor_lower_bound]
         if day_scores.empty:
-            prev_selected = []
             continue
 
         try:
@@ -90,9 +127,9 @@ def select_sharpe_corr_threshold(
 
         selected: list[str] = []
         for asset in day_scores.sort_values(ascending=False).index.tolist():
-            if len(selected) >= config.top_n:
+            if len(selected) >= params.top_n:
                 break
-            corr_block = _correlation_block(asset, selected, curr_corr, corr_threshold)
+            corr_block = _correlation_block(asset, selected, curr_corr, params.corr_threshold)
             if corr_block is not None:
                 selected_asset, corr_value = corr_block
                 filter_events.append({
@@ -102,7 +139,7 @@ def select_sharpe_corr_threshold(
                     "filter": "correlation",
                     "condition": "correlation > corr_threshold",
                     "correlation": float(corr_value),
-                    "corr_threshold": float(corr_threshold),
+                    "corr_threshold": float(params.corr_threshold),
                     "selected_symbol": str(selected_asset),
                     "selected_name": names.get(str(selected_asset), str(selected_asset)),
                     "score": float(day_scores.loc[asset]),
@@ -111,7 +148,7 @@ def select_sharpe_corr_threshold(
             selected.append(str(asset))
 
         if selected:
-            weight = 1.0 / config.top_n
+            weight = 1.0 / params.top_n
             for asset in selected:
                 rows.append({
                     "date": date,
@@ -120,8 +157,6 @@ def select_sharpe_corr_threshold(
                     "score": float(day_scores.loc[asset]),
                     "target_weight": weight,
                 })
-        prev_selected = selected
-
     selected = pd.DataFrame(rows, columns=["date", "symbol", "name", "score", "target_weight"])
     selected.attrs["signal_dates"] = signal_dates
     selected.attrs["universe_symbols"] = available_symbols

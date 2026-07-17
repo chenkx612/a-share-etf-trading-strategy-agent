@@ -665,11 +665,10 @@ def test_symbol_return_contributions_uses_held_weight_times_next_open_return() -
         daily,
         selected,
         {"510300", "510500"},
-        fee_rate=0.0,
     )
 
     assert contributions["symbol"].tolist() == ["510300", "510500"]
-    assert contributions["contribution"].tolist() == pytest.approx([-0.1, 0.1])
+    assert contributions["contribution"].tolist() == pytest.approx([-0.098, 0.098])
 
 
 def test_pruned_pool_challenge_accepts_only_when_sortino_improves(monkeypatch: pytest.MonkeyPatch) -> None:

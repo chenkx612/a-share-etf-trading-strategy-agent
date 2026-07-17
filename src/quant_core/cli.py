@@ -11,14 +11,7 @@ from typing import Iterable
 import pandas as pd
 
 from quant_core.backtest.engine import run_backtest
-from quant_core.config import (
-    SHARPE_CORR_THRESHOLD_CORR_THRESHOLD,
-    SHARPE_CORR_THRESHOLD_CORR_WINDOW,
-    SHARPE_CORR_THRESHOLD_LOWER_BOUND,
-    SHARPE_CORR_THRESHOLD_STOP_LOSS_PCT,
-    STRATEGY_NAME,
-    StrategyConfig,
-)
+from quant_core.config import BacktestConfig
 from quant_core.data.market_data import (
     AkshareMarketDataClient,
     DEFAULT_ADJUST,
@@ -34,7 +27,11 @@ from quant_core.data.market_data import (
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
 from quant_core.research import run_loop, run_managed_once, run_once
-from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
+from quant_core.strategy.sharpe_corr_threshold import (
+    STRATEGY_NAME,
+    SharpeCorrThresholdParams,
+    select_sharpe_corr_threshold,
+)
 
 
 STRATEGY_CHOICES = [STRATEGY_NAME]
@@ -80,7 +77,6 @@ def optimization_grid_results(
     start: pd.Timestamp,
     end: pd.Timestamp,
     top_ns: Iterable[int],
-    fee_rates: Iterable[float],
     sharpe_windows: Iterable[int] | None,
     factor_lower_bounds: Iterable[float | None],
     corr_windows: Iterable[int | None],
@@ -91,73 +87,101 @@ def optimization_grid_results(
     rows = []
     if strategy != STRATEGY_NAME:
         raise ValueError(f"Unknown strategy: {strategy}")
+    backtest_config = BacktestConfig()
+    defaults = SharpeCorrThresholdParams()
     candidate_sharpe_windows = list(sharpe_windows or [None])
     for top_n in top_ns:
-        for fee_rate in fee_rates:
-            for sharpe_window in candidate_sharpe_windows:
-                for factor_lower_bound in factor_lower_bounds:
-                    for corr_window in corr_windows:
-                        for corr_threshold in corr_thresholds:
-                            for stop_loss_pct in stop_loss_pcts:
-                                config = build_strategy_config(argparse.Namespace(
-                                    strategy=strategy,
-                                    top_n=top_n,
-                                    fee_rate=fee_rate,
-                                    sharpe_window=sharpe_window,
-                                ))
-                                selected = select_sharpe_corr_threshold(
-                                    factors,
-                                    config,
-                                    start=start,
-                                    end=end,
-                                    universe_symbols=symbols,
-                                    factor_lower_bound=(
-                                        factor_lower_bound
-                                        if factor_lower_bound is not None
-                                        else SHARPE_CORR_THRESHOLD_LOWER_BOUND
-                                    ),
-                                    corr_window=(
-                                        corr_window
-                                        if corr_window is not None
-                                        else SHARPE_CORR_THRESHOLD_CORR_WINDOW
-                                    ),
-                                    corr_threshold=(
-                                        corr_threshold
-                                        if corr_threshold is not None
-                                        else SHARPE_CORR_THRESHOLD_CORR_THRESHOLD
-                                    ),
-                                    stop_loss_pct=(
-                                        stop_loss_pct
-                                        if stop_loss_pct is not None
-                                        else SHARPE_CORR_THRESHOLD_STOP_LOSS_PCT
-                                    ),
-                                )
-                                result = run_backtest(daily, selected, fee_rate=config.fee_rate)
-                                metrics = result.metrics
-                                rows.append({
-                                    "strategy": STRATEGY_NAME,
-                                    "top_n": top_n,
-                                    "fee_rate": fee_rate,
-                                    "sharpe_window": sharpe_window,
-                                    "factor_lower_bound": factor_lower_bound,
-                                    "corr_window": corr_window,
-                                    "corr_threshold": corr_threshold,
-                                    "stop_loss_pct": stop_loss_pct,
-                                    "valid": metrics_satisfy_constraint(metrics, constraint),
-                                    **metrics,
-                                })
+        for sharpe_window in candidate_sharpe_windows:
+            for factor_lower_bound in factor_lower_bounds:
+                for corr_window in corr_windows:
+                    for corr_threshold in corr_thresholds:
+                        for stop_loss_pct in stop_loss_pcts:
+                            params = SharpeCorrThresholdParams(
+                                top_n=top_n,
+                                sharpe_window=(
+                                    defaults.sharpe_window
+                                    if sharpe_window is None
+                                    else sharpe_window
+                                ),
+                                factor_lower_bound=(
+                                    defaults.factor_lower_bound
+                                    if factor_lower_bound is None
+                                    else factor_lower_bound
+                                ),
+                                corr_window=(
+                                    defaults.corr_window
+                                    if corr_window is None
+                                    else corr_window
+                                ),
+                                corr_threshold=(
+                                    defaults.corr_threshold
+                                    if corr_threshold is None
+                                    else corr_threshold
+                                ),
+                                stop_loss_pct=(
+                                    defaults.stop_loss_pct
+                                    if stop_loss_pct is None
+                                    else stop_loss_pct
+                                ),
+                            )
+                            selected = select_sharpe_corr_threshold(
+                                factors,
+                                params,
+                                start=start,
+                                end=end,
+                                universe_symbols=symbols,
+                            )
+                            result = run_backtest(
+                                daily,
+                                selected,
+                                fee_rate=backtest_config.fee_rate,
+                                initial_capital=backtest_config.initial_capital,
+                                lot_size=backtest_config.lot_size,
+                            )
+                            metrics = result.metrics
+                            rows.append({
+                                "strategy": STRATEGY_NAME,
+                                "top_n": params.top_n,
+                                "fee_rate": backtest_config.fee_rate,
+                                "sharpe_window": params.sharpe_window,
+                                "factor_lower_bound": params.factor_lower_bound,
+                                "corr_window": params.corr_window,
+                                "corr_threshold": params.corr_threshold,
+                                "stop_loss_pct": params.stop_loss_pct,
+                                "valid": metrics_satisfy_constraint(metrics, constraint),
+                                **metrics,
+                            })
     return pd.DataFrame(rows)
 
 
-def build_strategy_config(args: argparse.Namespace) -> StrategyConfig:
+def build_strategy_params(args: argparse.Namespace) -> SharpeCorrThresholdParams:
     strategy = getattr(args, "strategy", STRATEGY_NAME)
     if strategy != STRATEGY_NAME:
         raise ValueError(f"Unknown strategy: {strategy}")
-    defaults = StrategyConfig()
-    return StrategyConfig(
+    defaults = SharpeCorrThresholdParams()
+    return SharpeCorrThresholdParams(
         top_n=getattr(args, "top_n", None) or defaults.top_n,
-        fee_rate=getattr(args, "fee_rate", None) or defaults.fee_rate,
         sharpe_window=getattr(args, "sharpe_window", None) or defaults.sharpe_window,
+        factor_lower_bound=(
+            defaults.factor_lower_bound
+            if getattr(args, "factor_lower_bound", None) is None
+            else args.factor_lower_bound
+        ),
+        corr_window=(
+            defaults.corr_window
+            if getattr(args, "corr_window", None) is None
+            else args.corr_window
+        ),
+        corr_threshold=(
+            defaults.corr_threshold
+            if getattr(args, "corr_threshold", None) is None
+            else args.corr_threshold
+        ),
+        stop_loss_pct=(
+            defaults.stop_loss_pct
+            if getattr(args, "stop_loss_pct", None) is None
+            else args.stop_loss_pct
+        ),
     )
 
 
@@ -315,10 +339,11 @@ def command_factor_compute(args: argparse.Namespace) -> None:
 def command_backtest_run(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
-    config = build_strategy_config(args)
+    params = build_strategy_params(args)
+    backtest_config = BacktestConfig()
     daily = read_daily(paths)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
-    factors = ensure_sharpe_factor_columns(factors, daily, [config.sharpe_window])
+    factors = ensure_sharpe_factor_columns(factors, daily, [params.sharpe_window])
     universe = load_strategy_universe(args)
     symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
@@ -326,18 +351,20 @@ def command_backtest_run(args: argparse.Namespace) -> None:
     end = pd.Timestamp(args.end)
     selected = select_sharpe_corr_threshold(
         factors,
-        config,
+        params,
         start=start,
         end=end,
         universe_symbols=symbols,
-        factor_lower_bound=getattr(args, "factor_lower_bound", None),
-        corr_window=getattr(args, "corr_window", None),
-        corr_threshold=getattr(args, "corr_threshold", None),
-        stop_loss_pct=getattr(args, "stop_loss_pct", None),
     )
-    result = run_backtest(daily, selected, fee_rate=config.fee_rate)
+    result = run_backtest(
+        daily,
+        selected,
+        fee_rate=backtest_config.fee_rate,
+        initial_capital=backtest_config.initial_capital,
+        lot_size=backtest_config.lot_size,
+    )
     metrics = result.metrics
-    run_id = args.run_id or f"{args.start}_{args.end}_{STRATEGY_NAME}_{args.universe_name}_top{config.top_n}"
+    run_id = args.run_id or f"{args.start}_{args.end}_{STRATEGY_NAME}_{args.universe_name}_top{params.top_n}"
     run_dir = paths.outputs / "backtests" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     selected.to_csv(run_dir / "orders.csv", index=False)
@@ -366,7 +393,6 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
     corr_windows = parse_int_list(args.corr_window)
     corr_thresholds = parse_float_list(args.corr_threshold)
     stop_loss_pcts = parse_float_list(args.stop_loss_pct)
-
     results = optimization_grid_results(
         strategy=args.strategy,
         daily=daily,
@@ -375,7 +401,6 @@ def command_optimize_grid(args: argparse.Namespace) -> None:
         start=start,
         end=end,
         top_ns=parse_int_list(args.top_n),
-        fee_rates=parse_float_list(args.fee_rate),
         sharpe_windows=sharpe_windows,
         factor_lower_bounds=factor_lower_bounds,
         corr_windows=corr_windows,
@@ -417,24 +442,20 @@ def command_report_build(args: argparse.Namespace) -> None:
 def command_recommend_today(args: argparse.Namespace) -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
-    config = build_strategy_config(args)
+    params = build_strategy_params(args)
     target_date = pd.Timestamp(args.date)
     factors = read_table(paths.outputs / "factors" / "factors", parse_dates=["date"])
     daily = read_daily(paths)
-    factors = ensure_sharpe_factor_columns(factors, daily, [config.sharpe_window])
+    factors = ensure_sharpe_factor_columns(factors, daily, [params.sharpe_window])
     universe = load_strategy_universe(args)
     symbols = universe_symbols(universe)
     factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     selected = select_sharpe_corr_threshold(
         factors,
-        config,
+        params,
         start=target_date,
         end=target_date,
         universe_symbols=symbols,
-        factor_lower_bound=getattr(args, "factor_lower_bound", None),
-        corr_window=getattr(args, "corr_window", None),
-        corr_threshold=getattr(args, "corr_threshold", None),
-        stop_loss_pct=getattr(args, "stop_loss_pct", None),
     )
     out = paths.outputs / "recommendations" / f"{args.date}_{args.universe_name}.csv"
     recommendation_output_frame(selected).to_csv(out, index=False)
@@ -522,7 +543,6 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_run.add_argument("--universe", required=True)
     backtest_run.add_argument("--universe-name", default="default")
     backtest_run.add_argument("--top-n", type=int)
-    backtest_run.add_argument("--fee-rate", type=float)
     backtest_run.add_argument("--sharpe-window", type=int)
     backtest_run.add_argument("--factor-lower-bound", type=float)
     backtest_run.add_argument("--corr-window", type=int)
@@ -540,7 +560,6 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid.add_argument("--universe", required=True)
     optimize_grid.add_argument("--universe-name", default="default")
     optimize_grid.add_argument("--top-n", default="3,5,10")
-    optimize_grid.add_argument("--fee-rate", default="0.0003,0.001")
     optimize_grid.add_argument("--sharpe-window", default="20,25,60,120")
     optimize_grid.add_argument("--factor-lower-bound", default="-0.5,0.0,0.5")
     optimize_grid.add_argument("--corr-window", default="100")
@@ -560,7 +579,6 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_today.add_argument("--universe", required=True)
     recommend_today.add_argument("--universe-name", default="default")
     recommend_today.add_argument("--top-n", type=int)
-    recommend_today.add_argument("--fee-rate", type=float)
     recommend_today.add_argument("--sharpe-window", type=int)
     recommend_today.add_argument("--factor-lower-bound", type=float)
     recommend_today.add_argument("--corr-window", type=int)

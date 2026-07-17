@@ -35,11 +35,11 @@ def test_evaluator_runs_candidate_through_fixed_backtest() -> None:
         pd.Timestamp("2025-01-01"),
         pd.Timestamp("2025-01-04"),
         select,
-        fee_rate=0.001,
     )
 
     assert selected["symbol"].tolist() == ["A"]
     assert "sortino" in result.metrics
+    assert result.positions["shares"].max() == 9_000
 
 
 def test_evaluator_rejects_invalid_candidate_weights() -> None:

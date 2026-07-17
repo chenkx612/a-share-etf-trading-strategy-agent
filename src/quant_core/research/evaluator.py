@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from quant_core.backtest.engine import BacktestResult, run_backtest
+from quant_core.config import BacktestConfig
 from quant_core.data.market_data import ProjectPaths, load_universe, read_daily
 
 
@@ -24,7 +25,7 @@ def evaluate_candidate(
     end: pd.Timestamp,
     selector: Selector,
     *,
-    fee_rate: float,
+    backtest_config: BacktestConfig = BacktestConfig(),
 ) -> tuple[pd.DataFrame, BacktestResult]:
     history = daily.copy()
     history["date"] = pd.to_datetime(history["date"])
@@ -37,7 +38,13 @@ def evaluate_candidate(
     if selected.empty:
         selected.attrs["signal_dates"] = sorted(backtest_daily["date"].unique())
     selected.attrs["universe_symbols"] = sorted(symbols)
-    return selected, run_backtest(backtest_daily, selected, fee_rate=fee_rate)
+    return selected, run_backtest(
+        backtest_daily,
+        selected,
+        fee_rate=backtest_config.fee_rate,
+        initial_capital=backtest_config.initial_capital,
+        lot_size=backtest_config.lot_size,
+    )
 
 
 def validate_selection(
@@ -89,7 +96,6 @@ def main() -> None:
     parser.add_argument("--end", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--candidate-module", default="quant_core.strategy.research_candidate")
-    parser.add_argument("--fee-rate", type=float, default=0.001)
     args = parser.parse_args()
 
     paths = ProjectPaths(Path(args.root))
@@ -100,7 +106,6 @@ def main() -> None:
         pd.Timestamp(args.start),
         pd.Timestamp(args.end),
         _selector(args.candidate_module),
-        fee_rate=args.fee_rate,
     )
     run_dir = paths.outputs / "backtests" / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,11 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from quant_core.config import BacktestConfig
+
+
+DEFAULT_BACKTEST_CONFIG = BacktestConfig()
+
 
 @dataclass(frozen=True)
 class BacktestResult:
@@ -37,9 +42,9 @@ def selected_to_weight_matrix(selected: pd.DataFrame) -> pd.DataFrame:
 def run_backtest(
     daily: pd.DataFrame,
     selected: pd.DataFrame,
-    fee_rate: float = 0.001,
-    initial_capital: float = 1_000_000.0,
-    lot_size: int = 100,
+    fee_rate: float = DEFAULT_BACKTEST_CONFIG.fee_rate,
+    initial_capital: float = DEFAULT_BACKTEST_CONFIG.initial_capital,
+    lot_size: int = DEFAULT_BACKTEST_CONFIG.lot_size,
 ) -> BacktestResult:
     prices = daily.pivot(index="date", columns="symbol", values="open").sort_index().ffill()
     target_weights = selected_to_weight_matrix(selected)

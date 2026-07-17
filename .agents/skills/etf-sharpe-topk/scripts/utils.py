@@ -23,7 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 from quant_core.backtest.engine import run_backtest  # noqa: E402
 from quant_core.cli import (  # noqa: E402
-    build_strategy_config,
+    build_strategy_params,
     command_factor_compute,
     command_recommend_today,
     optimization_grid_results,
@@ -33,7 +33,6 @@ from quant_core.cli import (  # noqa: E402
     read_daily,
     sort_optimization_results,
 )
-from quant_core.config import STRATEGY_NAME  # noqa: E402
 from quant_core.data.market_data import (  # noqa: E402
     ProjectPaths,
     expanded_universe as build_expanded_universe,
@@ -43,12 +42,14 @@ from quant_core.data.market_data import (  # noqa: E402
     write_table,
 )
 from quant_core.factors import compute_factors  # noqa: E402
-from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold  # noqa: E402
+from quant_core.strategy.sharpe_corr_threshold import (  # noqa: E402
+    STRATEGY_NAME,
+    select_sharpe_corr_threshold,
+)
 
 
 DEFAULT_RUN_ID = "current"
 DEFAULT_TOP_N = "4,5,6"
-DEFAULT_FEE_RATE = "0.0003"
 DEFAULT_SHARPE_WINDOW = "20,25,30"
 DEFAULT_FACTOR_LOWER_BOUND = "0.0,0.5,1.0"
 DEFAULT_CORR_WINDOW = "100"
@@ -72,7 +73,6 @@ def add_common_run_args(parser: argparse.ArgumentParser) -> None:
 
 def add_optimization_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--top-n", default=DEFAULT_TOP_N)
-    parser.add_argument("--fee-rate", default=DEFAULT_FEE_RATE)
     parser.add_argument("--sharpe-window", default=DEFAULT_SHARPE_WINDOW)
     parser.add_argument("--factor-lower-bound", default=DEFAULT_FACTOR_LOWER_BOUND)
     parser.add_argument("--corr-window", default=DEFAULT_CORR_WINDOW)
@@ -324,7 +324,6 @@ def generate_recommendations(args: argparse.Namespace, automation_dir: Path, rec
                 universe=str(automation_dir / "selected_universe.csv"),
                 universe_name="sector-rotation",
                 top_n=int(float(best["top_n"])),
-                fee_rate=float(best["fee_rate"]),
                 sharpe_window=int(float(best["sharpe_window"])),
                 factor_lower_bound=float(best["factor_lower_bound"]),
                 corr_window=int(float(best["corr_window"])),
@@ -465,7 +464,6 @@ def optimize_pool(
         start=start_date,
         end=end_date,
         top_ns=parse_int_list(args.top_n),
-        fee_rates=parse_float_list(args.fee_rate),
         sharpe_windows=sharpe_windows,
         factor_lower_bounds=parse_float_list(args.factor_lower_bound),
         corr_windows=parse_int_list(args.corr_window),
@@ -485,25 +483,24 @@ def best_strategy_selection(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    config = build_strategy_config(
+    params = build_strategy_params(
         argparse.Namespace(
             strategy=STRATEGY_NAME,
             top_n=int(float(best["top_n"])),
-            fee_rate=float(best["fee_rate"]),
             sharpe_window=int(float(best["sharpe_window"])),
+            factor_lower_bound=float(best["factor_lower_bound"]),
+            corr_window=int(float(best["corr_window"])),
+            corr_threshold=float(best["corr_threshold"]),
+            stop_loss_pct=float(best["stop_loss_pct"]),
         )
     )
     pool_factors = factors[factors["symbol"].astype(str).isin(symbols)].copy()
     return select_sharpe_corr_threshold(
         pool_factors,
-        config,
+        params,
         start=start_date,
         end=end_date,
         universe_symbols=symbols,
-        factor_lower_bound=float(best["factor_lower_bound"]),
-        corr_window=int(float(best["corr_window"])),
-        corr_threshold=float(best["corr_threshold"]),
-        stop_loss_pct=float(best["stop_loss_pct"]),
     )
 
 
@@ -511,9 +508,8 @@ def symbol_return_contributions(
     daily: pd.DataFrame,
     selected: pd.DataFrame,
     symbols: set[str],
-    fee_rate: float,
 ) -> pd.DataFrame:
-    result = run_backtest(daily, selected, fee_rate=fee_rate)
+    result = run_backtest(daily, selected)
     symbol_list = sorted(str(symbol) for symbol in symbols)
     if result.positions.empty:
         return pd.DataFrame({"symbol": symbol_list, "contribution": [0.0] * len(symbol_list)})
@@ -560,7 +556,6 @@ def evaluate_pruned_pool_challenge(
         daily,
         selected,
         symbols,
-        fee_rate=float(current_best["fee_rate"]),
     )
     if contributions.empty:
         return {"evaluated": False, "reason": "no contribution rows generated"}

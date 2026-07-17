@@ -14,10 +14,12 @@ from quant_core.cli import (
     recommendation_output_frame,
     sort_optimization_results,
 )
-from quant_core.config import StrategyConfig
 from quant_core.data.market_data import AkshareMarketDataClient, to_tencent_symbol
 from quant_core.factors import compute_factors
-from quant_core.strategy.sharpe_corr_threshold import select_sharpe_corr_threshold
+from quant_core.strategy.sharpe_corr_threshold import (
+    SharpeCorrThresholdParams,
+    select_sharpe_corr_threshold,
+)
 
 
 def sample_daily() -> pd.DataFrame:
@@ -48,12 +50,10 @@ def test_sharpe_corr_threshold_selection_backtest_loop() -> None:
     assert "sharpe_25" in factors.columns
     selected = select_sharpe_corr_threshold(
         factors,
-        StrategyConfig(top_n=2),
+        SharpeCorrThresholdParams(top_n=2, corr_window=10),
         start=pd.Timestamp("2024-01-25"),
         end=pd.Timestamp("2024-02-10"),
         universe_symbols={"510300", "510500", "159915"},
-        corr_window=10,
-        factor_lower_bound=0.0,
     )
     assert not selected.empty
     assert selected.groupby("date")["symbol"].count().max() <= 2
@@ -75,10 +75,10 @@ def test_compute_factors_supports_parameterized_sharpe_windows() -> None:
     assert factors["sharpe_10"].notna().any()
 
 
-def test_strategy_config_uses_custom_sharpe_window() -> None:
-    config = StrategyConfig(top_n=1, sharpe_window=30)
+def test_strategy_params_use_custom_sharpe_window() -> None:
+    params = SharpeCorrThresholdParams(top_n=1, sharpe_window=30)
 
-    assert config.factor_name == "sharpe_30"
+    assert params.factor_name == "sharpe_30"
 
 
 def test_missing_sharpe_factor_columns_are_computed_from_daily() -> None:
@@ -148,16 +148,14 @@ def test_sharpe_corr_threshold_leaves_cash_and_can_liquidate() -> None:
         0.8, -0.2,
         -0.1, -0.3,
     ]
-    config = StrategyConfig(top_n=2)
+    params = SharpeCorrThresholdParams(top_n=2, corr_window=1)
 
     selected = select_sharpe_corr_threshold(
         factors,
-        config,
+        params,
         start=dates[0],
         end=dates[2],
         universe_symbols={"510300", "510500"},
-        corr_window=1,
-        factor_lower_bound=0.0,
     )
 
     weights_by_date = selected.groupby("date")["target_weight"].sum()
@@ -200,13 +198,14 @@ def test_sharpe_corr_threshold_stop_loss_filters_single_day_candidates() -> None
 
     selected = select_sharpe_corr_threshold(
         factors,
-        StrategyConfig(top_n=2),
+        SharpeCorrThresholdParams(
+            top_n=2,
+            corr_window=2,
+            stop_loss_pct=0.1,
+        ),
         start=dates[-1],
         end=dates[-1],
         universe_symbols={"510300", "510500", "159915"},
-        corr_window=2,
-        stop_loss_pct=0.1,
-        factor_lower_bound=0.0,
     )
 
     assert "510300" not in set(selected["symbol"])
@@ -262,13 +261,14 @@ def test_sharpe_corr_threshold_corr_filter_works_for_single_day_selection() -> N
 
     selected = select_sharpe_corr_threshold(
         factors,
-        StrategyConfig(top_n=2),
+        SharpeCorrThresholdParams(
+            top_n=2,
+            corr_window=3,
+            corr_threshold=0.9,
+        ),
         start=dates[-1],
         end=dates[-1],
         universe_symbols={"510300", "510500", "159915"},
-        corr_window=3,
-        corr_threshold=0.9,
-        factor_lower_bound=0.0,
     )
 
     assert selected["symbol"].tolist() == ["510300", "159915"]
@@ -315,7 +315,7 @@ def test_backtest_trades_at_next_open_and_uses_open_to_open_returns() -> None:
     assert returns.loc[dates[1]] == pytest.approx(0.099)
     assert returns.loc[dates[2]] == 0.0
     positions = result.positions.set_index("date")
-    assert positions.loc[dates[1], "shares"] == 9000
+    assert positions.loc[dates[1], "shares"] == 900
     assert positions["shares"].mod(100).eq(0).all()
 
 
