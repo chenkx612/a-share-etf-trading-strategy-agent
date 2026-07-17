@@ -62,8 +62,9 @@ OpenCode 负责单轮研发。Python Harness 负责外层循环、权限、超�
 
 按 `task.id` 在 `.research/<task-id>/` 隔离研发任务。Harness 用临时 Git commit 捕获启动时的
 工作区状态，不修改当前分支或 index；每轮从 seed/champion commit 创建 detached worktree。
-评测后仅将满足约束且门禁目标优于 champion 的候选提交并推进任务专属 champion ref；失败和
-拒绝的 worktree 会被删除。
+评测后，候选必须满足全部硬约束；若 champion 不满足硬约束，首个目标指标有效的合格候选直接
+晋升。champion 合格后，候选还必须按配置幅度改善门禁目标，才会提交并推进任务专属 champion
+ref；失败和拒绝的 worktree 会被删除。
 candidate 最初只注入开发数据；OpenCode 退出后，Harness 才在该 worktree 中换入完整数据运行
 gate。已有 champion 需要重新评测时使用一次性 evaluator worktree。commit 只保存代码；任务
 初始化时冻结完整评测数据，并生成截止 `development.end` 的开发数据。这样既避免重复保存大体积

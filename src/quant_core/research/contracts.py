@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tomllib
 from dataclasses import dataclass
 from datetime import date
@@ -139,24 +140,41 @@ class ResearchTask:
                 raise ValueError(
                     f"task.evaluation.constraints.{name}.operator must be one of >=, <=, abs<="
                 )
-            if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+            if (
+                not isinstance(threshold, (int, float))
+                or isinstance(threshold, bool)
+                or not math.isfinite(float(threshold))
+            ):
                 raise ValueError(
-                    f"task.evaluation.constraints.{name}.threshold must be numeric"
+                    f"task.evaluation.constraints.{name}.threshold must be numeric and finite"
                 )
         acceptance = evaluation.get("acceptance")
         if acceptance is not None:
             if not isinstance(acceptance, dict):
                 raise ValueError("task.evaluation.acceptance must be a table")
             minimum = acceptance.get("minimum_improvement", 0.0)
-            if not isinstance(minimum, (int, float)) or isinstance(minimum, bool) or minimum < 0:
-                raise ValueError("task.evaluation.acceptance.minimum_improvement must be non-negative")
+            if (
+                not isinstance(minimum, (int, float))
+                or isinstance(minimum, bool)
+                or not math.isfinite(float(minimum))
+                or minimum < 0
+            ):
+                raise ValueError(
+                    "task.evaluation.acceptance.minimum_improvement must be finite and non-negative"
+                )
         target = evaluation.get("target")
         if target is not None:
             if not isinstance(target, dict):
                 raise ValueError("task.evaluation.target must be a table")
             threshold = target.get("objective_at_least")
-            if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
-                raise ValueError("task.evaluation.target.objective_at_least must be numeric")
+            if (
+                not isinstance(threshold, (int, float))
+                or isinstance(threshold, bool)
+                or not math.isfinite(float(threshold))
+            ):
+                raise ValueError(
+                    "task.evaluation.target.objective_at_least must be numeric and finite"
+                )
         fixed = _required(evaluation, "fixed", dict, "task.evaluation")
         development = _period(
             _required(fixed, "development", dict, "task.evaluation.fixed"),

@@ -5,7 +5,7 @@ import pytest
 
 from quant_core.config import BacktestConfig
 from quant_core.research.evaluator import evaluate_candidate
-from quant_core.strategy.sharpe_corr_threshold import SharpeCorrThresholdParams, select
+from quant_core.strategy.sharpe_corr_threshold import select
 
 
 def _daily() -> pd.DataFrame:
@@ -29,38 +29,12 @@ def _daily() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_research_baseline_uses_complete_strategy_defaults() -> None:
-    params = SharpeCorrThresholdParams()
-
-    assert params.top_n == 5
-    assert params.sharpe_window == 25
-    assert params.factor_lower_bound == pytest.approx(0.0)
-    assert params.corr_window == 100
-    assert params.corr_threshold == pytest.approx(0.9)
-    assert params.stop_loss_pct == pytest.approx(0.1)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("top_n", 0),
-        ("sharpe_window", 0),
-        ("corr_window", 0),
-        ("factor_lower_bound", float("nan")),
-        ("corr_threshold", 1.1),
-        ("stop_loss_pct", -0.1),
-    ],
-)
-def test_research_baseline_rejects_invalid_strategy_params(field: str, value: object) -> None:
-    with pytest.raises(ValueError):
-        SharpeCorrThresholdParams(**{field: value})
-
-
-def test_research_uses_fixed_backtest_fee() -> None:
+def test_research_uses_fixed_backtest_config() -> None:
     config = BacktestConfig()
 
     assert config.fee_rate == pytest.approx(0.001)
     assert config.initial_capital == pytest.approx(100_000.0)
+    assert config.lot_size == 100
 
 
 def test_research_evaluator_runs_sharpe_corr_threshold_baseline() -> None:

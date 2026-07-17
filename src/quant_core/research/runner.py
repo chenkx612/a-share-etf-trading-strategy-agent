@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -178,8 +179,9 @@ def _prompt(
     comparison_guidance = (
         f"Gate objective used to compare candidate with champion: {evaluation['objective']}\n"
         f"Minimum objective improvement required for acceptance: {minimum_improvement}\n"
-        "A candidate is accepted only when every hard gate constraint passes and its gate objective "
-        "improves over champion by the required amount."
+        "A candidate must pass every hard gate constraint. A feasible candidate replaces an "
+        "infeasible champion without needing relative objective improvement. Once the champion is "
+        "feasible, a candidate must also improve the gate objective by the required amount."
         if has_champion
         else
         f"There is no champion yet. The first candidate with a numeric gate {evaluation['objective']} "
@@ -501,7 +503,7 @@ def _evaluate_existing(
 
 
 def _constraint_passes(value: Any, constraint: Mapping[str, Any]) -> bool:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if not _is_finite_number(value):
         return False
     operator, threshold = _constraint_rule(constraint)
     if operator == ">=":
@@ -509,6 +511,14 @@ def _constraint_passes(value: Any, constraint: Mapping[str, Any]) -> bool:
     if operator == "abs<=":
         return abs(float(value)) <= threshold
     return float(value) <= threshold
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> bool:
@@ -521,7 +531,7 @@ def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> boo
     evaluation = task.raw["evaluation"]
     objective = gate.get(str(evaluation["objective"]))
     threshold = target["objective_at_least"]
-    if not isinstance(objective, (int, float)) or isinstance(objective, bool):
+    if not _is_finite_number(objective):
         return False
     return float(objective) >= float(threshold) and all(
         _constraint_passes(gate.get(name), constraint)
@@ -538,6 +548,14 @@ def _decide(
     objective = str(evaluation["objective"])
     champion_value = champion.get("gate", {}).get(objective) if champion is not None else None
     candidate_value = candidate.get("gate", {}).get(objective)
+    champion_constraints_passed = (
+        champion is not None
+        and all(
+            _constraint_passes(champion.get("gate", {}).get(name), constraint)
+            for name, constraint in evaluation["constraints"].items()
+        )
+    )
+    champion_objective_is_finite = _is_finite_number(champion_value)
     acceptance = evaluation.get("acceptance", {})
     minimum_improvement = float(acceptance.get("minimum_improvement", 0.0))
     constraints: dict[str, Any] = {}
@@ -553,13 +571,14 @@ def _decide(
             "passed": passed,
         }
         constraints_passed = constraints_passed and passed
-    candidate_objective_is_numeric = (
-        isinstance(candidate_value, (int, float)) and not isinstance(candidate_value, bool)
+    candidate_objective_is_finite = _is_finite_number(candidate_value)
+    relative_improvement_required = (
+        champion is not None
+        and champion_constraints_passed
+        and champion_objective_is_finite
     )
-    objective_passed = candidate_objective_is_numeric if champion is None else (
-        isinstance(champion_value, (int, float))
-        and not isinstance(champion_value, bool)
-        and candidate_objective_is_numeric
+    objective_passed = candidate_objective_is_finite if not relative_improvement_required else (
+        candidate_objective_is_finite
         and float(candidate_value) >= float(champion_value) + minimum_improvement
         and (minimum_improvement > 0 or float(candidate_value) > float(champion_value))
     )
@@ -567,8 +586,8 @@ def _decide(
     reasons: list[str] = []
     if not constraints_passed:
         reasons.append("gate constraints failed")
-    if not objective_passed and champion is None:
-        reasons.append("gate objective is not numeric")
+    if not objective_passed and not relative_improvement_required:
+        reasons.append("gate objective is not finite")
     elif not objective_passed:
         reasons.append("gate objective did not improve over champion")
     return {
@@ -578,6 +597,10 @@ def _decide(
             "champion": champion_value,
             "candidate": candidate_value,
             "minimum_improvement": minimum_improvement,
+            "champion_constraints_passed": (
+                champion_constraints_passed if champion is not None else None
+            ),
+            "relative_improvement_required": relative_improvement_required,
         },
         "constraints": constraints,
         "reasons": reasons,
@@ -586,6 +609,7 @@ def _decide(
 
 def _metrics_key(task: ResearchTask) -> str:
     relevant = {
+        "strategy": task.raw.get("strategy"),
         "data": task.raw["data"],
         "commands": task.raw["commands"],
         "periods": task.raw["evaluation"]["fixed"],

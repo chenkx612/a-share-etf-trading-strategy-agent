@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 from typing import Sequence
 
-from quant_core.research import run_once
+from quant_core.research import ResearchTask, run_once
+from quant_core.research.runner import _metrics_key
 
 
 TASK_TOML = """
@@ -74,6 +76,7 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         assert "2025-01-01" not in prompt
         assert "Gate objective used to compare candidate with champion: sortino" in prompt
         assert "Minimum objective improvement required for acceptance: 0.0" in prompt
+        assert "A feasible candidate replaces an infeasible champion" in prompt
         assert "Configured strategy: runner-strategy (strategy)" in prompt
         assert (
             'Hard gate constraints: [{"metric": "max_drawdown", "operator": "abs<=", '
@@ -135,6 +138,16 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     assert result["candidate"] == "Add momentum strategy"
     assert result["metrics"]["gate"]["sortino"] == 1.2
 
+
+def test_metrics_cache_key_changes_with_strategy_module() -> None:
+    first_payload = tomllib.loads(TASK_TOML)
+    second_payload = tomllib.loads(TASK_TOML)
+    second_payload["strategy"]["module"] = "other_strategy"
+
+    first = ResearchTask.from_mapping(first_payload)
+    second = ResearchTask.from_mapping(second_payload)
+
+    assert _metrics_key(first) != _metrics_key(second)
 
 def test_run_once_accepts_compact_blocked_output(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"

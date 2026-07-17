@@ -163,8 +163,9 @@ quant-agent --root <workspace> research run-managed \
 
 研发状态保存到 `.research/<task-id>/`。Harness 用临时 Git commit 捕获任务启动时的工作区状态，
 不修改当前分支或 index；每轮 candidate 是从当前 champion commit 创建的 detached worktree。
-候选满足门禁约束且目标指标至少改善 `minimum_improvement` 时提交并推进任务专属 champion ref，
-否则删除 worktree。行情和因子输入在任务初始化时冻结；candidate 只获得截止 `development.end` 的数据，
+候选必须满足门禁约束。若 champion 不满足约束，首个目标指标有效的合格候选直接晋升；只有
+champion 已合格时，才要求目标指标至少改善 `minimum_improvement`。否则删除 worktree。行情和
+因子输入在任务初始化时冻结；candidate 只获得截止 `development.end` 的数据，
 gate 和 champion 使用带完整数据的一次性 evaluator 副本。这里的数据隔离用于避免正常研发流程
 接触门禁数据，不构成限制工作区外读取的安全边界。
 

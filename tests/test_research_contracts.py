@@ -236,6 +236,14 @@ def test_task_rejects_implicit_numeric_constraints() -> None:
         ResearchTask.from_mapping(payload)
 
 
+def test_task_rejects_non_finite_thresholds() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["constraints"]["max_drawdown"]["threshold"] = float("nan")
+
+    with pytest.raises(ValueError, match="numeric and finite"):
+        ResearchTask.from_mapping(payload)
+
+
 def test_task_accepts_explicit_lower_and_absolute_constraints() -> None:
     payload = fixed_task()
     payload["evaluation"]["constraints"] = {
@@ -271,6 +279,14 @@ def test_task_requires_numeric_target() -> None:
     payload["evaluation"]["target"] = {"objective_at_least": "high"}
 
     with pytest.raises(ValueError, match="objective_at_least"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_finite_minimum_improvement() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["acceptance"] = {"minimum_improvement": float("inf")}
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
         ResearchTask.from_mapping(payload)
 
 
@@ -315,6 +331,55 @@ def test_decision_enforces_lower_bound_constraints() -> None:
     assert accepted["decision"] == "accepted"
     assert rejected["decision"] == "rejected"
     assert rejected["constraints"]["annual_return"]["operator"] == ">="
+
+
+def test_feasible_candidate_replaces_infeasible_champion_without_objective_improvement() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["acceptance"] = {"minimum_improvement": 0.50}
+    task = ResearchTask.from_mapping(payload)
+    champion = {"gate": {"sortino": 5.0, "max_drawdown": -0.30}}
+
+    accepted = _decide(task, champion, {"gate": {"sortino": 1.0, "max_drawdown": -0.10}})
+    rejected = _decide(task, champion, {"gate": {"sortino": 6.0, "max_drawdown": -0.30}})
+
+    assert accepted["decision"] == "accepted"
+    assert accepted["objective"]["champion_constraints_passed"] is False
+    assert rejected["decision"] == "rejected"
+    assert rejected["reasons"] == ["gate constraints failed"]
+
+
+def test_feasible_champion_still_requires_objective_improvement() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["acceptance"] = {"minimum_improvement": 0.50}
+    task = ResearchTask.from_mapping(payload)
+    champion = {"gate": {"sortino": 2.0, "max_drawdown": -0.10}}
+
+    rejected = _decide(task, champion, {"gate": {"sortino": 2.4, "max_drawdown": -0.10}})
+
+    assert rejected["decision"] == "rejected"
+    assert rejected["objective"]["champion_constraints_passed"] is True
+    assert rejected["reasons"] == ["gate objective did not improve over champion"]
+
+
+def test_non_finite_objectives_never_block_or_create_a_champion() -> None:
+    task = ResearchTask.from_mapping(fixed_task())
+    invalid_champion = {"gate": {"sortino": float("nan"), "max_drawdown": -0.10}}
+
+    accepted = _decide(
+        task,
+        invalid_champion,
+        {"gate": {"sortino": 1.0, "max_drawdown": -0.10}},
+    )
+    rejected = _decide(
+        task,
+        None,
+        {"gate": {"sortino": float("inf"), "max_drawdown": -0.10}},
+    )
+
+    assert accepted["decision"] == "accepted"
+    assert accepted["objective"]["relative_improvement_required"] is False
+    assert rejected["decision"] == "rejected"
+    assert rejected["reasons"] == ["gate objective is not finite"]
 
 
 def test_first_candidate_needs_constraints_but_not_relative_improvement() -> None:
