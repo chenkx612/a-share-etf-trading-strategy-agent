@@ -66,6 +66,15 @@ class ResearchTask:
         source = _required(data, "data", dict, "task")
         _required(source, "universe", str, "task.data")
 
+        strategy = data.get("strategy")
+        if strategy is not None:
+            if not isinstance(strategy, dict) or set(strategy) != {"name", "module"}:
+                raise ValueError("task.strategy must contain exactly name and module")
+            _required(strategy, "name", str, "task.strategy")
+            module = _required(strategy, "module", str, "task.strategy")
+            if not all(part.isidentifier() for part in module.split(".")):
+                raise ValueError("task.strategy.module must be a Python module path")
+
         scope = _required(data, "scope", dict, "task")
         cls._string_list(scope, "editable", required=True)
         cls._string_list(scope, "forbidden", required=False)
@@ -88,6 +97,20 @@ class ResearchTask:
         for placeholder in ("{start}", "{end}", "{run_id}"):
             if placeholder not in backtest_template:
                 raise ValueError(f"task.commands.backtest must contain {placeholder}")
+        strategy_placeholders = ("{strategy_name}", "{strategy_module}")
+        if strategy is None and any(
+            placeholder in backtest_template for placeholder in strategy_placeholders
+        ):
+            raise ValueError(
+                "task.strategy is required when task.commands.backtest uses a strategy placeholder"
+            )
+        if strategy is not None and not any(
+            placeholder in backtest_template for placeholder in strategy_placeholders
+        ):
+            raise ValueError(
+                "task.commands.backtest must reference {strategy_name} or {strategy_module} "
+                "when task.strategy is configured"
+            )
         if "{run_id}" not in metrics_path:
             raise ValueError("task.commands.metrics_path must contain {run_id}")
 
@@ -179,6 +202,16 @@ class ResearchTask:
     @property
     def baseline_exclude(self) -> list[str]:
         return list(self.raw.get("baseline", {}).get("exclude", []))
+
+    @property
+    def strategy_name(self) -> str | None:
+        strategy = self.raw.get("strategy")
+        return str(strategy["name"]) if isinstance(strategy, Mapping) else None
+
+    @property
+    def strategy_module(self) -> str | None:
+        strategy = self.raw.get("strategy")
+        return str(strategy["module"]) if isinstance(strategy, Mapping) else None
 
 
 @dataclass(frozen=True)

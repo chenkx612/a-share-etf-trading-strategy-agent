@@ -16,6 +16,10 @@ model = "xai/grok-4.5"
 variant = "high"
 timeout_minutes = 60
 
+[strategy]
+name = "example-strategy"
+module = "quant_core.strategy.example_strategy"
+
 [baseline]
 mode = "workspace"
 # For strict from-zero strategy research:
@@ -34,7 +38,7 @@ test = ["{python}", "-m", "pytest", "-q"]
 backtest = [
   "{python}", "-m", "quant_core.cli", "backtest", "run",
   "--universe", "{universe}", "--start", "{start}", "--end", "{end}",
-  "--run-id", "{run_id}"
+  "--run-id", "{run_id}", "--strategy", "{strategy_name}"
 ]
 metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
@@ -64,6 +68,10 @@ end = "2024-12-31"
 start = "2025-01-01"
 end = "2025-12-31"
 ```
+
+`strategy.name` 和 `strategy.module` 显式标识被评测的策略。配置了 `strategy` 时，回测命令必须
+引用 `{strategy_name}` 或 `{strategy_module}`，避免策略元数据与实际评测对象脱节。旧任务可以
+省略该表以保持兼容。
 
 `{python}` 由 Harness 替换为自身解释器。`baseline.mode` 默认为 `workspace`，即把任务首次初始化
 时的工作区快照作为初始 champion。0→1 研发可设置 `mode = "none"`：首个目标指标有效且满足全部

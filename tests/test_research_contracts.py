@@ -101,6 +101,54 @@ def test_task_allows_model_without_variant() -> None:
     ResearchTask.from_mapping(payload)
 
 
+def test_task_supports_explicit_strategy_metadata() -> None:
+    payload = fixed_task()
+    payload["strategy"] = {
+        "name": "etf-momentum",
+        "module": "quant_core.strategy.etf_momentum",
+    }
+    payload["commands"]["backtest"].extend([
+        "--candidate-module",
+        "{strategy_module}",
+    ])
+
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.strategy_name == "etf-momentum"
+    assert task.strategy_module == "quant_core.strategy.etf_momentum"
+
+
+def test_task_rejects_unused_strategy_metadata() -> None:
+    payload = fixed_task()
+    payload["strategy"] = {
+        "name": "etf-momentum",
+        "module": "quant_core.strategy.etf_momentum",
+    }
+
+    with pytest.raises(ValueError, match="must reference"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_rejects_invalid_strategy_module() -> None:
+    payload = fixed_task()
+    payload["strategy"] = {
+        "name": "etf-momentum",
+        "module": "quant_core.strategy.etf-momentum",
+    }
+    payload["commands"]["backtest"].append("{strategy_module}")
+
+    with pytest.raises(ValueError, match="Python module path"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_rejects_strategy_placeholder_without_metadata() -> None:
+    payload = fixed_task()
+    payload["commands"]["backtest"].append("{strategy_module}")
+
+    with pytest.raises(ValueError, match="task.strategy is required"):
+        ResearchTask.from_mapping(payload)
+
+
 def test_fixed_task_allows_missing_baseline() -> None:
     task = ResearchTask.from_mapping(fixed_task())
 

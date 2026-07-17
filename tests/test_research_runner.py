@@ -21,6 +21,10 @@ model = "xai/grok-4.5"
 variant = "high"
 timeout_minutes = 60
 
+[strategy]
+name = "runner-strategy"
+module = "strategy"
+
 [data]
 universe = "universe.csv"
 
@@ -30,7 +34,10 @@ forbidden = ["evaluator.py"]
 
 [commands]
 test = ["{python}", "-m", "pytest", "-q"]
-backtest = ["backtest", "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}"]
+backtest = [
+  "backtest", "--candidate-module", "{strategy_module}",
+  "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}"
+]
 metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
 [evaluation]
@@ -67,6 +74,7 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         assert "2025-01-01" not in prompt
         assert "Gate objective used to compare candidate with champion: sortino" in prompt
         assert "Minimum objective improvement required for acceptance: 0.0" in prompt
+        assert "Configured strategy: runner-strategy (strategy)" in prompt
         assert (
             'Hard gate constraints: [{"metric": "max_drawdown", "operator": "abs<=", '
             '"threshold": 0.2}]'
@@ -93,6 +101,7 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
 
     def fake_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) -> int:
         if command[0] == "backtest":
+            assert command[command.index("--candidate-module") + 1] == "strategy"
             run_id = command[command.index("--run-id") + 1]
             metrics_path = cwd / "outputs/backtests" / run_id / "metrics.json"
             metrics_path.parent.mkdir(parents=True, exist_ok=True)

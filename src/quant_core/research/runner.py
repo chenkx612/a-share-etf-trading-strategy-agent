@@ -132,7 +132,7 @@ def _format_command(command: Sequence[str], values: dict[str, str]) -> list[str]
 
 
 def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: Path) -> dict[str, str]:
-    return {
+    values = {
         "python": sys.executable,
         "universe": str(task.raw["data"]["universe"]),
         "workspace": str(workspace),
@@ -140,6 +140,11 @@ def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: 
         "end": period["end"],
         "run_id": run_id,
     }
+    if task.strategy_name is not None:
+        values["strategy_name"] = task.strategy_name
+    if task.strategy_module is not None:
+        values["strategy_module"] = task.strategy_module
+    return values
 
 
 def _constraint_rule(constraint: Mapping[str, Any]) -> tuple[str, float]:
@@ -181,7 +186,7 @@ def _prompt(
         "that passes every hard gate constraint becomes the initial champion. The configured minimum "
         "improvement does not apply until a champion exists."
     )
-    return "\n".join([
+    lines = [
         "Complete one quantitative strategy research round.",
         f"Goal: {raw['goal']}",
         "Use the full prior research history internally when choosing this round's hypothesis.",
@@ -210,7 +215,10 @@ def _prompt(
         "Clearly distinguish that submitted candidate from development variants listed in attempts but not retained.",
         'Set status to either "completed" or "blocked". Do not wrap the JSON in Markdown.',
         "Do not report gate metrics or an acceptance decision.",
-    ])
+    ]
+    if task.strategy_name is not None:
+        lines.insert(2, f"Configured strategy: {task.strategy_name} ({task.strategy_module})")
+    return "\n".join(lines)
 
 
 def _is_agent_output(value: object) -> bool:
