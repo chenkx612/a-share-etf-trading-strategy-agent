@@ -110,6 +110,12 @@ def _runner(decisions: list[str]):
     return run
 
 
+def _reporter(task_path: Path, manager: ResearchWorkspace, state: dict[str, object]) -> Path:
+    report = manager.root / "loop-report.md"
+    report.write_text("# Test report\n", encoding="utf-8")
+    return report
+
+
 def _running_state(task: Path, experiment_id: str = "loop-000001") -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -124,6 +130,7 @@ def _running_state(task: Path, experiment_id: str = "loop-000001") -> dict[str, 
         "rejected": 0,
         "failed": 0,
         "consecutive_failures": 0,
+        "experiment_ids": [],
         "current_experiment_id": experiment_id,
         "last_experiment_id": None,
         "stop_reason": None,
@@ -137,6 +144,7 @@ def test_loop_stops_after_consecutive_failed_rounds(tmp_path: Path) -> None:
         task,
         workspace=tmp_path,
         managed_runner=_runner(["rejected", "failed", "failed"]),
+        reporter=_reporter,
     )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -144,6 +152,13 @@ def test_loop_stops_after_consecutive_failed_rounds(tmp_path: Path) -> None:
     assert state["rounds_completed"] == 3
     assert state["rejected"] == 1
     assert state["failed"] == 2
+    assert state["experiment_ids"] == [
+        "loop-000001",
+        "loop-000002",
+        "loop-000003",
+    ]
+    assert state["report_status"] == "completed"
+    assert state["report_path"] == "loop-report.md"
 
 
 def test_rejected_round_breaks_a_failure_streak(tmp_path: Path) -> None:
@@ -153,6 +168,7 @@ def test_rejected_round_breaks_a_failure_streak(tmp_path: Path) -> None:
         task,
         workspace=tmp_path,
         managed_runner=_runner(["failed", "rejected", "failed"]),
+        reporter=_reporter,
     )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -168,6 +184,7 @@ def test_loop_does_not_start_another_round_after_time_budget(tmp_path: Path) -> 
         task,
         workspace=tmp_path,
         managed_runner=_runner(["rejected"]),
+        reporter=_reporter,
         monotonic=lambda: next(times),
     )
 
@@ -194,7 +211,12 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
         }), encoding="utf-8")
         return result_path
 
-    state_path = run_loop(task, workspace=tmp_path, managed_runner=reach_target)
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=reach_target,
+        reporter=_reporter,
+    )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["stop_reason"] == "target_reached"
@@ -215,12 +237,18 @@ def test_loop_recovers_a_completed_unrecorded_round(tmp_path: Path) -> None:
     loop_state = manager.root / "loop-state.json"
     loop_state.write_text(json.dumps(_running_state(task)), encoding="utf-8")
 
-    state_path = run_loop(task, workspace=tmp_path, managed_runner=_runner([]))
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+    )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["stop_reason"] == "max_rounds"
     assert state["accepted"] == 1
     assert state["last_experiment_id"] == "loop-000001"
+    assert state["experiment_ids"] == ["loop-000001"]
 
 
 def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -> None:
@@ -230,7 +258,12 @@ def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -
     loop_state = tmp_path / ".research/loop-test/loop-state.json"
     loop_state.write_text(json.dumps(_running_state(task)), encoding="utf-8")
 
-    state_path = run_loop(task, workspace=tmp_path, managed_runner=_runner([]))
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+    )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     decision = json.loads((experiment / "decision.json").read_text(encoding="utf-8"))
@@ -252,7 +285,12 @@ def test_loop_does_not_trust_a_decision_that_was_not_applied(tmp_path: Path) -> 
     loop_state = tmp_path / ".research/loop-test/loop-state.json"
     loop_state.write_text(json.dumps(_running_state(task)), encoding="utf-8")
 
-    state_path = run_loop(task, workspace=tmp_path, managed_runner=_runner([]))
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+    )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     decision = json.loads((experiment / "decision.json").read_text(encoding="utf-8"))
@@ -268,11 +306,21 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
         experiment.mkdir()
         raise KeyboardInterrupt
 
-    interrupted_path = run_loop(task, workspace=tmp_path, managed_runner=interrupt)
+    interrupted_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=interrupt,
+        reporter=_reporter,
+    )
     interrupted = json.loads(interrupted_path.read_text(encoding="utf-8"))
     assert interrupted["status"] == "interrupted"
 
-    resumed_path = run_loop(task, workspace=tmp_path, managed_runner=_runner([]))
+    resumed_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+    )
 
     resumed = json.loads(resumed_path.read_text(encoding="utf-8"))
     assert resumed["stop_reason"] == "max_consecutive_failures"
@@ -287,7 +335,13 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
         raise RuntimeError("runner bug")
 
     with pytest.raises(RuntimeError, match="runner bug"):
-        run_loop(task, workspace=tmp_path, managed_runner=fail, monotonic=lambda: next(times))
+        run_loop(
+            task,
+            workspace=tmp_path,
+            managed_runner=fail,
+            reporter=_reporter,
+            monotonic=lambda: next(times),
+        )
 
     state = json.loads(
         (tmp_path / ".research/loop-test/loop-state.json").read_text(encoding="utf-8")
@@ -295,3 +349,60 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
     assert state["status"] == "interrupted"
     assert state["stop_reason"] == "runner_error"
     assert state["elapsed_seconds"] == 120.0
+
+
+def test_report_failure_does_not_change_loop_result(tmp_path: Path) -> None:
+    task = _task(tmp_path, max_rounds=1)
+
+    def fail_report(
+        task_path: Path,
+        manager: ResearchWorkspace,
+        state: dict[str, object],
+    ) -> Path:
+        raise RuntimeError("report model unavailable")
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=fail_report,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "stopped"
+    assert state["stop_reason"] == "max_rounds"
+    assert state["rounds_completed"] == 1
+    assert state["report_status"] == "failed"
+    assert state["report_error"] == "report model unavailable"
+
+
+def test_new_loop_on_same_root_tracks_only_its_own_experiments(tmp_path: Path) -> None:
+    task = _task(tmp_path, max_rounds=1)
+    reported_experiments: list[list[str]] = []
+
+    def capture_report(
+        task_path: Path,
+        manager: ResearchWorkspace,
+        state: dict[str, object],
+    ) -> Path:
+        experiment_ids = state["experiment_ids"]
+        assert isinstance(experiment_ids, list)
+        reported_experiments.append([str(experiment_id) for experiment_id in experiment_ids])
+        return _reporter(task_path, manager, state)
+
+    run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=capture_report,
+    )
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=capture_report,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert reported_experiments == [["loop-000001"], ["loop-000002"]]
+    assert state["experiment_ids"] == ["loop-000002"]

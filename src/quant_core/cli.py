@@ -26,7 +26,7 @@ from quant_core.data.market_data import (
     write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
-from quant_core.research import run_loop, run_managed_once, run_once
+from quant_core.research import regenerate_loop_report, run_loop, run_managed_once, run_once
 from quant_core.strategy.sharpe_corr_threshold import (
     STRATEGY_NAME,
     SharpeCorrThresholdParams,
@@ -507,8 +507,21 @@ def command_research_loop(args: argparse.Namespace) -> None:
         f"rounds: {state['rounds_completed']} "
         f"(accepted={state['accepted']}, rejected={state['rejected']}, failed={state['failed']})"
     )
+    if state.get("report_status") == "completed":
+        print(f"report: {state_path.parent / str(state['report_path'])}")
+    elif state.get("report_status") == "failed":
+        print(f"report failed: {state.get('report_error')}")
     if state["stop_reason"] == "interrupted":
         raise SystemExit(130)
+
+
+def command_research_report(args: argparse.Namespace) -> None:
+    report_path = regenerate_loop_report(
+        args.task,
+        workspace=args.root,
+        research_root=args.research_root,
+    )
+    print(f"wrote loop report to {report_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -608,6 +621,10 @@ def build_parser() -> argparse.ArgumentParser:
     research_loop.add_argument("--task", required=True)
     research_loop.add_argument("--research-root", default=".research")
     research_loop.set_defaults(func=command_research_loop)
+    research_report = research_sub.add_parser("report")
+    research_report.add_argument("--task", required=True)
+    research_report.add_argument("--research-root", default=".research")
+    research_report.set_defaults(func=command_research_report)
     return parser
 
 

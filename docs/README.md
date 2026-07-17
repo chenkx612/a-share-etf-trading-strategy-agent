@@ -10,3 +10,4 @@ Do not store quantitative trading business knowledge, prompt references, strateg
 - `skill_contract.md`: skill directory responsibilities, stage boundaries, and dependency rules.
 - `loop-harness.md`: Harness goals, workflow, components, and implementation stages.
 - `loop-harness-contracts.md`: task configuration and single-experiment result contracts.
+- `research-harness-lessons.md`: production-like loop incidents, root causes, mitigations, and remaining risks.

@@ -141,6 +141,20 @@ OpenCode 的结构化输出、完整 JSONL 事件、测试日志和回测日志�
 `candidate` 记录实际提交给 Harness 做 gate 评测的最终候选方案。Harness 不会向研发 AI 注入精确
 gate 指标或 gate 区间。
 
+## Loop Report
+
+正常停止的多轮循环额外生成：
+
+- `.research/<task-id>/loop-report.md`：面向人的中文终局复盘。
+- `.research/<task-id>/report-events.jsonl`：报告 OpenCode 会话的原始事件。
+- `loop-state.json` 中的 `report_status`、`report_path`、`report_error`：报告执行状态。
+
+报告输入包含本次 loop 所有轮次的假设、尝试、development/gate 指标、接受决策和最终 champion
+源码；实验归属由 `loop-state.json` 的 `experiment_ids` 确定，避免复用 research root 时混入历史
+loop。
+报告生成发生在研发循环停止之后，因此不会向任何候选研发会话泄露精确 gate 指标。报告失败不改变
+loop 的停止原因、轮次统计或 champion。
+
 ## Run once
 
 ```bash

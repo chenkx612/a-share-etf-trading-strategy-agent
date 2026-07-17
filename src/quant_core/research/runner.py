@@ -26,11 +26,20 @@ AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 _RESEARCH_HISTORY_LIMIT = 12
 
 
+def _workspace_env(cwd: Path, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = {**os.environ, **(extra or {})}
+    source_root = str((cwd / "src").resolve())
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = source_root if not existing else os.pathsep.join((source_root, existing))
+    return env
+
+
 def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) -> int:
     try:
         completed = subprocess.run(
             list(command),
             cwd=cwd,
+            env=_workspace_env(cwd),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -48,7 +57,14 @@ def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int
     return completed.returncode
 
 
-def _run_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
+def _run_opencode_with_permissions(
+    command: Sequence[str],
+    prompt: str,
+    cwd: Path,
+    log_path: Path,
+    timeout: int,
+    permissions: Mapping[str, str],
+) -> int:
     def terminate(process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
             return
@@ -67,11 +83,10 @@ def _run_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path
 
     try:
         with log_path.open("w", encoding="utf-8") as log:
-            permissions = json.dumps({
-                "external_directory": "deny",
-                "question": "deny",
-            })
-            env = {**os.environ, "OPENCODE_PERMISSION": permissions}
+            env = _workspace_env(
+                cwd,
+                {"OPENCODE_PERMISSION": json.dumps(dict(permissions))},
+            )
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
@@ -94,6 +109,47 @@ def _run_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path
     except OSError as exc:
         log_path.write_text(str(exc), encoding="utf-8")
         return 127
+
+
+def _run_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
+    return _run_opencode_with_permissions(
+        command,
+        prompt,
+        cwd,
+        log_path,
+        timeout,
+        {
+            "external_directory": "deny",
+            "question": "deny",
+        },
+    )
+
+
+def _run_opencode_read_only(
+    command: Sequence[str],
+    prompt: str,
+    cwd: Path,
+    log_path: Path,
+    timeout: int,
+) -> int:
+    return _run_opencode_with_permissions(
+        command,
+        prompt,
+        cwd,
+        log_path,
+        timeout,
+        {
+            "external_directory": "deny",
+            "question": "deny",
+            "bash": "deny",
+            "edit": "deny",
+            "task": "deny",
+            "skill": "deny",
+            "webfetch": "deny",
+            "websearch": "deny",
+            "todowrite": "deny",
+        },
+    )
 
 
 def _snapshot(root: Path, excluded: Path) -> dict[str, str]:
@@ -163,6 +219,7 @@ def _constraint_descriptions(constraints: Mapping[str, Any]) -> list[dict[str, A
 def _prompt(
     task: ResearchTask,
     development_command: Sequence[str],
+    development_metrics_path: str,
     test_command: Sequence[str],
     research_history: Sequence[Mapping[str, Any]],
     has_champion: bool,
@@ -198,11 +255,25 @@ def _prompt(
         "Treat accepted/rejected as evidence about a specific implementation, not proof that an entire idea is true or false.",
         "A failed round is inconclusive. Do not repeat a rejected implementation unchanged.",
         f"Prior research history (sanitized; exact gate metrics are intentionally omitted): {history}",
-        "Propose one falsifiable hypothesis. Iterate internally until completed or blocked.",
+        "Propose one falsifiable hypothesis and keep every development variant within that mechanism.",
+        "Use at most 3 implementation attempts in this round and test at most 6 parameter "
+        "configurations per attempt (18 candidate evaluations total, excluding the baseline).",
+        "Do not start a new signal family or broad parameter sweep after seeing results. If the "
+        "hypothesis is exhausted, submit the best defensible variant or return blocked.",
+        "Stop development search as soon as a candidate passes the stated constraints and reaches "
+        "the configured objective improvement; additional optimization is out of scope.",
+        "After a rejected round, prefer a materially different risk mechanism. Reuse the prior "
+        "mechanism only when the history supports one specific, pre-declared corrective change; "
+        "do not perform local threshold mining around the rejected candidate.",
         f"Editable paths: {', '.join(raw['scope']['editable'])}",
         f"Forbidden paths: {', '.join(raw['scope'].get('forbidden', [])) or '(none)'}",
+        "The universe and cached market data are fixed for this task. Do not load or run ETF "
+        "discovery, pool-selection, data-refresh, or recommendation skills/workflows.",
         f"Test command: {' '.join(test_command)}",
         f"Development backtest command: {' '.join(development_command)}",
+        f"Development metrics path after that command: {development_metrics_path}",
+        "The development backtest is silent on success; read the metrics file directly instead "
+        "of searching the workspace or treating empty stdout as a failure.",
         comparison_guidance,
         f"Hard gate constraints: {json.dumps(_constraint_descriptions(evaluation['constraints']), ensure_ascii=False)}",
         f"Optional absolute target for stopping the loop: {target if target is not None else '(none)'}",
@@ -387,10 +458,12 @@ def run_once(
     fixed = raw["evaluation"]["fixed"]
     development_values = _values(task, fixed["development"], f"{experiment_id}-development", root)
     development_command = _format_command(raw["commands"]["backtest"], development_values)
+    development_metrics_path = str(raw["commands"]["metrics_path"]).format_map(development_values)
     test_command = _format_command(raw["commands"]["test"], development_values)
     prompt = _prompt(
         task,
         development_command,
+        development_metrics_path,
         test_command,
         research_history,
         task.baseline_mode != "none" if has_champion is None else has_champion,

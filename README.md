@@ -37,3 +37,4 @@ python3 -m quant_core.cli --root .agents/skills/etf-sharpe-topk/outputs/sector_r
 - [框架开发文档](docs/README.md)
 - [框架架构](docs/architecture.md)
 - [Skill 契约](docs/skill_contract.md)
+- [Research Harness 问题与技术方案](docs/research-harness-lessons.md)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tomllib
 from pathlib import Path
 from typing import Sequence
 
 from quant_core.research import ResearchTask, run_once
-from quant_core.research.runner import _metrics_key
+from quant_core.research.runner import _metrics_key, _workspace_env
 
 
 TASK_TOML = """
@@ -63,6 +64,21 @@ end = "2025-12-31"
 """
 
 
+def test_workspace_env_prefers_candidate_source_tree(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PYTHONPATH", "/existing/python/path")
+
+    env = _workspace_env(tmp_path, {"EXTRA": "value"})
+
+    assert env["PYTHONPATH"].split(os.pathsep) == [
+        str((tmp_path / "src").resolve()),
+        "/existing/python/path",
+    ]
+    assert env["EXTRA"] == "value"
+
+
 def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK_TOML, encoding="utf-8")
@@ -77,6 +93,15 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         assert "Gate objective used to compare candidate with champion: sortino" in prompt
         assert "Minimum objective improvement required for acceptance: 0.0" in prompt
         assert "A feasible candidate replaces an infeasible champion" in prompt
+        assert "at most 3 implementation attempts" in prompt
+        assert "18 candidate evaluations total" in prompt
+        assert "do not perform local threshold mining" in prompt
+        assert (
+            "Development metrics path after that command: "
+            "outputs/backtests/experiment-001-development/metrics.json"
+        ) in prompt
+        assert "development backtest is silent on success" in prompt
+        assert "Do not load or run ETF discovery" in prompt
         assert "Configured strategy: runner-strategy (strategy)" in prompt
         assert (
             'Hard gate constraints: [{"metric": "max_drawdown", "operator": "abs<=", '

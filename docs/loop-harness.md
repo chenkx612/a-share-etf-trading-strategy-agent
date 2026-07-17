@@ -22,6 +22,7 @@
 → 保存状态
 → 自动启动下一轮
 → 达成目标或耗尽预算后停止
+→ 独立 OpenCode 会话生成终局复盘报告
 ```
 
 OpenCode 负责单轮研发。Python Harness 负责外层循环、权限、超时、评测、版本和停止条件。
@@ -81,6 +82,9 @@ gate。已有 champion 需要重新评测时使用一次性 evaluator worktree�
 ```text
 .research/<task-id>/
 ├── state.json
+├── loop-state.json
+├── loop-report.md
+├── report-events.jsonl
 ├── runtime/
 │   ├── development/
 │   └── evaluation/
@@ -115,6 +119,28 @@ champion，新增 `loop-state.json` 保存当前循环的轮数、累计运行�
 champion 的 gate 指标达到目标且满足约束时提前停止。
 
 验收：一次启动可持续运行数小时，直到达成目标或耗尽预算。
+
+### 终局复盘
+
+Loop 正常停止后，Harness 启动一次独立、只读的 OpenCode 会话，读取本次 loop 对应的
+`result.json`、`decision.json`、最终 champion 指标和 champion 策略源码，生成 `loop-report.md`。报告逐轮说明
+假设、开发集尝试、development/gate 效果、决策和启发，并单独描述最终 champion 的交易逻辑与
+确定参数。
+
+报告会话使用任务配置的同一模型和推理强度，最长运行 10 分钟；禁止 Bash、代码编辑、Skill、
+Web 和子任务工具。精确 gate 指标只在循环已经结束后用于复盘，不会反馈给后续研发轮次。
+`loop-state.json` 显式记录本次运行的实验 ID，避免复用同一 research root 时混入历史 loop；
+旧版状态文件则按已完成轮数从单调递增的实验 ID 尾部兼容推断。
+`loop-state.json` 通过 `report_status`、`report_path` 和 `report_error` 记录报告状态。报告失败
+不会改变已完成的研究决策或 champion，也不会把成功 loop 标记为失败。
+
+可单独补生成或重试报告：
+
+```bash
+quant-agent --root <workspace> research report \
+  --task <task.toml> \
+  --research-root .research
+```
 
 ### 阶段五：验证两类任务
 
