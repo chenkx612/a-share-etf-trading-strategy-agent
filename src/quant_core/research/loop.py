@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,13 +65,16 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def _next_round_id(experiments: Path) -> str:
+def _next_round_id(experiments: Path, reserved: Sequence[object] = ()) -> str:
     highest = 0
     if experiments.exists():
         for path in experiments.iterdir():
             match = _ROUND_ID.fullmatch(path.name)
             if match:
                 highest = max(highest, int(match.group(1)))
+    for value in reserved:
+        if isinstance(value, str) and _ROUND_ID.fullmatch(value):
+            highest = max(highest, int(value))
     return f"{highest + 1:03d}"
 
 
@@ -80,9 +83,14 @@ def _record_decision(state: dict[str, Any], round_id: str, decision: str) -> Non
     if not isinstance(round_ids, list):
         round_ids = []
         state["round_ids"] = round_ids
-    if round_id not in round_ids:
-        round_ids.append(round_id)
-    state["rounds_completed"] = int(state["rounds_completed"]) + 1
+    completed = int(state["rounds_completed"])
+    counted = int(state["accepted"]) + int(state["rejected"]) + int(state["failed"])
+    if completed != len(round_ids) or counted != completed:
+        raise RuntimeError("research loop round counters are inconsistent")
+    if round_id in round_ids:
+        raise RuntimeError(f"round decision was already recorded: {round_id}")
+    round_ids.append(round_id)
+    state["rounds_completed"] = completed + 1
     state["last_round"] = round_id
     state["current_round"] = None
     if decision == "accepted":
@@ -224,19 +232,19 @@ def run_loop(
             decision = json.loads(decision_path.read_text(encoding="utf-8")).get("decision", "failed")
         else:
             decision = "failed"
-            if decision_path.parent.exists():
-                result_path = decision_path.parent / "result.json"
-                if not result_path.exists():
-                    write_json_atomic(result_path, {
-                        "experiment_id": current,
-                        "status": "failed",
-                        "error": "Loop was interrupted before the round was finalized",
-                    })
-                write_json_atomic(decision_path, {
-                    "experiment_id": current,
-                    "decision": "failed",
-                    "reasons": ["loop was interrupted before the round was finalized"],
+            decision_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path = decision_path.parent / "result.json"
+            if not result_path.exists():
+                write_json_atomic(result_path, {
+                    "experiment_id": record_id,
+                    "status": "failed",
+                    "error": "Loop was interrupted before the round was finalized",
                 })
+            write_json_atomic(decision_path, {
+                "experiment_id": record_id,
+                "decision": "failed",
+                "reasons": ["loop was interrupted before the round was finalized"],
+            })
         _record_decision(state, current, str(decision))
         _save(loop_state_path, state)
 
@@ -258,7 +266,9 @@ def run_loop(
                 reporter,
             )
 
-        round_id = _next_round_id(manager.rounds)
+        round_ids = state.get("round_ids")
+        reserved = round_ids if isinstance(round_ids, list) else []
+        round_id = _next_round_id(manager.rounds, reserved)
         state["current_round"] = round_id
         _save(loop_state_path, state)
         manager.emit_event("round_started", round=round_id, message="candidate started")

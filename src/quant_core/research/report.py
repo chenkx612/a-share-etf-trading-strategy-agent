@@ -85,6 +85,47 @@ def _experiment_records(
     return records
 
 
+def _loop_integrity_warnings(
+    experiments: Path,
+    loop_state: Mapping[str, Any],
+    round_ids: Sequence[str],
+) -> list[str]:
+    warnings: list[str] = []
+    try:
+        rounds_completed = int(loop_state.get("rounds_completed", 0))
+    except (TypeError, ValueError):
+        rounds_completed = 0
+        warnings.append("rounds_completed is not an integer")
+    if rounds_completed != len(round_ids):
+        warnings.append(
+            f"rounds_completed={rounds_completed} but round_ids contains {len(round_ids)} entries"
+        )
+    counter_keys = ("accepted", "rejected", "failed")
+    present_counters = [key for key in counter_keys if key in loop_state]
+    if present_counters and len(present_counters) != len(counter_keys):
+        warnings.append("accepted/rejected/failed counters are incomplete")
+    elif present_counters:
+        try:
+            decision_total = sum(int(loop_state[key]) for key in counter_keys)
+        except (TypeError, ValueError):
+            warnings.append("accepted/rejected/failed counters are not integers")
+        else:
+            if decision_total != rounds_completed:
+                warnings.append(
+                    f"decision counters total {decision_total} "
+                    f"but rounds_completed={rounds_completed}"
+                )
+    for round_id in round_ids:
+        experiment = experiments / round_id
+        if not experiment.is_dir():
+            warnings.append(f"round {round_id} directory is missing")
+            continue
+        for name in ("result.json", "decision.json"):
+            if not (experiment / name).is_file():
+                warnings.append(f"round {round_id} is missing {name}")
+    return warnings
+
+
 def _strategy_source(
     manager: ResearchWorkspace,
     champion_sha256: object,
@@ -121,6 +162,8 @@ def _report_prompt(payload: Mapping[str, Any]) -> str:
         "你是量化研发复盘员。根据下方完整、可信的 Harness 记录，生成一份简洁清晰的中文 Markdown 报告。",
         "只总结给定记录，不搜索外部信息，不运行工具，不修改文件，不虚构指标或因果关系。",
         "开发集和 gate 的结果必须明确区分；失败或中断轮次也必须如实说明。",
+        "如果 loop.integrity_warnings 非空，必须在总览中明确标为 Harness 状态一致性问题；"
+        "不得为缺失的轮次或工件虚构研究内容。",
         "接受或拒绝原因必须以 decision_objective、decision_constraints 和 decision_reasons "
         "为准；特别要准确说明当时 champion 是否可行、是否要求相对目标改善。",
         "报告固定包含以下结构：",
@@ -157,6 +200,7 @@ def generate_loop_report(
     task_state = manager.load_state(task.strategy_path)
     round_ids = _loop_round_ids(manager.rounds, loop_state)
     experiments = _experiment_records(manager.rounds, round_ids)
+    integrity_warnings = _loop_integrity_warnings(manager.rounds, loop_state, round_ids)
     champion_round_id = task_state.get("champion_round_id")
     local_champion_round = (
         str(champion_round_id).partition("/")[2]
@@ -172,6 +216,14 @@ def generate_loop_report(
         ),
         None,
     )
+    loop_payload = {
+        key: loop_state.get(key)
+        for key in (
+            "status", "stop_reason", "rounds_completed", "accepted", "rejected", "failed",
+            "elapsed_seconds",
+        )
+    }
+    loop_payload["integrity_warnings"] = integrity_warnings
     payload = {
         "task": {
             "id": task.task_id,
@@ -185,13 +237,7 @@ def generate_loop_report(
             "development_period": task.raw["evaluation"]["fixed"]["development"],
             "gate_period": task.raw["evaluation"]["fixed"]["gate"],
         },
-        "loop": {
-            key: loop_state.get(key)
-            for key in (
-                "status", "stop_reason", "rounds_completed", "accepted", "rejected", "failed",
-                "elapsed_seconds",
-            )
-        },
+        "loop": loop_payload,
         "experiments": experiments,
         "champion": {
             "experiment_id": champion_round_id,

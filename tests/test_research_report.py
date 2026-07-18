@@ -168,6 +168,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert '"relative_improvement_required": false' in prompt
     assert '"source_round": "001/001"' in prompt
     assert '"sortino": 1.2' in prompt
+    assert '"integrity_warnings": []' in prompt
     assert "PARAMETER = 1" in prompt
     assert command[command.index("--model") + 1] == "xai/grok-4.5"
     assert command[command.index("--variant") + 1] == "high"
@@ -236,6 +237,54 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
         )
 
 
+def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK, encoding="utf-8")
+    _repo(tmp_path)
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
+    captured: dict[str, str] = {}
+
+    def fake_agent(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        captured["prompt"] = prompt
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {
+                "text": "# Research Loop 总结\n\n## 总览\n\nHarness 状态一致性异常。"
+            },
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    generate_loop_report(
+        task_path,
+        manager,
+        {
+            "rounds_completed": 1,
+            "accepted": 0,
+            "rejected": 0,
+            "failed": 1,
+            "round_ids": [],
+        },
+        agent_runner=fake_agent,
+    )
+
+    prompt = captured["prompt"]
+    assert "integrity_warnings" in prompt
+    assert "rounds_completed=1 but round_ids contains 0 entries" in prompt
+    assert "不得为缺失的轮次或工件虚构研究内容" in prompt
+
+
 def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
@@ -287,3 +336,4 @@ def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> Non
 
     assert "Current loop" in captured["prompt"]
     assert "Earlier loop" not in captured["prompt"]
+    assert '"integrity_warnings": []' in captured["prompt"]

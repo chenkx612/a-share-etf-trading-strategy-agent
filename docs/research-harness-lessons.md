@@ -38,7 +38,7 @@
 
 ## RH-002：单轮研发退化为无界参数搜索
 
-- **状态**：mitigated
+- **状态**：open
 - **发现日期**：2026-07-18
 - **现象与影响**：首轮在一个假设下执行大量临时网格和十余次 Shell 调用，运行约 14.5 分钟；
   研发过程逐渐从验证机制漂移为开发集参数挖掘，增加耗时、成本和过拟合风险。
@@ -50,10 +50,16 @@
   - 候选满足开发集约束并达到目标改善后立即提交。
   - 不允许看到结果后切换到新的信号族或围绕被拒方案做宽泛局部搜索。
 - **验证方法**：收紧后的一轮在第一批 6 组配置找到可行改善后立即提交，耗时约 3 分钟。
-- **遗留风险**：当前预算由 Prompt 约束，尚未由 Harness 硬计数。Agent 曾出现单次实现超过
-  6 组、但总数未超过 18 组的情况。
-- **后续工作**：提供受控 development evaluator，签发 evaluation ID 并由 Harness 统计调用次数；
-  达到预算后拒绝继续评测，而不是依赖 Agent 自律。
+- **再次观测**：后续真实 Run 中，Agent 在一批 6 组正式配置后又执行 6 组“非正式探针”，随后
+  继续下一批配置；最终 `result.json` 没有完整披露这些额外评估。另一个 Round 在首个信号表现不佳后，
+  将不同特征重新命名为同一机制家族并继续搜索。两者证明 Prompt 只能缓解，不能落实预算或冻结假设。
+- **遗留风险**：Agent 可以把候选回测描述为诊断、复核或非正式探针来绕过软预算；也可以在结果已知后
+  改写机制边界。若成功轮的原始事件随后被压缩，最终证据不足以重建真实搜索次数。
+- **后续工作**：
+  - 提供唯一受控的 Development evaluator，签发 evaluation ID、记录参数指纹并硬计数。
+  - 第一次评估前持久化结构化 `hypothesis`、`signal_family`、允许特征和参数范围。
+  - 达到预算或偏离冻结机制时拒绝继续评测，并将违规写入永久 Round 结果。
+  - 提供参数化 CLI 和示例，避免 Agent 因缺少正式入口自行拼装数据加载和回测脚本。
 - **关联代码**：`src/quant_core/research/runner.py::_prompt`
 
 ## RH-003：回测成功但无标准输出，Agent 误判为失败
@@ -105,8 +111,8 @@
 - **现象与影响**：为了修复 Harness 而中断正在运行的实验后，恢复逻辑会把未提交实验记录为 failed，
   并计入 `max_rounds`。这是保守且可审计的行为，但在 Harness 调试阶段会减少有效研发轮数。
 - **根因**：系统无法证明中断候选是否完整，也无法安全复用未提交的 Agent 会话。
-- **当前做法**：保留失败记录，不手工篡改 loop state；需要完全干净的诊断运行时使用独立
-  `--research-root`。
+- **当前做法**：保留失败记录，不手工篡改 loop state，也不创建临时 research root。后续正常调用
+  继续使用任务配置的同一根目录，由 Harness 维护 Run 编号和审计边界。
 - **后续工作**：增加显式的 `research loop reset-current` 或“诊断轮不计预算”模式。该命令必须校验
   候选未提交、Champion 未变化，并保留审计记录。
 - **遗留风险**：直接删除实验目录或编辑状态文件会破坏恢复语义，不应作为常规操作。
@@ -154,6 +160,107 @@
 - **遗留风险**：旧版目录若曾手工删除部分实验，只能按旧状态中可用的轮次信息迁移。
 - **关联代码/测试**：`src/quant_core/research/loop.py::_record_decision`、
   `src/quant_core/research/report.py::_loop_round_ids`、`tests/test_research_report.py`
+
+## RH-010：候选 Agent 可通过 Bash 枚举 Research Root
+
+- **状态**：open
+- **发现日期**：2026-07-18
+- **现象与影响**：候选 Agent 位于隔离 worktree，但通过 Bash 使用主仓库绝对路径，仍能枚举
+  `.research/<task-id>/` 下的 Champion、Run 和 Round 文件。专用读取工具拒绝了外部文件读取，
+  Bash 枚举却成功。这说明 Agent 理论上可以绕过脱敏历史，直接读取旧 Gate 指标或终局报告，
+  破坏 Gate 隔离。
+- **触发条件**：OpenCode 配置 `external_directory=deny`，同时允许 Bash；Agent 进程的操作系统
+  文件权限仍可读取主仓库。
+- **根因**：worktree 隔离只控制候选代码内容，不是文件系统安全边界；工具级 external-directory
+  规则没有约束 Bash 子进程访问绝对路径。
+- **技术方案**：研发 Agent 必须运行在真实文件系统沙箱或容器中，只挂载候选 worktree、
+  Development 数据和必要运行环境。Research Root、Gate runtime、主工作区和终局报告不得挂载。
+  Gate 评估继续由独立 Harness 进程执行。
+- **验证方法**：集成测试让 Agent 分别通过读取工具、Bash、Python 和符号链接尝试访问主仓库
+  `.research` 与 Gate runtime，全部必须失败；同时候选测试和 Development 回测仍可运行。
+- **遗留风险**：仅增加 Prompt 禁止语句、路径黑名单或 OpenCode 工具权限不足以覆盖子进程、
+  解释器和符号链接绕过。
+- **关联代码**：`src/quant_core/research/runner.py::_run_opencode`
+
+## RH-011：Runner 早期失败产生幽灵 Round 并复用编号
+
+- **状态**：resolved
+- **发现日期**：2026-07-18
+- **现象与影响**：真实 Run 在 `current_round` 已写入后、候选目录创建前遭遇 Git 临时索引权限错误。
+  恢复逻辑将该 Round 计为失败，但没有创建 `result.json` 和 `decision.json`；下一编号只扫描物理目录，
+  因而再次分配相同 ID。最终状态显示完成轮数大于唯一 Round 工件数，少执行一个真实候选，并使终局
+  报告出现不存在的缺失轮次。
+- **触发条件**：Managed runner 在 Round 目录创建前抛出异常，随后恢复同一 Run。
+- **根因**：
+  - 恢复逻辑只在 Round 目录已经存在时补写失败工件。
+  - `_next_round_id` 不参考已记录的 Round ID。
+  - `_record_decision` 对重复 ID 去重列表，却仍递增计数器。
+- **技术方案**：
+  - 恢复任何未完成 Round 时先原子创建目录，并补写失败 `result.json`、`decision.json`。
+  - 新 Round 编号同时参考物理目录和状态中已保留的 ID。
+  - `_record_decision` 拒绝重复 Round ID，并校验完成数、决策计数和 ID 数量一致。
+- **验证方法**：新增回归测试覆盖“只有 `current_round`、没有 Round 目录”的恢复，确认失败工件落盘、
+  下一轮使用新 ID，且计数严格一致；另测状态已有 ID 时不得复用。
+- **遗留风险**：是否让基础设施故障占用研究预算仍属于 RH-006 的产品语义问题；本修复只保证其
+  可审计且不破坏编号和状态。
+- **关联代码/测试**：`src/quant_core/research/loop.py::_next_round_id`、
+  `src/quant_core/research/loop.py::_record_decision`、
+  `tests/test_research_loop.py`
+
+## RH-012：报告未显式校验 Loop 状态与 Round 工件一致性
+
+- **状态**：resolved
+- **发现日期**：2026-07-18
+- **现象与影响**：幽灵 Round 使状态声称完成 6 轮，但只有 5 个 Round 工件。终局报告模型只能根据
+  不一致输入推断“另有一轮记录不足”，无法明确这是 Harness 状态损坏，也存在虚构缺失轮次内容的风险。
+- **根因**：报告输入同时传递汇总计数和 Round 列表，却没有确定性的完整性检查或显式警告。
+- **技术方案**：报告生成前检查完成数与 ID 数量、接受/拒绝/失败计数总和、Round 目录及
+  `result.json`/`decision.json` 是否存在；将所有异常写入 `loop.integrity_warnings`。报告 Prompt
+  要求在总览中明确标记 Harness 状态一致性问题，并禁止为缺失工件虚构研究内容。
+- **验证方法**：新增报告回归测试构造计数与 ID 数量不一致的状态，确认警告进入报告输入且禁止虚构
+  指令存在；正常状态的警告列表为空。
+- **遗留风险**：该修复负责检测和诚实报告，不能自动修复已有损坏状态；状态写入侧仍需依赖 RH-011
+  的不变量保护。
+- **关联代码/测试**：`src/quant_core/research/report.py::_loop_integrity_warnings`、
+  `tests/test_research_report.py`
+
+## RH-013：单一 Development 汇总指标缺少稳健性和行为诊断
+
+- **状态**：open
+- **发现日期**：2026-07-18
+- **现象与影响**：多轮候选在完整 Development 区间显著改善目标或回撤，但在 Gate 上没有相对改善；
+  另有候选在 Gate 上与 Champion 指标完全相同，说明新增逻辑没有改变该区间的实际交易。当前决策只能
+  给出目标未改善，不能区分跨阶段失效、触发样本不足和行为等价。
+- **根因**：提交前只使用单一 Development 全期汇总；Decision 契约没有候选与 Champion 的订单、
+  持仓、暴露和机制触发差异。
+- **技术方案**：
+  - 由 Harness 固定 Development 子区间或滚动折叠，报告各段目标、约束和贡献方向。
+  - 要求最低触发样本和跨段一致性，切片定义不能由 Agent 选择。
+  - Gate 评估记录与 Champion 不同的信号日、订单、持仓、总暴露和机制触发次数。
+  - 行为完全一致时输出显式 `behaviorally_equivalent`，而不只报告目标相同。
+- **验证方法**：构造只在单个 Development 子段有效、Gate 完全不触发、以及订单完全相同的候选，
+  分别验证稳健性门槛和行为差异分类。
+- **遗留风险**：增加 Development 切片本身也扩大可见反馈面，必须预先固定并限制指标，避免形成
+  新的参数挖掘目标。
+- **关联模块**：`src/quant_core/research/runner.py`、`src/quant_core/research/evaluator.py`
+
+## RH-014：成功工件压缩会删除搜索预算与假设漂移证据
+
+- **状态**：open
+- **发现日期**：2026-07-18
+- **现象与影响**：实时事件显示 Agent 执行了永久 `result.json` 未披露的额外 Development 探针，
+  但成功轮在解析后删除 OpenCode 事件，Loop 结束时又删除成功日志。若没有外部实时监督，无法从耐久
+  工件重建真实评估次数、参数集合或假设切换过程。
+- **根因**：压缩逻辑假设结构化 Agent 总结已经完整，而评估调用和假设边界尚不由 Harness 记录。
+- **技术方案**：在删除原始事件前，必须先由 Harness 持久化不可变的 Development evaluation
+  manifest，包含 evaluation ID、机制 ID、参数指纹、命令、指标、开始/结束时间和预算计数。若检测到
+  超限、越界或总结不一致，保留原始事件和失败诊断。
+- **验证方法**：让 fake Agent 执行额外评估或提交不完整总结，确认 manifest 仍完整、违规被标记且
+  原始事件未被压缩；正常成功轮可删除重复日志。
+- **遗留风险**：在受控 evaluator 落地前，保留所有原始事件只能缓解审计缺口，会显著增加存储量，
+  也不能阻止违规发生。
+- **关联代码**：`src/quant_core/research/runner.py::run_once`、
+  `src/quant_core/research/workspace.py::compact_artifacts`
 
 ## 新问题模板
 

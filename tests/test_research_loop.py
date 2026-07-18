@@ -307,6 +307,81 @@ def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -
     assert result["status"] == "failed"
 
 
+def test_loop_materializes_missing_interrupted_round_before_allocating_next(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, max_rounds=2, max_failures=2)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        run_number=1,
+    )
+    manager.rounds.mkdir(parents=True)
+    manager.loop_state_path.write_text(
+        json.dumps(_running_state(task)),
+        encoding="utf-8",
+    )
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=_reporter,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    interrupted = manager.rounds / "001"
+    next_round = manager.rounds / "002"
+    assert state["stop_reason"] == "max_rounds"
+    assert state["rounds_completed"] == 2
+    assert state["failed"] == 1
+    assert state["rejected"] == 1
+    assert state["round_ids"] == ["001", "002"]
+    assert json.loads((interrupted / "result.json").read_text(encoding="utf-8"))[
+        "status"
+    ] == "failed"
+    assert json.loads((interrupted / "decision.json").read_text(encoding="utf-8"))[
+        "decision"
+    ] == "failed"
+    assert next_round.is_dir()
+
+
+def test_round_allocator_does_not_reuse_recorded_id_without_directory(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, max_rounds=2)
+    state = _running_state(task)
+    state.update({
+        "rounds_completed": 1,
+        "rejected": 1,
+        "round_ids": ["001"],
+        "current_round": None,
+        "last_round": "001",
+    })
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        run_number=1,
+    )
+    manager.rounds.mkdir(parents=True)
+    manager.loop_state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=_reporter,
+    )
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["round_ids"] == ["001", "002"]
+    assert saved["rounds_completed"] == 2
+    assert not (manager.rounds / "001").exists()
+    assert (manager.rounds / "002/result.json").is_file()
+
+
 def test_loop_does_not_trust_a_decision_that_was_not_applied(tmp_path: Path) -> None:
     task = _task(tmp_path, max_failures=1)
     experiment = tmp_path / ".research/loop-test/runs/001/rounds/001"
