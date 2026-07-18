@@ -17,16 +17,16 @@
 
 | 优先级 | 编号 | 问题 |
 | --- | --- | --- |
-| P0 | RH-010 | 候选 Agent 可通过 Bash 访问 Research Root |
-| P1 | RH-013 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
-| P2 | RH-004 | 仍依赖 Prompt 阻止加载无关 Skill |
-| P2 | RH-006 | 中断或基础设施失败仍会消耗研发轮次 |
+| P0 | 10 | 候选 Agent 可通过 Bash 访问 Research Root |
+| P1 | 13 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
+| P2 | 4 | 仍依赖 Prompt 阻止加载无关 Skill |
+| P2 | 6 | 中断或基础设施失败仍会消耗研发轮次 |
 
 ## 一、待解决问题
 
 ### P0：新 Loop 前必须解决
 
-#### RH-010：候选 Agent 可通过 Bash 访问 Research Root
+#### 10：候选 Agent 可通过 Bash 访问 Research Root
 
 - **状态**：open
 - **发现日期**：2026-07-18
@@ -51,7 +51,7 @@
 
 ### P1：推荐解决，可带风险继续
 
-#### RH-013：单一 Development 汇总指标缺少稳健性和行为诊断
+#### 13：单一 Development 汇总指标缺少稳健性和行为诊断
 
 - **状态**：open
 - **发现日期**：2026-07-18
@@ -75,7 +75,7 @@
 
 ### P2：有时间时优化
 
-#### RH-004：仍依赖 Prompt 阻止加载无关 Skill
+#### 4：仍依赖 Prompt 阻止加载无关 Skill
 
 - **状态**：mitigated
 - **发现日期**：2026-07-18
@@ -88,7 +88,7 @@
 - **验收标准**：事件日志中不再出现无关 Skill 加载，固定输入仍能正常读取。
 - **关联代码**：`src/quant_core/research/runner.py::_prompt`
 
-#### RH-006：中断或基础设施失败仍会消耗研发轮次
+#### 6：中断或基础设施失败仍会消耗研发轮次
 
 - **状态**：open
 - **发现日期**：2026-07-18
@@ -106,7 +106,7 @@
 
 ### P0：曾阻断可信研发
 
-#### RH-002：Development 搜索预算曾依赖 Prompt 次数限制
+#### 2：Development 搜索预算曾依赖 Prompt 次数限制
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -129,13 +129,13 @@
 - **关联代码/测试**：`src/quant_core/research/runner.py::_RoundClock`、
   `src/quant_core/research/runner.py::run_once`、`tests/test_research_runner.py`
 
-#### RH-014：成功工件压缩曾被要求保留全部搜索轨迹
+#### 14：成功工件压缩曾被要求保留全部搜索轨迹
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
 - **问题与影响**：旧设计把每次 Development 探针、参数集合和假设切换都视为晋级所需的永久证据，
   因而认为成功日志压缩会破坏审计。
-- **设计决策**：随 RH-002 采用协作型 Agent 和单轮时间硬预算后，中间搜索路径属于研究员工作过程，
+- **设计决策**：随问题 2 采用协作型 Agent 和单轮时间硬预算后，中间搜索路径属于研究员工作过程，
   不再是评测或晋级契约。耐久证据聚焦冻结输入、最终代码差异、固定 Development/Gate 指标、Decision、
   Parent Champion 和 Round 时间。
 - **修正**：`result.json.round_timing` 永久保留时间边界；成功轮可以继续删除重复事件和日志，失败及
@@ -146,7 +146,7 @@
 - **关联代码/测试**：`src/quant_core/research/runner.py::run_once`、
   `src/quant_core/research/workspace.py::compact_artifacts`、`tests/test_research_workspace.py`
 
-#### RH-001：候选 Worktree 导入主工作区代码
+#### 1：候选 Worktree 导入主工作区代码
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -159,7 +159,7 @@
 - **遗留风险**：非 Python 命令或自行重置环境变量的子进程仍可能绕过。长期可考虑独立虚拟环境。
 - **关联代码**：`src/quant_core/research/runner.py::_workspace_env`
 
-#### RH-005：不可行 Champion 的接受语义错误
+#### 5：不可行 Champion 的接受语义错误
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -174,7 +174,7 @@
   测试与真实 Run 均验证首个可行候选按该语义晋级。
 - **遗留风险**：未来若有分层约束，需要升级为分层可行性比较。
 
-#### RH-007：Development 改善曾被误当成可替代 Gate 的证据
+#### 7：Development 改善曾被误当成可替代 Gate 的证据
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -185,7 +185,7 @@
 - **验证**：真实 Run 中只有满足全部 Gate 约束的候选被提升，拒绝候选未污染 Champion。
 - **遗留风险**：反复接收 Gate 通过/失败仍会形成间接反馈；上线前需要新的最终验证区间或前向观察。
 
-#### RH-009：终局报告混入其他 Run 的实验
+#### 9：终局报告混入其他 Run 的实验
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -200,7 +200,7 @@
 
 ### P1：重要可靠性问题
 
-#### RH-008：终局报告缺少完整 Decision 语义
+#### 8：终局报告缺少完整 Decision 语义
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -214,7 +214,7 @@
 - **遗留风险**：扩展多目标或分层约束时必须同步升级报告契约。
 - **关联代码**：`src/quant_core/research/report.py::_experiment_records`
 
-#### RH-011：Runner 早期失败产生幽灵 Round 并复用编号
+#### 11：Runner 早期失败产生幽灵 Round 并复用编号
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -230,11 +230,11 @@
   - 新编号同时参考物理目录和状态保留 ID。
   - 决策写入前校验完成数、决策计数和 ID 数量，拒绝重复 ID。
 - **验证**：回归测试覆盖缺少 Round 目录的恢复、编号不复用及计数一致性。
-- **遗留风险**：失败是否占用预算仍由 RH-006 跟踪。
+- **遗留风险**：失败是否占用预算仍由问题 6 跟踪。
 - **关联代码/测试**：`src/quant_core/research/loop.py::_next_round_id`、
   `src/quant_core/research/loop.py::_record_decision`、`tests/test_research_loop.py`
 
-#### RH-012：报告未校验 Loop 状态与 Round 工件一致性
+#### 12：报告未校验 Loop 状态与 Round 工件一致性
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -250,7 +250,7 @@
 
 ### P2：易用性和效率问题
 
-#### RH-003：回测成功但无标准输出，Agent 误判失败
+#### 3：回测成功但无标准输出，Agent 误判失败
 
 - **状态**：resolved
 - **发现日期**：2026-07-18
@@ -266,7 +266,7 @@
 修正和验证记录。
 
 ```markdown
-### RH-NNN：简短标题
+### N：简短标题
 
 - **状态**：open、mitigated 或 resolved
 - **发现日期**：YYYY-MM-DD
