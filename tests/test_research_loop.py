@@ -88,6 +88,7 @@ def _task(
     if target is not None:
         content += f"\n[evaluation.target]\nobjective_at_least = {target}\n"
     path.write_text(content, encoding="utf-8")
+    (root / "strategy.py").write_text("1.0\n", encoding="utf-8")
     _init_repo(root)
     return path
 
@@ -256,7 +257,7 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
 def test_loop_recovers_a_completed_unrecorded_round(tmp_path: Path) -> None:
     task = _task(tmp_path, max_rounds=1)
     base = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
-    task_state = base.initialize(date(2021, 12, 31))
+    task_state = base.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     manager = base.for_run(1)
     manager.rounds.mkdir(parents=True)
     manager.record_state(task_state, "001/001")
@@ -343,7 +344,11 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
         event_sink,
     ) -> Path:
         manager = ResearchWorkspace(workspace, research_root, "loop-test", run_number)
-        manager.create_candidate(experiment_id, date(2021, 12, 31))
+        manager.create_candidate(
+            experiment_id,
+            date(2021, 12, 31),
+            strategy_path="strategy.py",
+        )
         raise KeyboardInterrupt
 
     interrupted_path = run_loop(

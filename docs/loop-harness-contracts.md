@@ -30,7 +30,7 @@ mode = "workspace"
 universe = "path/to/universe.csv"
 
 [scope]
-editable = ["src/quant_core/strategy/", "tests/"]
+editable = ["src/quant_core/strategy/example_strategy.py"]
 forbidden = ["src/quant_core/backtest/", "data/"]
 
 [commands]
@@ -164,17 +164,16 @@ quant-agent --root <workspace> research run-once \
   --output <experiment-dir>
 ```
 
-研发状态保存到 `.research/<task-id>/`。Harness 用临时 Git commit 捕获任务启动时的工作区状态，
-不修改当前分支或 index；每轮 candidate 是从当前 champion commit 创建的 detached worktree。
+研发状态保存到 `.research/<task-id>/`。Harness 用无持久 ref 的临时 Git commit 构造
+detached worktree，不修改当前分支或 index；每轮把 `champion.py` 注入任务声明的唯一策略路径。
 候选必须满足门禁约束。若 champion 不满足约束，首个目标指标有效的合格候选直接晋升；只有
 champion 已合格时，才要求目标指标至少改善 `minimum_improvement`。否则删除 worktree。行情和
 因子输入在任务初始化时冻结；candidate 只获得截止 `development.end` 的数据，
 gate 和 champion 使用带完整数据的一次性 evaluator 副本。这里的数据隔离用于避免正常研发流程
 接触门禁数据，不构成限制工作区外读取的安全边界。
 
-当 `baseline.mode = "none"` 时，首个 champion 产生前，每轮 candidate 都从同一 seed commit
-创建，不执行基线回测；`baseline.exclude` 指定的现有实现不会进入该快照。不满足硬约束的候选会
-被拒绝且不会改变该快照。
+当 `baseline.mode = "none"` 时，首个 Champion 产生前不创建 `champion.py`，候选基座排除
+`baseline.exclude` 指定的现有实现，也不执行基线回测。不满足硬约束的候选会被拒绝。
 
 严格的 0→1 任务应使用 Harness 提供的固定 evaluator，而不是候选可修改的 CLI。候选实现
 `quant_core.strategy.research_candidate.select(daily, universe, start, end)`，返回包含 `date`、
@@ -189,7 +188,8 @@ quant-agent --root <workspace> research loop \
   --research-root .research
 ```
 
-任务级 Champion 保存在 `.research/<task-id>/champion.json`；循环状态保存在
+任务级 Champion 源码和元数据分别保存在 `.research/<task-id>/champion.py` 与
+`.research/<task-id>/champion.json`；循环状态保存在
 `.research/<task-id>/runs/<run>/state.json`。循环在达到 `max_rounds`、`max_hours` 或
 `max_consecutive_failures` 后停止；配置 `evaluation.target.objective_at_least` 时，champion 的 gate
 目标指标达到阈值且满足约束也会停止。总时长用于判断是否启动下一轮，不会缩短已经开始的单轮

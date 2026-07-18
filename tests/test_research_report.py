@@ -83,10 +83,14 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
     base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    task_state = base.initialize(date(2021, 12, 31))
+    task_state = base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
     manager = base.for_run(1)
     manager.rounds.mkdir(parents=True)
     task_state["champion_number"] = 1
+    task_state["champion_round_id"] = "001/001"
     task_state["champion_metrics"] = {
         "development": {"sortino": 1.4, "max_drawdown": -0.10},
         "gate": {"sortino": 1.2, "max_drawdown": -0.12},
@@ -162,6 +166,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert "Historical hypothesis from an earlier loop" not in prompt
     assert '"decision": "accepted"' in prompt
     assert '"relative_improvement_required": false' in prompt
+    assert '"source_round": "001/001"' in prompt
     assert '"sortino": 1.2' in prompt
     assert "PARAMETER = 1" in prompt
     assert command[command.index("--model") + 1] == "xai/grok-4.5"
@@ -202,7 +207,10 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
     base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    base.initialize(date(2021, 12, 31))
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
     manager = base.for_run(1)
     manager.rounds.mkdir(parents=True)
 
@@ -233,7 +241,10 @@ def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> Non
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
     base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    base.initialize(date(2021, 12, 31))
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
     manager = base.for_run(1)
     manager.rounds.mkdir(parents=True)
     for experiment_id, hypothesis in (

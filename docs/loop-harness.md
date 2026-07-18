@@ -61,13 +61,15 @@ OpenCode 负责单轮研发。Python Harness 负责外层循环、权限、超�
 
 状态：已完成。
 
-按 `task.id` 在 `.research/<task-id>/` 隔离研发任务。Harness 用临时 Git commit 捕获启动时的
-工作区状态，不修改当前分支或 index；每轮从 seed/champion commit 创建 detached worktree。
+按 `task.id` 在 `.research/<task-id>/` 隔离研发任务。Harness 用无持久 ref 的临时 Git commit
+构造 detached worktree，不修改当前分支或 index；当前项目提供框架基座，`champion.py` 覆盖
+任务声明的唯一策略脚本。
 评测后，候选必须满足全部硬约束；若 champion 不满足硬约束，首个目标指标有效的合格候选直接
-晋升。champion 合格后，候选还必须按配置幅度改善门禁目标，才会提交并推进任务专属 champion
-ref；失败和拒绝的 worktree 会被删除。
+晋升。champion 合格后，候选还必须按配置幅度改善门禁目标，才会由 Harness 原子替换
+`champion.py`；失败和拒绝的 worktree 会被删除。
 candidate 最初只注入开发数据；OpenCode 退出后，Harness 才在该 worktree 中换入完整数据运行
-gate。已有 champion 需要重新评测时使用一次性 evaluator worktree。commit 只保存代码；任务
+gate。已有 champion 需要重新评测时使用一次性 evaluator worktree。临时 commit 只服务于
+worktree 创建且不作为 Champion 存储；任务
 初始化时冻结完整评测数据，并生成截止 `development.end` 的开发数据。这样既避免重复保存大体积
 数据，也保证各轮使用同一数据基准。该机制不阻止进程主动读取 candidate 之外的路径，因此不作为
 强安全边界。
@@ -82,6 +84,7 @@ gate。已有 champion 需要重新评测时使用一次性 evaluator worktree�
 ```text
 .research/<task-id>/
 ├── champion.json
+├── champion.py
 ├── runs/
 │   └── 001/
 │       ├── state.json
@@ -106,8 +109,8 @@ gate。已有 champion 需要重新评测时使用一次性 evaluator worktree�
 数据派生的缓存，Loop 结束后删除并在需要时重建。worktree 只属于临时运行状态，正常结束、
 可处理的中断以及下一次初始化都会清理。
 
-最终 champion 由 `refs/quant-research/.../champion` 指向，仍不会自动合并或应用到当前工作
-分支。seed commit 由独立 ref 保留，避免在首个 champion 产生前被 Git GC 清理。
+最终 Champion 的完整策略源码保存在 `champion.py`，`champion.json` 记录 SHA-256、来源
+Run/Round、指标和项目 revision。它不会自动覆盖当前工作分支中的策略脚本。
 
 验收：失败 Round 不会污染下一轮。
 

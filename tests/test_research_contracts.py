@@ -13,7 +13,10 @@ def fixed_task() -> dict:
         "budget": {"max_rounds": 3, "max_hours": 4, "max_consecutive_failures": 2},
         "opencode": {"model": "xai/grok-4.5", "variant": "high", "timeout_minutes": 60},
         "data": {"universe": "universe.csv"},
-        "scope": {"editable": ["src/quant_core/strategy/"], "forbidden": ["data/"]},
+        "scope": {
+            "editable": ["src/quant_core/strategy/etf_momentum.py"],
+            "forbidden": ["data/"],
+        },
         "commands": {
             "test": ["pytest"],
             "backtest": [
@@ -59,6 +62,14 @@ def test_task_requires_positive_budget() -> None:
     payload["budget"]["max_rounds"] = 0
 
     with pytest.raises(ValueError, match="max_rounds"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_exactly_one_editable_strategy_script() -> None:
+    payload = fixed_task()
+    payload["scope"]["editable"] = ["strategy_a.py", "strategy_b.py"]
+
+    with pytest.raises(ValueError, match="exactly one"):
         ResearchTask.from_mapping(payload)
 
 

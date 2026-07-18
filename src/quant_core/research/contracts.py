@@ -78,6 +78,16 @@ class ResearchTask:
 
         scope = _required(data, "scope", dict, "task")
         cls._string_list(scope, "editable", required=True)
+        editable = scope["editable"]
+        if len(editable) != 1:
+            raise ValueError("task.scope.editable must contain exactly one strategy script")
+        strategy_path = Path(editable[0])
+        if (
+            strategy_path.is_absolute()
+            or ".." in strategy_path.parts
+            or editable[0].endswith("/")
+        ):
+            raise ValueError("task.scope.editable must be a repository-relative file path")
         cls._string_list(scope, "forbidden", required=False)
 
         baseline = data.get("baseline")
@@ -220,6 +230,10 @@ class ResearchTask:
     @property
     def baseline_exclude(self) -> list[str]:
         return list(self.raw.get("baseline", {}).get("exclude", []))
+
+    @property
+    def strategy_path(self) -> str:
+        return str(self.raw["scope"]["editable"][0])
 
     @property
     def strategy_name(self) -> str | None:

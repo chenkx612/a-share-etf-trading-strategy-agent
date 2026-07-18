@@ -86,26 +86,15 @@ def _experiment_records(
 
 
 def _strategy_source(
-    task: ResearchTask,
     manager: ResearchWorkspace,
-    champion_commit: object,
+    champion_sha256: object,
 ) -> str | None:
-    module = task.strategy_module
-    if module is None or not isinstance(champion_commit, str):
+    if not isinstance(champion_sha256, str):
         return None
-    module_path = Path("src").joinpath(*module.split("."))
-    for relative in (module_path.with_suffix(".py"), module_path / "__init__.py"):
-        completed = subprocess.run(
-            ["git", "show", f"{champion_commit}:{relative.as_posix()}"],
-            cwd=manager.source,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if completed.returncode == 0:
-            return completed.stdout
-    return None
+    try:
+        return manager.champion_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
 
 
 def _last_text_event(events_path: Path) -> str | None:
@@ -165,14 +154,24 @@ def generate_loop_report(
     agent_runner: ReportAgentRunner = _run_opencode_read_only,
 ) -> Path:
     task = ResearchTask.load(task_path)
-    task_state = manager.load_state()
+    task_state = manager.load_state(task.strategy_path)
     round_ids = _loop_round_ids(manager.rounds, loop_state)
     experiments = _experiment_records(manager.rounds, round_ids)
-    accepted = [
-        record for record in experiments
-        if record.get("decision") == "accepted"
-    ]
-    champion_experiment = accepted[-1] if accepted else None
+    champion_round_id = task_state.get("champion_round_id")
+    local_champion_round = (
+        str(champion_round_id).partition("/")[2]
+        if isinstance(champion_round_id, str)
+        and str(champion_round_id).startswith(f"{manager.run_id}/")
+        else None
+    )
+    champion_experiment = next(
+        (
+            record
+            for record in experiments
+            if record.get("experiment_id") == local_champion_round
+        ),
+        None,
+    )
     payload = {
         "task": {
             "id": task.task_id,
@@ -195,24 +194,20 @@ def generate_loop_report(
         },
         "experiments": experiments,
         "champion": {
-            "experiment_id": (
-                champion_experiment.get("experiment_id")
-                if champion_experiment is not None
-                else None
-            ),
+            "experiment_id": champion_round_id,
             "submitted_candidate": (
                 champion_experiment.get("submitted_candidate")
                 if champion_experiment is not None
                 else None
             ),
             "champion_number": task_state.get("champion_number"),
-            "commit": task_state.get("champion_commit"),
-            "ref": task_state.get("champion_ref"),
+            "sha256": task_state.get("champion_sha256"),
+            "source_round": champion_round_id,
+            "strategy_path": task_state.get("strategy_path"),
             "metrics": task_state.get("champion_metrics"),
             "strategy_source": _strategy_source(
-                task,
                 manager,
-                task_state.get("champion_commit"),
+                task_state.get("champion_sha256"),
             ),
         },
     }
@@ -268,7 +263,7 @@ def regenerate_loop_report(
     if not managed_root.is_absolute():
         managed_root = source / managed_root
     base_manager = ResearchWorkspace(source, managed_root, task.task_id)
-    base_manager.load_state()
+    base_manager.load_state(task.strategy_path)
     base_manager.migrate_legacy_loop()
     available = base_manager.run_numbers()
     selected = run_number if run_number is not None else (available[-1] if available else None)

@@ -858,8 +858,9 @@ def run_managed_once(
         date.fromisoformat(development_end),
         task.baseline_mode,
         task.baseline_exclude,
+        task.strategy_path,
     )
-    has_champion = isinstance(state.get("champion_commit"), str)
+    has_champion = isinstance(state.get("champion_sha256"), str)
     research_history = _load_managed_history(manager)
     if source in task_file.parents:
         candidate_task = candidate / task_file.relative_to(source)

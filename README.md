@@ -38,7 +38,7 @@ Candidate runner ── isolated worktree / development data / Agent session
 Fixed evaluator ── tests / backtest / hard constraints / Gate metrics
         │
         ▼
-Champion manager ── accept or reject / version refs / experiment evidence
+Champion manager ── accept or reject / atomic strategy file / experiment evidence
         │
         └────────────── next research round
 ```
@@ -71,7 +71,8 @@ python3 -m quant_core.cli research loop \
 
 研究任务在 `task.toml` 中声明目标、数据、Development/Gate 区间、允许修改的范围、
 固定评测命令、硬约束、Champion 改善要求、模型配置和运行预算。Harness 会在
-`.research/<task-id>/champion.json` 保存跨 Run 的 Champion；每次 Loop 自动分配
+`.research/<task-id>/champion.py` 保存可直接读取的 Champion 策略，在 `champion.json`
+保存其哈希、来源与指标；每次 Loop 自动分配
 `runs/001`、`runs/002` 等独立目录，轮次写入 `rounds/001`。历史 Run 的状态和报告
 不会被后续 Loop 覆盖。
 成功轮次默认不保留重复的 Agent 输出、原始事件流和成功命令日志；失败轮次仍保留

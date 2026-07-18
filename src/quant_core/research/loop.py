@@ -178,6 +178,7 @@ def run_loop(
         date.fromisoformat(development_end),
         task.baseline_mode,
         task.baseline_exclude,
+        task.strategy_path,
     )
     base_manager.migrate_legacy_loop()
     fingerprint = _task_fingerprint(task_file)
@@ -214,7 +215,7 @@ def run_loop(
     current = state.get("current_round", state.get("current_experiment_id"))
     if isinstance(current, str):
         decision_path = manager.rounds / current / "decision.json"
-        task_state = manager.load_state()
+        task_state = manager.load_state(task.strategy_path)
         record_id = f"{manager.run_id}/{current}"
         if decision_path.exists() and task_state.get(
             "last_round_id",
@@ -229,18 +230,18 @@ def run_loop(
                     write_json_atomic(result_path, {
                         "experiment_id": current,
                         "status": "failed",
-                        "error": "Loop was interrupted before the round was committed",
+                        "error": "Loop was interrupted before the round was finalized",
                     })
                 write_json_atomic(decision_path, {
                     "experiment_id": current,
                     "decision": "failed",
-                    "reasons": ["loop was interrupted before the round was committed"],
+                    "reasons": ["loop was interrupted before the round was finalized"],
                 })
         _record_decision(state, current, str(decision))
         _save(loop_state_path, state)
 
     while True:
-        task_state = manager.load_state()
+        task_state = manager.load_state(task.strategy_path)
         champion_metrics = task_state.get("champion_metrics")
         reason = _stop_reason(
             state,

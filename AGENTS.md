@@ -45,8 +45,8 @@ lightweight report output lives in the CLI.
 contains framework development documentation only; do not put quantitative
 trading business knowledge there. Skill-specific prompts, knowledge, scripts,
 templates, stock-pool definitions, and intermediate outputs live under
-`.agents/skills/<skill-name>/`. Managed research keeps task-level Champion state
-at `.research/<task-id>/champion.json` and immutable Loop history under
+`.agents/skills/<skill-name>/`. Managed research keeps the task-level strategy
+at `.research/<task-id>/champion.py`, its metadata at `champion.json`, and immutable Loop history under
 `.research/<task-id>/runs/<run>/rounds/<round>/`. It must remain isolated from
 normal framework outputs.
 

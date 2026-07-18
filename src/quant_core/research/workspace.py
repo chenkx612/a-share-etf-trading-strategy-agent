@@ -87,6 +87,14 @@ def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 @dataclass
 class ResearchWorkspace:
     source: Path
@@ -120,6 +128,14 @@ class ResearchWorkspace:
     @property
     def legacy_state_path(self) -> Path:
         return self.root / "state.json"
+
+    @property
+    def champion_path(self) -> Path:
+        return self.root / "champion.py"
+
+    @property
+    def champion_next_path(self) -> Path:
+        return self.root / ".tmp" / "champion.next.py"
 
     @property
     def runs(self) -> Path:
@@ -178,38 +194,6 @@ class ResearchWorkspace:
     @property
     def evaluation_runtime(self) -> Path:
         return self.runtime / "evaluation"
-
-    @property
-    def champion_ref(self) -> str:
-        state = self._existing_champion_state()
-        if state is not None and isinstance(state.get("champion_ref"), str):
-            return str(state["champion_ref"])
-        return f"{self._new_ref_namespace()}/champion"
-
-    @property
-    def seed_ref(self) -> str:
-        state = self._existing_champion_state()
-        if state is not None and isinstance(state.get("seed_ref"), str):
-            return str(state["seed_ref"])
-        return f"{self._new_ref_namespace()}/seed"
-
-    def _existing_champion_state(self) -> dict[str, Any] | None:
-        for path in (self.state_path, self.legacy_state_path):
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                return value
-        return None
-
-    def _new_ref_namespace(self) -> str:
-        task_digest = hashlib.sha256(self.task_id.encode()).hexdigest()[:12]
-        identity = f"{self.source}\0{self.root}".encode()
-        workspace_id = hashlib.sha256(identity).hexdigest()[:12]
-        # Keep workspace-scoped refs away from the legacy
-        # refs/quant-research/<task-digest>/{seed,champion} namespace.
-        return f"refs/quant-research/workspaces/{task_digest}/{workspace_id}"
 
     def for_run(self, run_number: int) -> ResearchWorkspace:
         return ResearchWorkspace(
@@ -299,6 +283,24 @@ class ResearchWorkspace:
             shutil.move(str(report_path), str(bound.report_path))
             state["report_path"] = "report.md"
         write_json_atomic(bound.loop_state_path, state)
+        if self.state_path.exists():
+            champion_state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if isinstance(state.get("last_round"), str):
+                champion_state["last_round_id"] = f"{bound.run_id}/{state['last_round']}"
+            accepted_rounds: list[str] = []
+            for legacy_id, round_id in mapping.items():
+                decision_path = bound.rounds / round_id / "decision.json"
+                try:
+                    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if decision.get("decision") == "accepted":
+                    accepted_rounds.append(round_id)
+            if accepted_rounds:
+                champion_state["champion_round_id"] = (
+                    f"{bound.run_id}/{accepted_rounds[-1]}"
+                )
+            write_json_atomic(self.state_path, champion_state)
         legacy_loop_state.unlink()
         try:
             legacy_experiments.rmdir()
@@ -306,8 +308,16 @@ class ResearchWorkspace:
             pass
         return run_number
 
-    def _snapshot_commit(self, excluded_paths: Sequence[str]) -> str:
+    def _snapshot_commit(
+        self,
+        excluded_paths: Sequence[str],
+        *,
+        strategy_path: str,
+        champion_path: Path | None,
+    ) -> str:
         excluded = [*excluded_paths, "data", "outputs"]
+        if strategy_path not in excluded:
+            excluded.append(strategy_path)
         if self.source in self.research_root.parents:
             excluded.append(self.research_root.relative_to(self.source).as_posix())
         with tempfile.TemporaryDirectory(prefix="quant-index-") as temporary:
@@ -326,6 +336,16 @@ class ResearchWorkspace:
                     path.rstrip("/"),
                     env=env,
                 )
+            if champion_path is not None:
+                blob = _git(self.source, "hash-object", "-w", "--", str(champion_path))
+                _git(
+                    self.source,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"100644,{blob},{strategy_path}",
+                    env=env,
+                )
             tree = _git(self.source, "write-tree", env=env)
             parent = _git(self.source, "rev-parse", "HEAD")
             return _git(
@@ -335,7 +355,7 @@ class ResearchWorkspace:
                 "-p",
                 parent,
                 "-m",
-                f"Research seed for {self.task_id}",
+                f"Temporary research base for {self.task_id}",
                 env=env,
             )
 
@@ -381,29 +401,96 @@ class ResearchWorkspace:
             self.runtime.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(legacy_runtime), str(self.runtime))
 
-    def _migrate_champion_layout(self) -> None:
+    def _strategy_path(
+        self,
+        state: Mapping[str, Any],
+        supplied: str | None,
+    ) -> str:
+        configured = state.get("strategy_path")
+        if configured is not None and not isinstance(configured, str):
+            raise ValueError("research workspace has an invalid strategy path")
+        if supplied is not None and configured is not None and supplied != configured:
+            raise ValueError("task strategy path changed after research workspace initialization")
+        strategy_path = supplied or configured
+        if strategy_path is None:
+            raise ValueError("strategy path is required to migrate the research workspace")
+        relative = Path(strategy_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("strategy path must be repository-relative")
+        return strategy_path
+
+    def _extract_champion(self, commit: str, strategy_path: str) -> bool:
+        completed = subprocess.run(
+            ["git", "-C", str(self.source), "show", f"{commit}:{strategy_path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return False
+        self.champion_next_path.parent.mkdir(parents=True, exist_ok=True)
+        self.champion_next_path.write_bytes(completed.stdout)
+        os.replace(self.champion_next_path, self.champion_path)
+        return True
+
+    def _latest_accepted_round(self) -> str | None:
+        accepted: str | None = None
+        for run_number in self.run_numbers():
+            run = self.for_run(run_number)
+            if not run.rounds.exists():
+                continue
+            for round_path in sorted(run.rounds.iterdir()):
+                try:
+                    decision = json.loads(
+                        (round_path / "decision.json").read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if decision.get("decision") == "accepted":
+                    accepted = f"{run.run_id}/{round_path.name}"
+        return accepted
+
+    def _migrate_champion_layout(self, strategy_path: str | None = None) -> None:
         source = self.state_path if self.state_path.exists() else self.legacy_state_path
         if not source.exists():
             return
         state = json.loads(source.read_text(encoding="utf-8"))
-        if state.get("schema_version") == 3 and source == self.state_path:
+        schema_version = state.get("schema_version")
+        if schema_version == 4 and source == self.state_path:
             if "last_experiment_id" in state and "last_round_id" not in state:
                 state["last_round_id"] = state.pop("last_experiment_id")
                 write_json_atomic(self.state_path, state)
             return
-        if state.get("schema_version") != 2:
+        if schema_version not in {2, 3}:
             raise ValueError("research workspace uses an incompatible champion schema")
-        namespace = self._new_ref_namespace()
-        state["schema_version"] = 3
-        state["workspace_id"] = namespace.rsplit("/", 1)[-1]
-        state["seed_ref"] = f"{namespace}/seed"
-        state["champion_ref"] = f"{namespace}/champion"
-        state["last_round_id"] = state.pop("last_experiment_id", None)
-        _git(self.source, "update-ref", str(state["seed_ref"]), str(state["seed_commit"]))
-        champion = state.get("champion_commit")
-        if isinstance(champion, str):
-            _git(self.source, "update-ref", str(state["champion_ref"]), champion)
-        write_json_atomic(self.state_path, state)
+        editable = self._strategy_path(state, strategy_path)
+        champion_commit = state.get("champion_commit")
+        champion_sha256: str | None = None
+        if isinstance(champion_commit, str):
+            if not self._extract_champion(champion_commit, editable):
+                raise ValueError("legacy Champion strategy cannot be read from its Git commit")
+            champion_sha256 = _file_sha256(self.champion_path)
+        migrated = {
+            "schema_version": 4,
+            "task_id": self.task_id,
+            "baseline_mode": state.get("baseline_mode", "workspace"),
+            "baseline_exclude": list(state.get("baseline_exclude", [])),
+            "strategy_path": editable,
+            "project_revision": _git(self.source, "rev-parse", "HEAD"),
+            "champion_number": int(state.get("champion_number", 0)),
+            "champion_sha256": champion_sha256,
+            "champion_round_id": self._latest_accepted_round(),
+            "champion_metrics": state.get("champion_metrics"),
+            "champion_metrics_key": state.get("champion_metrics_key"),
+            "last_round_id": state.get(
+                "last_round_id",
+                state.get("last_experiment_id"),
+            ),
+            "pending_promotion": None,
+            "development_end": state.get("development_end"),
+            "updated_at": state.get("updated_at"),
+        }
+        write_json_atomic(self.state_path, migrated)
         if source != self.state_path:
             source.unlink()
 
@@ -537,19 +624,20 @@ class ResearchWorkspace:
         pending = state.get("pending_promotion")
         if not isinstance(pending, dict):
             return state
-        commit = str(pending["commit"])
-        try:
-            _git(self.source, "cat-file", "-e", f"{commit}^{{commit}}")
-        except RuntimeError:
-            pass
-        else:
-            _git(self.source, "update-ref", self.champion_ref, commit)
-            state["champion_commit"] = commit
+        target_sha256 = str(pending["sha256"])
+        if (
+            self.champion_next_path.is_file()
+            and _file_sha256(self.champion_next_path) == target_sha256
+        ):
+            os.replace(self.champion_next_path, self.champion_path)
+        if self.champion_path.is_file() and _file_sha256(self.champion_path) == target_sha256:
+            state["champion_sha256"] = target_sha256
             state["champion_number"] = int(pending["champion_number"])
             state["champion_metrics"] = pending["metrics"]
-            state["last_round_id"] = str(
-                pending.get("round_id", pending.get("experiment_id"))
-            )
+            state["champion_round_id"] = str(pending["round_id"])
+            state["last_round_id"] = str(pending["round_id"])
+            state["project_revision"] = str(pending["project_revision"])
+        self.champion_next_path.unlink(missing_ok=True)
         state["pending_promotion"] = None
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         write_json_atomic(self.state_path, state)
@@ -572,16 +660,16 @@ class ResearchWorkspace:
         development_end: date | None = None,
         baseline_mode: str = "workspace",
         baseline_exclude: Sequence[str] = (),
+        strategy_path: str | None = None,
     ) -> dict[str, Any]:
-        self._migrate_champion_layout()
+        self._migrate_champion_layout(strategy_path)
         self._migrate_transient_layout()
         if self.state_path.exists():
-            state = self._recover_promotion(self.load_state())
+            state = self.load_state(strategy_path)
             if state.get("baseline_mode", "workspace") != baseline_mode:
                 raise ValueError("task baseline mode changed after research workspace initialization")
             if state.get("baseline_exclude", []) != list(baseline_exclude):
                 raise ValueError("task baseline exclusions changed after research workspace initialization")
-            _git(self.source, "update-ref", self.seed_ref, str(state["seed_commit"]))
             if self.run_number is not None:
                 self._cleanup_worktrees(self.candidates)
                 self._cleanup_worktrees(self.evaluators)
@@ -589,44 +677,54 @@ class ResearchWorkspace:
             return state
 
         self.root.mkdir(parents=True, exist_ok=True)
-        seed_commit = self._snapshot_commit(baseline_exclude)
-        namespace = self._new_ref_namespace()
+        editable = self._strategy_path({}, strategy_path)
+        champion_sha256: str | None = None
+        if baseline_mode == "workspace":
+            source_strategy = self.source / editable
+            if not source_strategy.is_file():
+                raise FileNotFoundError(f"Strategy script does not exist: {source_strategy}")
+            self.champion_next_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_strategy, self.champion_next_path)
+            os.replace(self.champion_next_path, self.champion_path)
+            champion_sha256 = _file_sha256(self.champion_path)
         state: dict[str, Any] = {
-            "schema_version": 3,
+            "schema_version": 4,
             "task_id": self.task_id,
-            "workspace_id": namespace.rsplit("/", 1)[-1],
             "baseline_mode": baseline_mode,
             "baseline_exclude": list(baseline_exclude),
-            "seed_commit": seed_commit,
-            "seed_ref": f"{namespace}/seed",
-            "champion_commit": seed_commit if baseline_mode == "workspace" else None,
-            "champion_ref": f"{namespace}/champion",
+            "strategy_path": editable,
+            "project_revision": _git(self.source, "rev-parse", "HEAD"),
             "champion_number": 0,
+            "champion_sha256": champion_sha256,
+            "champion_round_id": None,
             "champion_metrics": None,
             "champion_metrics_key": None,
             "last_round_id": None,
             "pending_promotion": None,
         }
-        if baseline_mode == "workspace":
-            _git(self.source, "update-ref", str(state["champion_ref"]), seed_commit)
-        _git(self.source, "update-ref", str(state["seed_ref"]), seed_commit)
         write_json_atomic(self.state_path, state)
         self._prepare_runtime(state, development_end)
         return state
 
-    def load_state(self) -> dict[str, Any]:
-        self._migrate_champion_layout()
+    def load_state(self, strategy_path: str | None = None) -> dict[str, Any]:
+        self._migrate_champion_layout(strategy_path)
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
-        if state.get("schema_version") != 3:
-            raise ValueError("research workspace uses an incompatible pre-worktree schema")
+        if state.get("schema_version") != 4:
+            raise ValueError("research workspace uses an incompatible Champion schema")
+        self._strategy_path(state, strategy_path)
+        if isinstance(state.get("pending_promotion"), dict):
+            state = self._recover_promotion(state)
+        else:
+            self.champion_next_path.unlink(missing_ok=True)
+        champion_sha256 = state.get("champion_sha256")
+        if isinstance(champion_sha256, str):
+            if not self.champion_path.is_file():
+                raise FileNotFoundError(f"Champion strategy does not exist: {self.champion_path}")
+            if _file_sha256(self.champion_path) != champion_sha256:
+                raise ValueError("Champion strategy hash does not match champion.json")
         return state
-
-    def candidate_base_commit(self, state: Mapping[str, Any] | None = None) -> str:
-        current = state or self.load_state()
-        champion = current.get("champion_commit")
-        return str(champion if isinstance(champion, str) else current["seed_commit"])
 
     def create_candidate(
         self,
@@ -634,6 +732,7 @@ class ResearchWorkspace:
         development_end: date | None = None,
         baseline_mode: str = "workspace",
         baseline_exclude: Sequence[str] = (),
+        strategy_path: str | None = None,
     ) -> tuple[Path, Path, dict[str, Any]]:
         if (
             not round_id.isdigit()
@@ -641,24 +740,43 @@ class ResearchWorkspace:
             or round_id != f"{int(round_id):03d}"
         ):
             raise ValueError("round id must be a zero-padded positive number")
-        state = self.initialize(development_end, baseline_mode, baseline_exclude)
+        state = self.initialize(
+            development_end,
+            baseline_mode,
+            baseline_exclude,
+            strategy_path,
+        )
         self._cleanup_worktrees(self.candidates)
         candidate = self.candidates / round_id
         experiment = self.rounds / round_id
         if candidate.exists() or experiment.exists():
             raise FileExistsError(f"Round already exists: {round_id}")
-        self._add_worktree(candidate, self.candidate_base_commit(state))
+        champion = (
+            self.champion_path
+            if isinstance(state.get("champion_sha256"), str)
+            else None
+        )
+        base_commit = self._snapshot_commit(
+            state.get("baseline_exclude", []),
+            strategy_path=str(state["strategy_path"]),
+            champion_path=champion,
+        )
+        self._add_worktree(candidate, base_commit)
         copy_runtime_inputs(self.development_runtime, candidate)
         experiment.mkdir(parents=True)
         return candidate, experiment, state
 
     def create_champion_evaluator(self, round_id: str, state: Mapping[str, Any]) -> Path:
-        commit = state.get("champion_commit")
-        if not isinstance(commit, str):
+        if not isinstance(state.get("champion_sha256"), str):
             raise RuntimeError("research task does not have a champion yet")
         self._cleanup_worktrees(self.evaluators)
         evaluator = self.evaluators / round_id
-        self._add_worktree(evaluator, commit)
+        base_commit = self._snapshot_commit(
+            state.get("baseline_exclude", []),
+            strategy_path=str(state["strategy_path"]),
+            champion_path=self.champion_path,
+        )
+        self._add_worktree(evaluator, base_commit)
         return evaluator
 
     def remove_evaluator(self, evaluator: Path) -> None:
@@ -675,7 +793,7 @@ class ResearchWorkspace:
             candidate,
             "diff",
             "--binary",
-            self.candidate_base_commit(state),
+            "HEAD",
             "--",
             *editable,
         )
@@ -701,34 +819,33 @@ class ResearchWorkspace:
         metrics: Mapping[str, Any],
         editable: Sequence[str],
     ) -> str:
-        _git(candidate, "add", "-A", "--", *editable)
-        _git(
-            candidate,
-            "-c",
-            f"user.name={_GIT_IDENTITY['GIT_AUTHOR_NAME']}",
-            "-c",
-            f"user.email={_GIT_IDENTITY['GIT_AUTHOR_EMAIL']}",
-            "commit",
-            "-m",
-            f"Research {self.task_id}: {round_id}",
-            env=_GIT_IDENTITY,
-        )
-        commit = _git(candidate, "rev-parse", "HEAD")
+        strategy_path = str(state["strategy_path"])
+        if list(editable) != [strategy_path]:
+            raise ValueError("editable strategy path does not match champion.json")
+        candidate_strategy = candidate / strategy_path
+        if not candidate_strategy.is_file():
+            raise FileNotFoundError(f"Candidate strategy does not exist: {candidate_strategy}")
+        self.champion_next_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate_strategy, self.champion_next_path)
+        sha256 = _file_sha256(self.champion_next_path)
         number = int(state["champion_number"]) + 1
         state["pending_promotion"] = {
             "round_id": round_id,
-            "commit": commit,
+            "sha256": sha256,
             "champion_number": number,
             "metrics": dict(metrics),
+            "project_revision": _git(self.source, "rev-parse", "HEAD"),
         }
         write_json_atomic(self.state_path, state)
-        _git(self.source, "update-ref", self.champion_ref, commit)
-        state["champion_commit"] = commit
+        os.replace(self.champion_next_path, self.champion_path)
+        state["champion_sha256"] = sha256
         state["champion_number"] = number
+        state["champion_round_id"] = round_id
+        state["project_revision"] = state["pending_promotion"]["project_revision"]
         state["pending_promotion"] = None
         self.record_state(state, round_id, metrics)
         self._remove_worktree(candidate)
-        return commit
+        return sha256
 
     def reject(self, candidate: Path, state: dict[str, Any], round_id: str) -> None:
         self.record_state(state, round_id)

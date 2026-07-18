@@ -517,25 +517,29 @@ def command_research_report(args: argparse.Namespace) -> None:
 
 
 def command_research_clean(args: argparse.Namespace) -> None:
-    task_id = (
-        ResearchTask.load(Path(args.task).resolve()).task_id
-        if args.task is not None
-        else str(args.task_id)
-    )
+    task = ResearchTask.load(Path(args.task).resolve()) if args.task is not None else None
+    task_id = task.task_id if task is not None else str(args.task_id)
     source = Path(args.root).resolve()
     research_root = Path(args.research_root)
     if not research_root.is_absolute():
         research_root = source / research_root
     manager = ResearchWorkspace(source, research_root, task_id)
+    loop_state_paths = [
+        manager.root / "loop-state.json",
+        *(
+            manager.for_run(run_number).loop_state_path
+            for run_number in manager.run_numbers()
+        ),
+    ]
+    for loop_state_path in loop_state_paths:
+        if not loop_state_path.exists():
+            continue
+        loop_state = json.loads(loop_state_path.read_text(encoding="utf-8"))
+        if loop_state.get("status") == "running":
+            raise RuntimeError("cannot clean artifacts while a research loop is running")
     if manager.state_path.exists() or manager.legacy_state_path.exists():
-        manager.load_state()
+        manager.load_state(task.strategy_path if task is not None else None)
     manager.migrate_legacy_loop()
-    for run_number in manager.run_numbers():
-        loop_state_path = manager.for_run(run_number).loop_state_path
-        if loop_state_path.exists():
-            loop_state = json.loads(loop_state_path.read_text(encoding="utf-8"))
-            if loop_state.get("status") == "running":
-                raise RuntimeError("cannot clean artifacts while a research loop is running")
     manager.cleanup_transient(remove_development_cache=True)
     summary = manager.compact_artifacts()
     print(
