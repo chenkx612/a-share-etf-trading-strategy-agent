@@ -190,6 +190,25 @@ def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) ->
     legacy_state = dict(state)
     legacy_state["schema_version"] = 2
     legacy_state.pop("workspace_id")
+    ref_parts = str(state["champion_ref"]).split("/")
+    legacy_namespace = f"refs/quant-research/{ref_parts[-3]}"
+    legacy_state["seed_ref"] = f"{legacy_namespace}/seed"
+    legacy_state["champion_ref"] = f"{legacy_namespace}/champion"
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "update-ref", legacy_state["seed_ref"], state["seed_commit"]],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "update-ref",
+            legacy_state["champion_ref"],
+            state["champion_commit"],
+        ],
+        check=True,
+    )
     manager.legacy_state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
     manager.state_path.unlink()
     legacy_experiment = manager.root / "experiments/loop-000001"

@@ -207,7 +207,9 @@ class ResearchWorkspace:
         task_digest = hashlib.sha256(self.task_id.encode()).hexdigest()[:12]
         identity = f"{self.source}\0{self.root}".encode()
         workspace_id = hashlib.sha256(identity).hexdigest()[:12]
-        return f"refs/quant-research/{task_digest}/{workspace_id}"
+        # Keep workspace-scoped refs away from the legacy
+        # refs/quant-research/<task-digest>/{seed,champion} namespace.
+        return f"refs/quant-research/workspaces/{task_digest}/{workspace_id}"
 
     def for_run(self, run_number: int) -> ResearchWorkspace:
         return ResearchWorkspace(
