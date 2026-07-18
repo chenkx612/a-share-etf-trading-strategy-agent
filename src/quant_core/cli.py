@@ -26,7 +26,13 @@ from quant_core.data.market_data import (
     write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
-from quant_core.research import regenerate_loop_report, run_loop, run_managed_once, run_once
+from quant_core.research import (
+    ResearchTask,
+    regenerate_loop_report,
+    run_loop,
+    run_once,
+)
+from quant_core.research.workspace import ResearchWorkspace
 from quant_core.strategy.sharpe_corr_threshold import (
     STRATEGY_NAME,
     SharpeCorrThresholdParams,
@@ -470,21 +476,6 @@ def command_research_run_once(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
-def command_research_run_managed(args: argparse.Namespace) -> None:
-    result_path = run_managed_once(
-        args.task,
-        args.experiment_id,
-        workspace=args.root,
-        research_root=args.research_root,
-    )
-    decision_path = result_path.parent / "decision.json"
-    decision = json.loads(decision_path.read_text(encoding="utf-8"))
-    print(f"wrote managed experiment to {result_path.parent}")
-    print(f"decision: {decision['decision']}")
-    if decision["decision"] == "failed":
-        raise SystemExit(1)
-
-
 def command_research_loop(args: argparse.Namespace) -> None:
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -520,8 +511,37 @@ def command_research_report(args: argparse.Namespace) -> None:
         args.task,
         workspace=args.root,
         research_root=args.research_root,
+        run_number=args.run,
     )
     print(f"wrote loop report to {report_path}")
+
+
+def command_research_clean(args: argparse.Namespace) -> None:
+    task_id = (
+        ResearchTask.load(Path(args.task).resolve()).task_id
+        if args.task is not None
+        else str(args.task_id)
+    )
+    source = Path(args.root).resolve()
+    research_root = Path(args.research_root)
+    if not research_root.is_absolute():
+        research_root = source / research_root
+    manager = ResearchWorkspace(source, research_root, task_id)
+    if manager.state_path.exists() or manager.legacy_state_path.exists():
+        manager.load_state()
+    manager.migrate_legacy_loop()
+    for run_number in manager.run_numbers():
+        loop_state_path = manager.for_run(run_number).loop_state_path
+        if loop_state_path.exists():
+            loop_state = json.loads(loop_state_path.read_text(encoding="utf-8"))
+            if loop_state.get("status") == "running":
+                raise RuntimeError("cannot clean artifacts while a research loop is running")
+    manager.cleanup_transient(remove_development_cache=True)
+    summary = manager.compact_artifacts()
+    print(
+        f"removed {summary['removed_files']} redundant files "
+        f"({summary['removed_bytes']} bytes) from {manager.root}"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -612,11 +632,6 @@ def build_parser() -> argparse.ArgumentParser:
     research_run_once.add_argument("--experiment-id", required=True)
     research_run_once.add_argument("--output", required=True)
     research_run_once.set_defaults(func=command_research_run_once)
-    research_run_managed = research_sub.add_parser("run-managed")
-    research_run_managed.add_argument("--task", required=True)
-    research_run_managed.add_argument("--experiment-id", required=True)
-    research_run_managed.add_argument("--research-root", default=".research")
-    research_run_managed.set_defaults(func=command_research_run_managed)
     research_loop = research_sub.add_parser("loop")
     research_loop.add_argument("--task", required=True)
     research_loop.add_argument("--research-root", default=".research")
@@ -624,7 +639,14 @@ def build_parser() -> argparse.ArgumentParser:
     research_report = research_sub.add_parser("report")
     research_report.add_argument("--task", required=True)
     research_report.add_argument("--research-root", default=".research")
+    research_report.add_argument("--run", type=int)
     research_report.set_defaults(func=command_research_report)
+    research_clean = research_sub.add_parser("clean")
+    research_clean_target = research_clean.add_mutually_exclusive_group(required=True)
+    research_clean_target.add_argument("--task")
+    research_clean_target.add_argument("--task-id")
+    research_clean.add_argument("--research-root", default=".research")
+    research_clean.set_defaults(func=command_research_clean)
     return parser
 
 

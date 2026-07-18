@@ -134,7 +134,8 @@ Harness 写入 `result.json`：
 }
 ```
 
-OpenCode 的结构化输出、完整 JSONL 事件、测试日志和回测日志保存在实验目录中。
+OpenCode 的有效结构化输出会合并进 `result.json`，不再重复保存为单独文件。完整 JSONL
+事件及测试、回测日志只在相应阶段失败时保留；成功轮次删除这些诊断产物。
 一轮结束时还没有自己的 gate 结论，因此该轮的 `feedback` 先留空，由下一轮 AI 在开头根据已产生的
 受控决策补齐。每轮只强制补上一轮的简短反馈，更早记录仅作为隐式推理上下文。`attempts` 记录本轮在
 开发集上试过的方案和变体，不表示 gate 拒绝或未晋升 champion；`development_effect` 记录开发集效果，
@@ -145,13 +146,12 @@ gate 指标或 gate 区间。
 
 正常停止的多轮循环额外生成：
 
-- `.research/<task-id>/loop-report.md`：面向人的中文终局复盘。
-- `.research/<task-id>/report-events.jsonl`：报告 OpenCode 会话的原始事件。
-- `loop-state.json` 中的 `report_status`、`report_path`、`report_error`：报告执行状态。
+- `.research/<task-id>/runs/<run>/report.md`：面向人的中文终局复盘。
+- `.research/<task-id>/runs/<run>/report-events.jsonl`：仅在报告失败或内容无效时保留的原始事件。
+- Run `state.json` 中的 `report_status`、`report_path`、`report_error`：报告执行状态。
 
 报告输入包含本次 loop 所有轮次的假设、尝试、development/gate 指标、接受决策和最终 champion
-源码；实验归属由 `loop-state.json` 的 `experiment_ids` 确定，避免复用 research root 时混入历史
-loop。
+源码；每个报告只读取同一 `runs/<run>/rounds/` 下的记录。
 报告生成发生在研发循环停止之后，因此不会向任何候选研发会话泄露精确 gate 指标。报告失败不改变
 loop 的停止原因、轮次统计或 champion。
 
@@ -162,17 +162,6 @@ quant-agent --root <workspace> research run-once \
   --task <task.toml> \
   --experiment-id experiment-001 \
   --output <experiment-dir>
-```
-
-## Managed candidate
-
-阶段三使用受管理入口：
-
-```bash
-quant-agent --root <workspace> research run-managed \
-  --task <task.toml> \
-  --experiment-id experiment-001 \
-  --research-root .research
 ```
 
 研发状态保存到 `.research/<task-id>/`。Harness 用临时 Git commit 捕获任务启动时的工作区状态，
@@ -200,8 +189,16 @@ quant-agent --root <workspace> research loop \
   --research-root .research
 ```
 
-循环状态保存在 `.research/<task-id>/loop-state.json`。循环在达到 `max_rounds`、`max_hours` 或
+任务级 Champion 保存在 `.research/<task-id>/champion.json`；循环状态保存在
+`.research/<task-id>/runs/<run>/state.json`。循环在达到 `max_rounds`、`max_hours` 或
 `max_consecutive_failures` 后停止；配置 `evaluation.target.objective_at_least` 时，champion 的 gate
 目标指标达到阈值且满足约束也会停止。总时长用于判断是否启动下一轮，不会缩短已经开始的单轮
-超时。`rejected` 不计入连续失败；中断的未完成轮次在恢复时计为 `failed`。后续轮次直接从各实验的
-`result.json`、`decision.json` 和 `agent-output.json` 动态构建受控研究历史，不维护重复的记忆文件。
+超时。`rejected` 不计入连续失败；中断的未完成轮次在恢复时计为 `failed`。后续轮次直接从各 Round 的
+`result.json` 和 `decision.json` 动态构建受控研究历史，不维护重复的 Agent 输出或记忆文件。
+
+运行时阶段事件会打印到 stdout 并同步写入 `.research/<task-id>/.tmp/runs/<run>/events.jsonl`，
+供外部 Codex 实时观察；正常结束后删除该临时事件流。
+
+可使用 `research clean` 清理旧版成功诊断文件、中断 worktree 和可重建的 Development 缓存；
+该命令接受 `--task <task.toml>` 或 `--task-id <task-id>`，不会删除结构化 Round 记录、候选 patch、
+Champion、Evaluation 数据快照或最终报告。

@@ -14,7 +14,7 @@ from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 
 ReportAgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
-_LOOP_EXPERIMENT_ID = re.compile(r"^loop-\d+$")
+_ROUND_ID = re.compile(r"^\d+$")
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -30,20 +30,19 @@ def _write_loop_state(path: Path, state: dict[str, Any]) -> None:
     write_json_atomic(path, state)
 
 
-def _loop_experiment_ids(
+def _loop_round_ids(
     experiments: Path,
     loop_state: Mapping[str, Any],
 ) -> list[str]:
-    configured = loop_state.get("experiment_ids")
+    configured = loop_state.get("round_ids", loop_state.get("experiment_ids"))
     if isinstance(configured, list):
         return [
-            experiment_id
-            for experiment_id in configured
-            if isinstance(experiment_id, str) and _LOOP_EXPERIMENT_ID.fullmatch(experiment_id)
+            round_id
+            for round_id in configured
+            if isinstance(round_id, str) and _ROUND_ID.fullmatch(round_id)
         ]
 
-    # States written before experiment_ids existed can only be scoped by the
-    # completed-round count. Loop IDs are monotonically increasing.
+    # Legacy states without round_ids can only be scoped by the completed count.
     try:
         rounds_completed = max(0, int(loop_state.get("rounds_completed", 0)))
     except (TypeError, ValueError):
@@ -53,18 +52,18 @@ def _loop_experiment_ids(
     candidates = sorted(
         path.name
         for path in experiments.iterdir()
-        if path.is_dir() and _LOOP_EXPERIMENT_ID.fullmatch(path.name)
+        if path.is_dir() and _ROUND_ID.fullmatch(path.name)
     )
     return candidates[-rounds_completed:]
 
 
 def _experiment_records(
     experiments: Path,
-    experiment_ids: Sequence[str],
+    round_ids: Sequence[str],
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for experiment_id in experiment_ids:
-        experiment = experiments / experiment_id
+    for round_id in round_ids:
+        experiment = experiments / round_id
         if not experiment.is_dir():
             continue
         result = _read_json(experiment / "result.json") or {}
@@ -167,8 +166,8 @@ def generate_loop_report(
 ) -> Path:
     task = ResearchTask.load(task_path)
     task_state = manager.load_state()
-    experiment_ids = _loop_experiment_ids(manager.experiments, loop_state)
-    experiments = _experiment_records(manager.experiments, experiment_ids)
+    round_ids = _loop_round_ids(manager.rounds, loop_state)
+    experiments = _experiment_records(manager.rounds, round_ids)
     accepted = [
         record for record in experiments
         if record.get("decision") == "accepted"
@@ -220,29 +219,37 @@ def generate_loop_report(
     opencode = task.raw["opencode"]
     command = [
         "opencode", "run", "--auto", "--format", "json",
-        "--model", str(opencode["model"]), "--dir", str(manager.root),
+        "--model", str(opencode["model"]), "--dir", str(manager.run_root),
     ]
     if variant := opencode.get("variant"):
         command.extend(["--variant", str(variant)])
     timeout = min(int(opencode["timeout_minutes"]) * 60, 600)
-    events_path = manager.root / "report-events.jsonl"
+    events_path = manager.run_temp / "report-events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
     exit_code = agent_runner(
         command,
         _report_prompt(payload),
-        manager.root,
+        manager.run_root,
         events_path,
         timeout,
     )
     if exit_code != 0:
+        failed_events = manager.run_root / "report-events.jsonl"
+        if events_path.exists():
+            events_path.replace(failed_events)
         reason = "timed out" if exit_code == 124 else f"exited with code {exit_code}"
         raise RuntimeError(f"OpenCode report session {reason}")
     report = _last_text_event(events_path)
     if report is None or not report.lstrip().startswith("# Research Loop 总结"):
+        failed_events = manager.run_root / "report-events.jsonl"
+        if events_path.exists():
+            events_path.replace(failed_events)
         raise RuntimeError("OpenCode report session produced no valid Markdown report")
-    report_path = manager.root / "loop-report.md"
+    report_path = manager.report_path
     temporary = report_path.with_suffix(".md.tmp")
     temporary.write_text(report.rstrip() + "\n", encoding="utf-8")
     temporary.replace(report_path)
+    events_path.unlink(missing_ok=True)
     return report_path
 
 
@@ -251,6 +258,7 @@ def regenerate_loop_report(
     *,
     workspace: str | Path = ".",
     research_root: str | Path = ".research",
+    run_number: int | None = None,
     agent_runner: ReportAgentRunner = _run_opencode_read_only,
 ) -> Path:
     task_file = Path(task_path).resolve()
@@ -259,8 +267,15 @@ def regenerate_loop_report(
     managed_root = Path(research_root)
     if not managed_root.is_absolute():
         managed_root = source / managed_root
-    manager = ResearchWorkspace(source, managed_root, task.task_id)
-    loop_state_path = manager.root / "loop-state.json"
+    base_manager = ResearchWorkspace(source, managed_root, task.task_id)
+    base_manager.load_state()
+    base_manager.migrate_legacy_loop()
+    available = base_manager.run_numbers()
+    selected = run_number if run_number is not None else (available[-1] if available else None)
+    if selected is None or selected not in available:
+        raise FileNotFoundError("Research run does not exist")
+    manager = base_manager.for_run(selected)
+    loop_state_path = manager.loop_state_path
     loop_state = _read_json(loop_state_path)
     if loop_state is None:
         raise FileNotFoundError(f"Loop state does not exist: {loop_state_path}")
@@ -288,6 +303,6 @@ def regenerate_loop_report(
         _write_loop_state(loop_state_path, loop_state)
         raise
     loop_state["report_status"] = "completed"
-    loop_state["report_path"] = report_path.relative_to(manager.root).as_posix()
+    loop_state["report_path"] = report_path.relative_to(manager.run_root).as_posix()
     _write_loop_state(loop_state_path, loop_state)
     return report_path

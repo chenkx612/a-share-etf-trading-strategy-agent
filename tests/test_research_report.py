@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -81,25 +82,27 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    task_state = manager.initialize(date(2021, 12, 31))
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    task_state = base.initialize(date(2021, 12, 31))
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
     task_state["champion_number"] = 1
     task_state["champion_metrics"] = {
         "development": {"sortino": 1.4, "max_drawdown": -0.10},
         "gate": {"sortino": 1.2, "max_drawdown": -0.12},
     }
     write_json_atomic(manager.state_path, task_state)
-    stale = manager.experiments / "loop-000000"
+    stale = manager.rounds / "000"
     stale.mkdir()
     write_json_atomic(stale / "result.json", {
         "status": "completed",
         "hypothesis": "Historical hypothesis from an earlier loop",
     })
     write_json_atomic(stale / "decision.json", {
-        "experiment_id": "loop-000000",
+        "experiment_id": "001/000",
         "decision": "rejected",
     })
-    experiment = manager.experiments / "loop-000001"
+    experiment = manager.rounds / "001"
     experiment.mkdir()
     write_json_atomic(experiment / "result.json", {
         "status": "completed",
@@ -110,7 +113,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         "metrics": task_state["champion_metrics"],
     })
     write_json_atomic(experiment / "decision.json", {
-        "experiment_id": "loop-000001",
+        "experiment_id": "001/001",
         "decision": "accepted",
         "objective": {
             "champion_constraints_passed": False,
@@ -148,7 +151,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
             "rejected": 0,
             "failed": 0,
             "elapsed_seconds": 42.0,
-            "experiment_ids": ["loop-000001"],
+            "round_ids": ["001"],
         },
         agent_runner=fake_agent,
     )
@@ -163,11 +166,12 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert "PARAMETER = 1" in prompt
     assert command[command.index("--model") + 1] == "xai/grok-4.5"
     assert command[command.index("--variant") + 1] == "high"
-    assert captured["cwd"] == manager.root
+    assert captured["cwd"] == manager.run_root
     assert captured["timeout"] == 600
     assert report_path.read_text(encoding="utf-8").startswith("# Research Loop 总结")
+    assert not (manager.run_root / "report-events.jsonl").exists()
 
-    loop_state_path = manager.root / "loop-state.json"
+    loop_state_path = manager.loop_state_path
     write_json_atomic(loop_state_path, {
         "status": "stopped",
         "stop_reason": "max_rounds",
@@ -176,8 +180,9 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         "rejected": 0,
         "failed": 0,
         "elapsed_seconds": 42.0,
-        "experiment_ids": ["loop-000001"],
+        "round_ids": ["001"],
     })
+    shutil.rmtree(base.runtime)
     regenerated = regenerate_loop_report(
         task_path,
         workspace=tmp_path,
@@ -186,17 +191,20 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     saved_state = json.loads(loop_state_path.read_text(encoding="utf-8"))
     assert regenerated == report_path
     assert saved_state["report_status"] == "completed"
-    assert saved_state["report_path"] == "loop-report.md"
+    assert saved_state["report_path"] == "report.md"
     assert saved_state["report_error"] is None
     assert "updated_at" in saved_state
+    assert not base.runtime.exists()
 
 
 def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    manager.initialize(date(2021, 12, 31))
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base.initialize(date(2021, 12, 31))
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
 
     def fake_agent(
         command: Sequence[str],
@@ -215,7 +223,7 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
         generate_loop_report(
             task_path,
             manager,
-            {"rounds_completed": 0, "experiment_ids": []},
+            {"rounds_completed": 0, "round_ids": []},
             agent_runner=fake_agent,
         )
 
@@ -224,13 +232,15 @@ def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> Non
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    manager.initialize(date(2021, 12, 31))
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base.initialize(date(2021, 12, 31))
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
     for experiment_id, hypothesis in (
-        ("loop-000001", "Earlier loop"),
-        ("loop-000002", "Current loop"),
+        ("001", "Earlier loop"),
+        ("002", "Current loop"),
     ):
-        experiment = manager.experiments / experiment_id
+        experiment = manager.rounds / experiment_id
         experiment.mkdir()
         write_json_atomic(experiment / "result.json", {
             "status": "completed",

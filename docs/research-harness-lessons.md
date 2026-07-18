@@ -146,13 +146,14 @@
   扫描全部目录，就会把多次运行混成一次复盘，轮次统计、假设演进和 Champion 归因都可能失真。
 - **根因**：实验 ID 在任务内单调递增，但首版 loop state 只记录最后一个实验，没有保存本次运行的
   完整实验集合。
-- **技术方案**：每次完成决策时将实验 ID 追加到 `loop-state.json.experiment_ids`，报告只读取该
-  集合。对旧版状态，按 `rounds_completed` 取单调递增实验 ID 的尾部，提供确定性的兼容推断。
-- **验证方法**：测试在同一实验目录放入历史和当前两轮，确认新状态与旧状态两条路径都只向报告
-  会话提供当前轮次。
-- **遗留风险**：旧状态的尾部推断依赖实验 ID 单调递增且目录未被手工删除；新状态不存在该限制。
+- **技术方案**：任务级 Champion 与 Run 历史分离。每次 Loop 自动分配 `runs/<run>/`，本次轮次
+  只写入其 `rounds/` 子目录，Run 自己保存 `state.json` 和 `report.md`。旧版平铺状态在首次访问时
+  迁移到编号 Run。
+- **验证方法**：连续启动两次 Loop，确认分别生成 `runs/001/rounds/001` 和
+  `runs/002/rounds/001`，且两份报告均保留并只读取所属 Run。
+- **遗留风险**：旧版目录若曾手工删除部分实验，只能按旧状态中可用的轮次信息迁移。
 - **关联代码/测试**：`src/quant_core/research/loop.py::_record_decision`、
-  `src/quant_core/research/report.py::_loop_experiment_ids`、`tests/test_research_report.py`
+  `src/quant_core/research/report.py::_loop_round_ids`、`tests/test_research_report.py`
 
 ## 新问题模板
 

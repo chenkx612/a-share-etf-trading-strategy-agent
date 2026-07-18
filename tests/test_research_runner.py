@@ -83,6 +83,7 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK_TOML, encoding="utf-8")
     opencode_commands: list[Sequence[str]] = []
+    events: list[str] = []
 
     def fake_opencode(
         command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
@@ -146,6 +147,8 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         workspace=tmp_path,
         command_runner=fake_command,
         opencode_runner=fake_opencode,
+        event_sink=lambda event, **details: events.append(event),
+        round_id="001",
     )
 
     result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -156,12 +159,27 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     assert command[command.index("--format") + 1] == "json"
     assert command[command.index("--dir") + 1] == str(tmp_path)
     assert "--auto" in command
-    assert json.loads((result_path.parent / "agent-output.json").read_text(encoding="utf-8"))["status"] == "completed"
+    assert not (result_path.parent / "agent-output.json").exists()
+    assert not (result_path.parent / "opencode-events.jsonl").exists()
+    assert not (result_path.parent / "tests.log").exists()
+    assert not (result_path.parent / "development.log").exists()
+    assert not (result_path.parent / "gate.log").exists()
     assert result["status"] == "completed"
+    assert result["previous_feedback"] == ""
     assert "feedback" not in result
     assert result["attempts"].startswith("Added and tested")
     assert result["candidate"] == "Add momentum strategy"
     assert result["metrics"]["gate"]["sortino"] == 1.2
+    assert events == [
+        "agent_started",
+        "agent_completed",
+        "tests_started",
+        "tests_passed",
+        "development_started",
+        "development_completed",
+        "gate_started",
+        "gate_completed",
+    ]
 
 
 def test_metrics_cache_key_changes_with_strategy_module() -> None:

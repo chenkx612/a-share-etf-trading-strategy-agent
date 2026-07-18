@@ -81,33 +81,44 @@ gate。已有 champion 需要重新评测时使用一次性 evaluator worktree�
 
 ```text
 .research/<task-id>/
-├── state.json
-├── loop-state.json
-├── loop-report.md
-├── report-events.jsonl
-├── runtime/
-│   ├── development/
+├── champion.json
+├── runs/
+│   └── 001/
+│       ├── state.json
+│       ├── report.md
+│       └── rounds/
+│           └── 001/
+│               ├── result.json
+│               ├── decision.json
+│               └── candidate.patch
+├── .cache/runtime/
 │   └── evaluation/
-├── worktrees/
-│   ├── candidates/
-│   └── evaluators/
-└── experiments/<experiment-id>/
+└── .tmp/
+    ├── runs/001/events.jsonl
+    └── worktrees/001/
+        ├── candidates/
+        └── evaluators/
 ```
 
-每个实验永久保存 `result.json`、`decision.json` 和已有的执行日志；成功产生合法候选修改时额外
-保存 `candidate.patch`。最终 champion 由 `refs/quant-research/.../champion` 指向，仍不会自动
-合并或应用到当前工作分支。seed commit 由独立 ref 保留，避免在首个 champion 产生前被 Git GC
-清理。
+每个 Round 永久保存 `result.json` 和 `decision.json`；成功产生合法候选修改时额外保存
+`candidate.patch`。成功轮次在结构化结果写入后删除重复的 Agent 输出、原始事件流和成功命令
+日志；失败轮次保留相关原始事件与失败日志用于诊断。Development 数据是从冻结 Evaluation
+数据派生的缓存，Loop 结束后删除并在需要时重建。worktree 只属于临时运行状态，正常结束、
+可处理的中断以及下一次初始化都会清理。
 
-验收：失败实验不会污染下一轮。
+最终 champion 由 `refs/quant-research/.../champion` 指向，仍不会自动合并或应用到当前工作
+分支。seed commit 由独立 ref 保留，避免在首个 champion 产生前被 Git GC 清理。
+
+验收：失败 Round 不会污染下一轮。
 
 ### 阶段四：自动多轮循环
 
 状态：已完成。按当前资源约束不做数小时真实长跑验收。
 
-`research loop` 在 `run-managed` 外层自动续轮。`.research/<task-id>/state.json` 继续管理
-champion，新增 `loop-state.json` 保存当前循环的轮数、累计运行时间、连续失败、当前实验和停止原因。
-每轮会直接从已有实验记录构建研究历史。下一轮 OpenCode 先读取最近的受控研究历史，
+`research loop` 在内部受管理单轮执行器外层自动续轮。`.research/<task-id>/champion.json` 管理
+跨 Run 的 champion；每次新 Loop 自动分配下一个三位数字 Run，Run 内的 `state.json` 保存轮数、
+累计运行时间、连续失败、当前 Round 和停止原因。每个 Run 的 Round 从 `001` 重新编号。
+每轮会直接从已有 Round 记录构建研究历史。下一轮 OpenCode 先读取最近的受控研究历史，
 只为上一轮补齐一条简短 `feedback`，更早历史仅用于隐式推理，然后再提出新假设。本轮结束时必须
 记录假设、开发集阶段尝试过的方案、开发集效果和最终候选结果，供后续轮次快速理解。研发 Prompt
 会明确 objective、相对 champion 的最小改善要求和全部硬约束，但历史不包含精确 gate 指标或 gate
@@ -120,25 +131,42 @@ champion 的 gate 指标达到目标且满足约束时提前停止。
 
 验收：一次启动可持续运行数小时，直到达成目标或耗尽预算。
 
+### 实时可观测性
+
+Harness 在 Run 和 Round 开始、Agent 完成、测试、Development/Gate 回测、决策和停止时向 stdout
+输出带 `[run/round]` 前缀的简洁事件，并同步追加到 `.tmp/runs/<run>/events.jsonl`。启动 Loop 的
+Codex 可以直接观察控制台或轮询该文件；Run 正常结束后删除临时事件流，技术失败的具体日志则保留
+在对应 Round 中。
+
 ### 终局复盘
 
 Loop 正常停止后，Harness 启动一次独立、只读的 OpenCode 会话，读取本次 loop 对应的
-`result.json`、`decision.json`、最终 champion 指标和 champion 策略源码，生成 `loop-report.md`。报告逐轮说明
+`result.json`、`decision.json`、最终 champion 指标和 champion 策略源码，生成当前 Run 的
+`report.md`。报告逐轮说明
 假设、开发集尝试、development/gate 效果、决策和启发，并单独描述最终 champion 的交易逻辑与
 确定参数。
 
 报告会话使用任务配置的同一模型和推理强度，最长运行 10 分钟；禁止 Bash、代码编辑、Skill、
 Web 和子任务工具。精确 gate 指标只在循环已经结束后用于复盘，不会反馈给后续研发轮次。
-`loop-state.json` 显式记录本次运行的实验 ID，避免复用同一 research root 时混入历史 loop；
-旧版状态文件则按已完成轮数从单调递增的实验 ID 尾部兼容推断。
-`loop-state.json` 通过 `report_status`、`report_path` 和 `report_error` 记录报告状态。报告失败
-不会改变已完成的研究决策或 champion，也不会把成功 loop 标记为失败。
+Run 的 `state.json` 显式记录本次运行的 Round ID；物理目录边界确保报告不会混入其他 Run。
+该状态通过 `report_status`、`report_path` 和 `report_error` 记录报告状态。成功生成
+报告后删除原始报告事件；报告失败时保留事件用于诊断。报告失败不会改变已完成的研究决策或
+champion，也不会把成功 loop 标记为失败。
 
 可单独补生成或重试报告：
 
 ```bash
 quant-agent --root <workspace> research report \
   --task <task.toml> \
+  --run 1 \
+  --research-root .research
+```
+
+可清理旧版成功日志、中断 worktree 和派生 Development 缓存：
+
+```bash
+quant-agent --root <workspace> research clean \
+  --task-id <task-id> \
   --research-root .research
 ```
 

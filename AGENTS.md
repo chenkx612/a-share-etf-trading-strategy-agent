@@ -45,9 +45,10 @@ lightweight report output lives in the CLI.
 contains framework development documentation only; do not put quantitative
 trading business knowledge there. Skill-specific prompts, knowledge, scripts,
 templates, stock-pool definitions, and intermediate outputs live under
-`.agents/skills/<skill-name>/`. Managed research state and experiment evidence
-live under `.research/<task-id>/` and must remain isolated from normal framework
-outputs.
+`.agents/skills/<skill-name>/`. Managed research keeps task-level Champion state
+at `.research/<task-id>/champion.json` and immutable Loop history under
+`.research/<task-id>/runs/<run>/rounds/<round>/`. It must remain isolated from
+normal framework outputs.
 
 ## Build, Test, and Development Commands
 
@@ -58,8 +59,8 @@ outputs.
 - `python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31`: run the Sharpe/correlation/threshold strategy backtest.
 - `python3 -m quant_core.cli --root .agents/skills/etf-sharpe-topk/outputs/sector_rotation recommend today --universe .agents/skills/etf-sharpe-topk/outputs/sector_rotation/selected_universe.csv --date 2024-12-31 --top-n 10`: generate skill-scoped recommendations.
 - `python3 -m quant_core.cli research run-once --task path/to/task.toml --experiment-id experiment-001 --output path/to/experiment`: run one candidate-development experiment without champion management.
-- `python3 -m quant_core.cli research run-managed --task path/to/task.toml --experiment-id experiment-001 --research-root .research`: run one isolated, evaluated candidate round with champion management.
 - `python3 -m quant_core.cli research loop --task path/to/task.toml --research-root .research`: run the resumable automated strategy-research loop until its configured target or budget stops it.
+- `python3 -m quant_core.cli research clean --task path/to/task.toml --research-root .research`: remove disposable worktrees, derived development data, and redundant successful-run diagnostics without deleting research decisions or the champion.
 
 ## Loop & Harness Engineering Rules
 
@@ -72,7 +73,7 @@ outputs.
   development inputs; exact gate-period metrics must not feed later research
   rounds. Final reports may inspect gate results only after the loop stops.
 - Run candidates in isolated worktrees or equivalent disposable workspaces.
-  Rejected, failed, or interrupted experiments must not contaminate the next
+  Rejected, failed, or interrupted rounds must not contaminate the next
   round or the user's current branch and index.
 - Promotion is harness-owned. A candidate becomes champion only after fixed
   tests, hard constraints, objective comparison, and configured improvement
@@ -82,6 +83,15 @@ outputs.
   not reasons to silently bypass gates.
 - Preserve auditability: an experiment should be explainable from its frozen
   inputs, code diff, logs, metrics, decision, and parent champion.
+- Keep durable evidence separate from disposable runtime state. Store caches
+  under `.cache/`, worktrees under `.tmp/`, retain detailed logs for failures,
+  and avoid persisting duplicate or empty success artifacts.
+- Never create ad-hoc research roots such as `.research/clean-run` to separate
+  Loop invocations. Reuse the configured task root; the Harness allocates
+  `runs/001`, `runs/002`, and subsequent Run directories automatically.
+- Emit concise stage events to stdout and `.tmp/runs/<run>/events.jsonl` while a
+  Loop is active so an external Codex supervisor can observe progress without
+  requiring permanent successful-session traces.
 - Do not turn the harness into an automatic deployment or live-trading system
   without an explicit, separately reviewed scope change.
 

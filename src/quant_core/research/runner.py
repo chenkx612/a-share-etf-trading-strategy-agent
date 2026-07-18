@@ -23,7 +23,13 @@ from quant_core.research.workspace import (
 
 CommandRunner = Callable[[Sequence[str], Path, Path, int], int]
 AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
+EventSink = Callable[..., None]
 _RESEARCH_HISTORY_LIMIT = 12
+
+
+def _emit(event_sink: EventSink | None, event: str, **details: Any) -> None:
+    if event_sink is not None:
+        event_sink(event, **details)
 
 
 def _workspace_env(cwd: Path, extra: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -55,6 +61,19 @@ def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int
         return 127
     log_path.write_text(completed.stdout, encoding="utf-8")
     return completed.returncode
+
+
+def _run_with_failure_log(
+    runner: CommandRunner,
+    command: Sequence[str],
+    cwd: Path,
+    log_path: Path,
+    timeout: int,
+) -> int:
+    exit_code = runner(command, cwd, log_path, timeout)
+    if exit_code == 0:
+        log_path.unlink(missing_ok=True)
+    return exit_code
 
 
 def _run_opencode_with_permissions(
@@ -325,7 +344,11 @@ def _scalar_metrics(value: object) -> dict[str, Any]:
     }
 
 
-def _load_research_history(experiments: Path) -> list[dict[str, Any]]:
+def _load_research_history(
+    experiments: Path,
+    *,
+    run_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Build a compact history without exposing exact gate metrics to the research agent."""
     history: list[dict[str, Any]] = []
     if not experiments.exists():
@@ -346,6 +369,8 @@ def _load_research_history(experiments: Path) -> list[dict[str, Any]]:
             "decision": decision.get("decision"),
             "feedback": result.get("feedback"),
         }
+        if run_id is not None:
+            entry["run_id"] = run_id
         reasons = decision.get("reasons")
         if isinstance(reasons, list):
             entry["decision_reasons"] = [str(reason) for reason in reasons[:5]]
@@ -360,15 +385,25 @@ def _load_research_history(experiments: Path) -> list[dict[str, Any]]:
             })
         else:
             entry["error"] = result.get("error")
-            agent_output_path = experiment / "agent-output.json"
-            try:
-                agent_output = json.loads(agent_output_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                agent_output = None
-            if isinstance(agent_output, dict) and agent_output.get("status") == "completed":
-                for key in ("hypothesis", "attempts", "development_effect", "candidate"):
-                    entry[key] = agent_output.get(key)
+            for key in ("hypothesis", "attempts", "development_effect", "candidate"):
+                if result.get(key) is not None:
+                    entry[key] = result.get(key)
         history.append(entry)
+    return history[-_RESEARCH_HISTORY_LIMIT:]
+
+
+def _load_managed_history(manager: ResearchWorkspace) -> list[dict[str, Any]]:
+    if manager.run_number is None:
+        return _load_research_history(manager.rounds)
+    history: list[dict[str, Any]] = []
+    legacy = manager.legacy_experiments
+    if legacy.exists():
+        history.extend(_load_research_history(legacy))
+    for run_number in manager.run_numbers():
+        if run_number > manager.run_number:
+            break
+        run = manager.for_run(run_number)
+        history.extend(_load_research_history(run.rounds, run_id=run.run_id))
     return history[-_RESEARCH_HISTORY_LIMIT:]
 
 
@@ -382,10 +417,34 @@ def _fill_previous_feedback(
     previous_id = research_history[-1].get("experiment_id")
     if not isinstance(previous_id, str):
         return
-    result_path = manager.experiments / previous_id / "result.json"
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    previous_run = research_history[-1].get("run_id")
+    if (
+        manager.run_number is not None
+        and isinstance(previous_run, str)
+        and previous_run.isdigit()
+    ):
+        roots = [manager.for_run(int(previous_run)).rounds]
+    else:
+        roots = [manager.rounds]
+    if manager.run_number is not None and not isinstance(previous_run, str):
+        roots.extend(
+            manager.for_run(number).rounds
+            for number in reversed(manager.run_numbers())
+            if number < manager.run_number
+        )
+        roots.append(manager.legacy_experiments)
+    result_path: Path | None = None
+    result: dict[str, Any] | None = None
+    for root in roots:
+        candidate = root / previous_id / "result.json"
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        result_path = candidate
+        result = value
+        break
+    if result_path is None or result is None:
         return
     if isinstance(result.get("feedback"), str) and result["feedback"].strip():
         return
@@ -426,9 +485,25 @@ def _parse_opencode_output(log_path: Path) -> dict[str, Any] | None:
     return result
 
 
-def _write_failed(output_dir: Path, experiment_id: str, error: str) -> Path:
+def _write_failed(
+    output_dir: Path,
+    experiment_id: str,
+    error: str,
+    agent_output: Mapping[str, Any] | None = None,
+) -> Path:
     result_path = output_dir / "result.json"
     payload = {"experiment_id": experiment_id, "status": "failed", "error": error}
+    if agent_output is not None:
+        for key in (
+            "previous_feedback",
+            "hypothesis",
+            "attempts",
+            "development_effect",
+            "candidate",
+        ):
+            value = agent_output.get(key)
+            if isinstance(value, str):
+                payload[key] = value
     ExperimentResult.from_mapping(payload)
     write_json_atomic(result_path, payload)
     return result_path
@@ -445,6 +520,8 @@ def run_once(
     has_champion: bool | None = None,
     command_runner: CommandRunner = _run_command,
     opencode_runner: AgentRunner = _run_opencode,
+    event_sink: EventSink | None = None,
+    round_id: str | None = None,
 ) -> Path:
     task = ResearchTask.load(task_path)
     root = Path(workspace).resolve()
@@ -452,7 +529,6 @@ def run_once(
         raise FileNotFoundError(f"Workspace does not exist: {root}")
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    agent_output_path = out / "agent-output.json"
 
     raw = task.raw
     fixed = raw["evaluation"]["fixed"]
@@ -479,6 +555,8 @@ def run_once(
 
     before = _snapshot(root, out)
     events_path = out / "opencode-events.jsonl"
+    event_details = {"round": round_id} if round_id is not None else {}
+    _emit(event_sink, "agent_started", message="agent started", **event_details)
     exit_code = opencode_runner(
         opencode_command,
         prompt,
@@ -487,12 +565,15 @@ def run_once(
         timeout,
     )
     if exit_code != 0:
+        _emit(event_sink, "agent_failed", message="agent failed", **event_details)
         reason = "OpenCode timed out" if exit_code == 124 else "OpenCode session failed"
         return _write_failed(out, experiment_id, reason)
     agent_output = _parse_opencode_output(events_path)
     if agent_output is None:
+        _emit(event_sink, "agent_failed", message="invalid agent output", **event_details)
         return _write_failed(out, experiment_id, "OpenCode produced invalid agent output")
-    write_json_atomic(agent_output_path, agent_output)
+    events_path.unlink(missing_ok=True)
+    _emit(event_sink, "agent_completed", message="agent completed", **event_details)
     if agent_output["status"] == "blocked":
         return _write_failed(out, experiment_id, f"OpenCode was blocked: {agent_output['error']}")
 
@@ -504,12 +585,31 @@ def run_once(
     forbidden = raw["scope"].get("forbidden", [])
     invalid = [path for path in changed if not _is_within(path, editable) or _is_within(path, forbidden)]
     if invalid:
-        return _write_failed(out, experiment_id, f"Changes outside editable scope: {', '.join(invalid)}")
+        return _write_failed(
+            out,
+            experiment_id,
+            f"Changes outside editable scope: {', '.join(invalid)}",
+            agent_output,
+        )
     if not changed:
-        return _write_failed(out, experiment_id, "OpenCode completed without code changes")
+        return _write_failed(
+            out,
+            experiment_id,
+            "OpenCode completed without code changes",
+            agent_output,
+        )
 
-    if command_runner(test_command, root, out / "tests.log", timeout) != 0:
-        return _write_failed(out, experiment_id, "Tests failed")
+    _emit(event_sink, "tests_started", message="tests started", **event_details)
+    if _run_with_failure_log(
+        command_runner,
+        test_command,
+        root,
+        out / "tests.log",
+        timeout,
+    ) != 0:
+        _emit(event_sink, "tests_failed", message="tests failed", **event_details)
+        return _write_failed(out, experiment_id, "Tests failed", agent_output)
+    _emit(event_sink, "tests_passed", message="tests passed", **event_details)
     metrics: dict[str, Any] = {}
     for label in ("development", "gate"):
         evaluation_root = root
@@ -519,19 +619,44 @@ def run_once(
                 copy_runtime_inputs(Path(gate_runtime), root)
         values = _values(task, fixed[label], f"{experiment_id}-{label}", evaluation_root)
         command = _format_command(raw["commands"]["backtest"], values)
-        if command_runner(command, evaluation_root, out / f"{label}.log", timeout) != 0:
-            return _write_failed(out, experiment_id, f"{label} backtest failed")
+        _emit(
+            event_sink,
+            f"{label}_started",
+            message=f"{label} backtest started",
+            **event_details,
+        )
+        if _run_with_failure_log(
+            command_runner,
+            command,
+            evaluation_root,
+            out / f"{label}.log",
+            timeout,
+        ) != 0:
+            _emit(
+                event_sink,
+                f"{label}_failed",
+                message=f"{label} backtest failed",
+                **event_details,
+            )
+            return _write_failed(out, experiment_id, f"{label} backtest failed", agent_output)
         metrics_path = evaluation_root / str(raw["commands"]["metrics_path"]).format_map(values)
         if not metrics_path.exists():
-            return _write_failed(out, experiment_id, f"Missing {label} metrics")
+            return _write_failed(out, experiment_id, f"Missing {label} metrics", agent_output)
         try:
             metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return _write_failed(out, experiment_id, f"Invalid {label} metrics")
+            return _write_failed(out, experiment_id, f"Invalid {label} metrics", agent_output)
+        _emit(
+            event_sink,
+            f"{label}_completed",
+            message=f"{label} backtest completed",
+            **event_details,
+        )
 
     payload = {
         "experiment_id": experiment_id,
         "status": "completed",
+        "previous_feedback": agent_output["previous_feedback"],
         "hypothesis": agent_output["hypothesis"],
         "attempts": agent_output["attempts"],
         "development_effect": agent_output["development_effect"],
@@ -565,7 +690,13 @@ def _evaluate_existing(
             workspace,
         )
         command = _format_command(raw["commands"]["backtest"], values)
-        if command_runner(command, workspace, output_dir / f"champion-{label}.log", timeout) != 0:
+        if _run_with_failure_log(
+            command_runner,
+            command,
+            workspace,
+            output_dir / f"champion-{label}.log",
+            timeout,
+        ) != 0:
             raise RuntimeError(f"champion {label} backtest failed")
         metrics_path = workspace / str(raw["commands"]["metrics_path"]).format_map(values)
         try:
@@ -693,12 +824,14 @@ def _metrics_key(task: ResearchTask) -> str:
 
 def run_managed_once(
     task_path: str | Path,
-    experiment_id: str,
+    round_id: str,
     *,
+    run_number: int,
     workspace: str | Path = ".",
     research_root: str | Path = ".research",
     command_runner: CommandRunner = _run_command,
     opencode_runner: AgentRunner = _run_opencode,
+    event_sink: EventSink | None = None,
 ) -> Path:
     """Run one isolated candidate and promote it only when it beats the champion."""
     task_file = Path(task_path).resolve()
@@ -707,22 +840,34 @@ def run_managed_once(
     managed_root = Path(research_root)
     if not managed_root.is_absolute():
         managed_root = source / managed_root
-    manager = ResearchWorkspace(source, managed_root, task.task_id)
     development_end = task.raw["evaluation"]["fixed"]["development"]["end"]
+    if (
+        not round_id.isdigit()
+        or int(round_id) < 1
+        or round_id != f"{int(round_id):03d}"
+    ):
+        raise ValueError("round id must be a zero-padded positive number")
+    manager = ResearchWorkspace(
+        source,
+        managed_root,
+        task.task_id,
+        run_number=run_number,
+    )
     candidate, experiment, state = manager.create_candidate(
-        experiment_id,
+        round_id,
         date.fromisoformat(development_end),
         task.baseline_mode,
         task.baseline_exclude,
     )
     has_champion = isinstance(state.get("champion_commit"), str)
-    research_history = _load_research_history(manager.experiments)
+    research_history = _load_managed_history(manager)
     if source in task_file.parents:
         candidate_task = candidate / task_file.relative_to(source)
         candidate_task.unlink(missing_ok=True)
+    execution_id = f"{manager.run_id}-{round_id}"
     result_path = run_once(
         task_file,
-        experiment_id,
+        execution_id,
         experiment,
         workspace=candidate,
         gate_runtime=manager.evaluation_runtime,
@@ -730,17 +875,28 @@ def run_managed_once(
         has_champion=has_champion,
         command_runner=command_runner,
         opencode_runner=opencode_runner,
+        event_sink=event_sink,
+        round_id=round_id,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    agent_output_path = experiment / "agent-output.json"
-    if agent_output_path.exists():
-        agent_output = json.loads(agent_output_path.read_text(encoding="utf-8"))
-        _fill_previous_feedback(manager, research_history, str(agent_output["previous_feedback"]))
+    result["experiment_id"] = f"{manager.run_id}/{round_id}"
+    result["run_number"] = run_number
+    result["round_number"] = int(round_id)
+    write_json_atomic(result_path, result)
+    previous_feedback = result.pop("previous_feedback", None)
+    if isinstance(previous_feedback, str):
+        _fill_previous_feedback(manager, research_history, previous_feedback)
+        write_json_atomic(result_path, result)
     decision_path = experiment / "decision.json"
+    record_id = str(result["experiment_id"])
     if result.get("status") != "completed":
-        decision = {"experiment_id": experiment_id, "decision": "failed", "reasons": [result.get("error")]}
+        decision = {
+            "experiment_id": result["experiment_id"],
+            "decision": "failed",
+            "reasons": [result.get("error")],
+        }
         write_json_atomic(decision_path, decision)
-        manager.reject(candidate, state, experiment_id)
+        manager.reject(candidate, state, record_id)
         return result_path
 
     manager.write_candidate_patch(
@@ -756,33 +912,37 @@ def run_managed_once(
         else None
     )
     if has_champion and not isinstance(champion_metrics, dict):
-        evaluator = manager.create_champion_evaluator(experiment_id, state)
+        evaluator = manager.create_champion_evaluator(round_id, state)
         try:
             champion_metrics = _evaluate_existing(
                 task,
                 evaluator,
                 manager.evaluation_runtime,
-                experiment_id,
+                round_id,
                 experiment,
                 command_runner,
             )
         except RuntimeError as exc:
-            decision = {"experiment_id": experiment_id, "decision": "failed", "reasons": [str(exc)]}
+            decision = {
+                "experiment_id": result["experiment_id"],
+                "decision": "failed",
+                "reasons": [str(exc)],
+            }
             write_json_atomic(decision_path, decision)
-            manager.reject(candidate, state, experiment_id)
-            failed_path = _write_failed(experiment, experiment_id, str(exc))
+            manager.reject(candidate, state, record_id)
+            failed_path = _write_failed(experiment, record_id, str(exc))
             return failed_path
         finally:
             manager.remove_evaluator(evaluator)
 
-    decision = {"experiment_id": experiment_id, **_decide(task, champion_metrics, result["metrics"])}
+    decision = {"experiment_id": result["experiment_id"], **_decide(task, champion_metrics, result["metrics"])}
     write_json_atomic(decision_path, decision)
     if decision["decision"] == "accepted":
         state["champion_metrics_key"] = metrics_key
         manager.promote(
             candidate,
             state,
-            experiment_id,
+            record_id,
             result["metrics"],
             task.raw["scope"]["editable"],
         )
@@ -790,5 +950,5 @@ def run_managed_once(
         if has_champion:
             state["champion_metrics"] = champion_metrics
             state["champion_metrics_key"] = metrics_key
-        manager.reject(candidate, state, experiment_id)
+        manager.reject(candidate, state, record_id)
     return result_path

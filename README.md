@@ -48,7 +48,7 @@ Harness 遵循以下核心原则：
 - **确定性评测**：策略选择、回测指标、硬约束和晋级规则由固定 Python 代码执行。
 - **数据隔离**：研发阶段只使用 Development 数据；精确 Gate 指标不会反馈给后续研发轮次。
 - **候选隔离**：每轮候选在独立 worktree 中开发，失败或拒绝不会污染下一轮和当前工作分支。
-- **可恢复运行**：循环状态、累计时间、连续失败、当前实验和停止原因都会持久化。
+- **可恢复运行**：Run 状态、累计时间、连续失败、当前 Round 和停止原因都会持久化。
 - **证据可审计**：每轮保存输入、代码差异、日志、指标、决策及其父 Champion。
 - **受控自动化**：循环在达到目标、轮数、时长或连续失败预算时停止，并生成终局复盘。
 
@@ -71,7 +71,18 @@ python3 -m quant_core.cli research loop \
 
 研究任务在 `task.toml` 中声明目标、数据、Development/Gate 区间、允许修改的范围、
 固定评测命令、硬约束、Champion 改善要求、模型配置和运行预算。Harness 会在
-`.research/<task-id>/` 下保存状态、实验记录、候选补丁、决策和最终报告。
+`.research/<task-id>/champion.json` 保存跨 Run 的 Champion；每次 Loop 自动分配
+`runs/001`、`runs/002` 等独立目录，轮次写入 `rounds/001`。历史 Run 的状态和报告
+不会被后续 Loop 覆盖。
+成功轮次默认不保留重复的 Agent 输出、原始事件流和成功命令日志；失败轮次仍保留
+诊断材料。
+
+运行期间，Harness 会把阶段事件实时打印到控制台，并同步写入
+`.tmp/runs/<run>/events.jsonl`，方便启动 Loop 的 Codex 或人工监控 Agent、测试、
+Development、Gate 和决策进度。Run 正常结束后删除这份临时事件流。
+
+重复运行时继续使用同一个 `--research-root`；不要创建 `.research/clean-run` 一类临时根目录。
+Harness 会自动创建下一个编号 Run。
 
 调试时可以只运行一轮：
 
@@ -81,12 +92,6 @@ python3 -m quant_core.cli research run-once \
   --task path/to/task.toml \
   --experiment-id experiment-001 \
   --output path/to/experiment
-
-# 运行一次完整的隔离、评测和 Champion 决策
-python3 -m quant_core.cli research run-managed \
-  --task path/to/task.toml \
-  --experiment-id experiment-001 \
-  --research-root .research
 ```
 
 循环结束后会自动生成复盘，也可以单独补生成或重试：
@@ -94,8 +99,22 @@ python3 -m quant_core.cli research run-managed \
 ```bash
 python3 -m quant_core.cli research report \
   --task path/to/task.toml \
+  --run 1 \
   --research-root .research
 ```
+
+省略 `--run` 时默认重建最近一次 Run 的报告。
+
+清理中断残留、Development 缓存和旧版冗余日志：
+
+```bash
+python3 -m quant_core.cli research clean \
+  --task-id <task-id> \
+  --research-root .research
+```
+
+清理命令不会删除 `result.json`、`decision.json`、候选 patch、Champion、
+Gate 数据快照或最终报告，也不会在 Loop 正在运行时执行。
 
 ## Quant framework
 
@@ -123,7 +142,7 @@ src/quant_core/backtest/  # Fixed simulation engine and metrics
 tests/                    # Framework and harness tests
 docs/                     # Framework engineering documentation
 .agents/skills/           # Task knowledge, prompts, scripts, assets, and outputs
-.research/<task-id>/      # Managed loop state and auditable experiment evidence
+.research/<task-id>/      # Champion, numbered Run history, cache, and temp observation
 ```
 
 运行命令默认把本地日线缓存写到当前工作目录下的 `data/etf_daily.*`，把因子、回测和推荐等中间结果写到 `outputs/`。股票池不再保存在 `data/` 下；调用框架 CLI 时通过 `--universe path/to/universe.csv` 显式传入。

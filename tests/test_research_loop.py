@@ -95,9 +95,20 @@ def _task(
 def _runner(decisions: list[str]):
     remaining = iter(decisions)
 
-    def run(task_path: Path, experiment_id: str, *, workspace: Path, research_root: Path) -> Path:
+    def run(
+        task_path: Path,
+        experiment_id: str,
+        *,
+        workspace: Path,
+        research_root: Path,
+        run_number: int,
+        event_sink,
+    ) -> Path:
         decision = next(remaining)
-        experiment = research_root / "loop-test" / "experiments" / experiment_id
+        experiment = (
+            research_root / "loop-test" / "runs" / f"{run_number:03d}"
+            / "rounds" / experiment_id
+        )
         experiment.mkdir()
         result_path = experiment / "result.json"
         result_path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
@@ -111,15 +122,16 @@ def _runner(decisions: list[str]):
 
 
 def _reporter(task_path: Path, manager: ResearchWorkspace, state: dict[str, object]) -> Path:
-    report = manager.root / "loop-report.md"
+    report = manager.report_path
     report.write_text("# Test report\n", encoding="utf-8")
     return report
 
 
-def _running_state(task: Path, experiment_id: str = "loop-000001") -> dict[str, object]:
+def _running_state(task: Path, experiment_id: str = "001") -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "task_id": "loop-test",
+        "run_number": 1,
         "task_fingerprint": hashlib.sha256(task.read_bytes()).hexdigest(),
         "status": "running",
         "started_at": "2026-01-01T00:00:00+00:00",
@@ -130,14 +142,17 @@ def _running_state(task: Path, experiment_id: str = "loop-000001") -> dict[str, 
         "rejected": 0,
         "failed": 0,
         "consecutive_failures": 0,
-        "experiment_ids": [],
-        "current_experiment_id": experiment_id,
-        "last_experiment_id": None,
+        "round_ids": [],
+        "current_round": experiment_id,
+        "last_round": None,
         "stop_reason": None,
     }
 
 
-def test_loop_stops_after_consecutive_failed_rounds(tmp_path: Path) -> None:
+def test_loop_stops_after_consecutive_failed_rounds(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     task = _task(tmp_path, max_failures=2)
 
     state_path = run_loop(
@@ -152,13 +167,20 @@ def test_loop_stops_after_consecutive_failed_rounds(tmp_path: Path) -> None:
     assert state["rounds_completed"] == 3
     assert state["rejected"] == 1
     assert state["failed"] == 2
-    assert state["experiment_ids"] == [
-        "loop-000001",
-        "loop-000002",
-        "loop-000003",
+    assert state["round_ids"] == [
+        "001",
+        "002",
+        "003",
     ]
     assert state["report_status"] == "completed"
-    assert state["report_path"] == "loop-report.md"
+    assert state["report_path"] == "report.md"
+    assert state_path == tmp_path / ".research/loop-test/runs/001/state.json"
+    assert (state_path.parent / "report.md").exists()
+    assert not (tmp_path / ".research/loop-test/.tmp/runs/001/events.jsonl").exists()
+    output = capsys.readouterr().out
+    assert "[001] started" in output
+    assert "[001/001] candidate started" in output
+    assert "[001/003] completed: failed" in output
 
 
 def test_rejected_round_breaks_a_failure_streak(tmp_path: Path) -> None:
@@ -196,12 +218,20 @@ def test_loop_does_not_start_another_round_after_time_budget(tmp_path: Path) -> 
 def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
     task = _task(tmp_path, target=1.5)
 
-    def reach_target(task_path: Path, experiment_id: str, *, workspace: Path, research_root: Path) -> Path:
-        manager = ResearchWorkspace(workspace, research_root, "loop-test")
+    def reach_target(
+        task_path: Path,
+        experiment_id: str,
+        *,
+        workspace: Path,
+        research_root: Path,
+        run_number: int,
+        event_sink,
+    ) -> Path:
+        manager = ResearchWorkspace(workspace, research_root, "loop-test", run_number)
         task_state = manager.load_state()
         metrics = {"gate": {"sortino": 1.5, "max_drawdown": -0.10}}
         manager.record_state(task_state, experiment_id, metrics)
-        experiment = manager.experiments / experiment_id
+        experiment = manager.rounds / experiment_id
         experiment.mkdir()
         result_path = experiment / "result.json"
         result_path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
@@ -225,16 +255,18 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
 
 def test_loop_recovers_a_completed_unrecorded_round(tmp_path: Path) -> None:
     task = _task(tmp_path, max_rounds=1)
-    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
-    task_state = manager.initialize(date(2021, 12, 31))
-    manager.record_state(task_state, "loop-000001")
-    experiment = manager.experiments / "loop-000001"
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    task_state = base.initialize(date(2021, 12, 31))
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
+    manager.record_state(task_state, "001/001")
+    experiment = manager.rounds / "001"
     experiment.mkdir()
     (experiment / "decision.json").write_text(json.dumps({
-        "experiment_id": "loop-000001",
+        "experiment_id": "001/001",
         "decision": "accepted",
     }), encoding="utf-8")
-    loop_state = manager.root / "loop-state.json"
+    loop_state = manager.loop_state_path
     loop_state.write_text(json.dumps(_running_state(task)), encoding="utf-8")
 
     state_path = run_loop(
@@ -247,15 +279,15 @@ def test_loop_recovers_a_completed_unrecorded_round(tmp_path: Path) -> None:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["stop_reason"] == "max_rounds"
     assert state["accepted"] == 1
-    assert state["last_experiment_id"] == "loop-000001"
-    assert state["experiment_ids"] == ["loop-000001"]
+    assert state["last_round"] == "001"
+    assert state["round_ids"] == ["001"]
 
 
 def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -> None:
     task = _task(tmp_path, max_failures=1)
-    experiment = tmp_path / ".research/loop-test/experiments/loop-000001"
+    experiment = tmp_path / ".research/loop-test/runs/001/rounds/001"
     experiment.mkdir(parents=True)
-    loop_state = tmp_path / ".research/loop-test/loop-state.json"
+    loop_state = tmp_path / ".research/loop-test/runs/001/state.json"
     loop_state.write_text(json.dumps(_running_state(task)), encoding="utf-8")
 
     state_path = run_loop(
@@ -276,13 +308,13 @@ def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -
 
 def test_loop_does_not_trust_a_decision_that_was_not_applied(tmp_path: Path) -> None:
     task = _task(tmp_path, max_failures=1)
-    experiment = tmp_path / ".research/loop-test/experiments/loop-000001"
+    experiment = tmp_path / ".research/loop-test/runs/001/rounds/001"
     experiment.mkdir(parents=True)
     (experiment / "decision.json").write_text(json.dumps({
-        "experiment_id": "loop-000001",
+        "experiment_id": "001/001",
         "decision": "accepted",
     }), encoding="utf-8")
-    loop_state = tmp_path / ".research/loop-test/loop-state.json"
+    loop_state = tmp_path / ".research/loop-test/runs/001/state.json"
     loop_state.write_text(json.dumps(_running_state(task)), encoding="utf-8")
 
     state_path = run_loop(
@@ -301,9 +333,17 @@ def test_loop_does_not_trust_a_decision_that_was_not_applied(tmp_path: Path) -> 
 def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> None:
     task = _task(tmp_path, max_failures=1)
 
-    def interrupt(task_path: Path, experiment_id: str, *, workspace: Path, research_root: Path) -> Path:
-        experiment = research_root / "loop-test" / "experiments" / experiment_id
-        experiment.mkdir()
+    def interrupt(
+        task_path: Path,
+        experiment_id: str,
+        *,
+        workspace: Path,
+        research_root: Path,
+        run_number: int,
+        event_sink,
+    ) -> Path:
+        manager = ResearchWorkspace(workspace, research_root, "loop-test", run_number)
+        manager.create_candidate(experiment_id, date(2021, 12, 31))
         raise KeyboardInterrupt
 
     interrupted_path = run_loop(
@@ -314,6 +354,9 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
     )
     interrupted = json.loads(interrupted_path.read_text(encoding="utf-8"))
     assert interrupted["status"] == "interrupted"
+    assert not (
+        tmp_path / ".research/loop-test/.tmp/worktrees/001/candidates/001"
+    ).exists()
 
     resumed_path = run_loop(
         task,
@@ -331,7 +374,15 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
     task = _task(tmp_path)
     times = iter([10.0, 130.0])
 
-    def fail(task_path: Path, experiment_id: str, *, workspace: Path, research_root: Path) -> Path:
+    def fail(
+        task_path: Path,
+        experiment_id: str,
+        *,
+        workspace: Path,
+        research_root: Path,
+        run_number: int,
+        event_sink,
+    ) -> Path:
         raise RuntimeError("runner bug")
 
     with pytest.raises(RuntimeError, match="runner bug"):
@@ -344,7 +395,7 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
         )
 
     state = json.loads(
-        (tmp_path / ".research/loop-test/loop-state.json").read_text(encoding="utf-8")
+        (tmp_path / ".research/loop-test/runs/001/state.json").read_text(encoding="utf-8")
     )
     assert state["status"] == "interrupted"
     assert state["stop_reason"] == "runner_error"
@@ -385,9 +436,9 @@ def test_new_loop_on_same_root_tracks_only_its_own_experiments(tmp_path: Path) -
         manager: ResearchWorkspace,
         state: dict[str, object],
     ) -> Path:
-        experiment_ids = state["experiment_ids"]
-        assert isinstance(experiment_ids, list)
-        reported_experiments.append([str(experiment_id) for experiment_id in experiment_ids])
+        round_ids = state["round_ids"]
+        assert isinstance(round_ids, list)
+        reported_experiments.append([str(round_id) for round_id in round_ids])
         return _reporter(task_path, manager, state)
 
     run_loop(
@@ -404,5 +455,8 @@ def test_new_loop_on_same_root_tracks_only_its_own_experiments(tmp_path: Path) -
     )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert reported_experiments == [["loop-000001"], ["loop-000002"]]
-    assert state["experiment_ids"] == ["loop-000002"]
+    assert reported_experiments == [["001"], ["001"]]
+    assert state["round_ids"] == ["001"]
+    assert state_path == tmp_path / ".research/loop-test/runs/002/state.json"
+    assert (tmp_path / ".research/loop-test/runs/001/report.md").exists()
+    assert (tmp_path / ".research/loop-test/runs/002/report.md").exists()
