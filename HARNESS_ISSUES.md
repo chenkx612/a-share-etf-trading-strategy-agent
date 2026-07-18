@@ -13,13 +13,11 @@
 
 ## 当前结论
 
-当前仍有 3 个 P0 待解决问题，因此按本文件定义，**不应启动新的 Loop Run**：
+当前仍有 1 个 P0 待解决问题，因此按本文件定义，**不应启动新的 Loop Run**：
 
 | 优先级 | 编号 | 问题 |
 | --- | --- | --- |
-| P0 | RH-002 | Development 搜索预算和单轮假设边界仍由 Prompt 软约束 |
 | P0 | RH-010 | 候选 Agent 可通过 Bash 访问 Research Root |
-| P0 | RH-014 | 成功工件压缩会删除搜索预算与假设漂移证据 |
 | P1 | RH-013 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
 | P2 | RH-004 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | RH-006 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -27,32 +25,6 @@
 ## 一、待解决问题
 
 ### P0：新 Loop 前必须解决
-
-#### RH-002：Development 搜索预算和假设边界未由 Harness 控制
-
-- **状态**：open
-- **发现日期**：2026-07-18
-- **问题与影响**：Agent 曾在一批 6 组正式配置后继续执行 6 组“非正式探针”，随后再开始下一批配置；
-  最终 `result.json` 没有完整披露这些额外评估。另一个 Round 在首个信号表现不佳后，将不同特征重新
-  命名为同一机制家族继续搜索。真实搜索超过 Prompt 声明的单轮预算，且存在看到结果后改写假设边界的
-  Development 过拟合风险。
-- **触发条件**：Agent 可以直接运行 Bash、Python 和回测模块；预算与“单轮一个机制”只写在 Prompt。
-- **根因**：外层 Harness 管理 Run 和 Round 预算，却不拥有 Round 内每次 Development evaluation；
-  模型可以把回测称为诊断、复核或非正式探针来绕过软约束。
-- **已做缓解**：Prompt 要求每轮一个可证伪机制、最多 3 次实现、每次最多 6 组配置，总计最多
-  18 次评估，并要求达到门槛后立即停止。真实运行证明该措施不能作为最终控制。
-- **必须完成的方案**：
-  - 提供唯一受控的 Development evaluator，由 Harness 签发 evaluation ID 并硬计数。
-  - 每次评估原子记录机制 ID、参数指纹、命令、指标、开始/结束时间和剩余预算。
-  - 第一次评估前冻结结构化 `hypothesis`、`signal_family`、允许特征和参数范围。
-  - 达到预算或偏离冻结机制时拒绝执行，并将违规写入永久 Round 结果。
-  - 禁止候选绕过受控入口直接运行完整 Development 回测。
-- **验收标准**：
-  - fake Agent 尝试第 19 次候选评估时被 Harness 拒绝。
-  - 将额外评估描述为诊断或复核不会绕过计数。
-  - 更换未声明的特征族会被拒绝并留下永久证据。
-  - 正常 Round 的 evaluation manifest 能完整重放所有尝试。
-- **关联代码**：`src/quant_core/research/runner.py::_prompt`
 
 #### RH-010：候选 Agent 可通过 Bash 访问 Research Root
 
@@ -76,29 +48,6 @@
 - **不可接受的临时方案**：只增加 Prompt 禁止语句、字符串路径黑名单或依赖
   `external_directory=deny`。
 - **关联代码**：`src/quant_core/research/runner.py::_run_opencode`
-
-#### RH-014：成功工件压缩会删除搜索预算与假设漂移证据
-
-- **状态**：open
-- **发现日期**：2026-07-18
-- **问题与影响**：实时事件显示 Agent 执行了永久 `result.json` 未披露的额外 Development 探针，
-  但成功 Agent 输出解析后会删除 OpenCode 事件，Loop 结束时还会删除成功日志。若没有外部实时监督，
-  无法从耐久工件重建真实评估次数、参数集合或假设切换过程。
-- **触发条件**：成功轮依赖 Agent 自己总结尝试，随后执行工件压缩。
-- **根因**：压缩逻辑假设结构化 Agent 总结完整可信，但 Development 调用和假设边界尚未由 Harness
-  记录。
-- **必须完成的方案**：
-  - 依赖 RH-002 的受控 evaluator，先持久化不可变 evaluation manifest，再允许压缩。
-  - manifest 至少包含 evaluation ID、机制 ID、参数指纹、命令、指标、时间和预算计数。
-  - 若发现超限、越界或总结与 manifest 不一致，Round 标为失败并保留原始事件。
-  - 只有 manifest 完整且校验通过的成功轮才能删除重复日志。
-- **验收标准**：
-  - fake Agent 执行未披露评估时，manifest 仍完整记录且违规可见。
-  - 有违规的 Round 不删除原始事件。
-  - 正常成功轮压缩后仍可从 manifest 重建全部 Development 尝试。
-- **依赖关系**：应与 RH-002 同时设计和交付，避免实现两套评估审计机制。
-- **关联代码**：`src/quant_core/research/runner.py::run_once`、
-  `src/quant_core/research/workspace.py::compact_artifacts`
 
 ### P1：推荐解决，可带风险继续
 
@@ -156,6 +105,46 @@
 ## 二、已解决问题
 
 ### P0：曾阻断可信研发
+
+#### RH-002：Development 搜索预算曾依赖 Prompt 次数限制
+
+- **状态**：resolved
+- **发现日期**：2026-07-18
+- **问题与影响**：Agent 曾超过 Prompt 声明的实现和参数组数，并把部分回测称为诊断或复核；当时
+  Harness 无法强制或核验这些次数。
+- **设计决策**：Harness 采用协作型 Agent 信任模型：信任 Agent 不会主动攻击或逃逸系统边界，但
+  防范超时、崩溃、错误输出和普通残留子进程。研究自由度不再以实现次数、参数组数、信号族冻结或逐次
+  evaluation manifest 约束；单轮研发时间是唯一的搜索硬限制。
+- **修正**：
+  - 新增 `budget.round_minutes`；Harness 使用单调时钟执行硬截止，Prompt 提供绝对截止时间，动态
+    Round 时钟提供剩余秒数以及 `research`、`converge`、`finalize`、`submit_now` 阶段。
+  - 15、5、1 分钟节点写入活动事件；超时会终止 Agent 进程组并永久记录
+    `result.json.round_timing`。
+  - Agent 即使在截止后返回成功，Harness 仍将 Round 标为失败，且不再执行测试、Development、Gate
+    或晋级。
+- **验证**：测试覆盖动态时钟阶段、普通子进程随超时终止、超时返回和截止后成功返回；后两者均不会
+  进入固定评测。
+- **信任边界**：不防御 Agent 主动通过 `setsid`、容器逃逸或其他系统权限规避进程组。若未来改为
+  对抗型 Agent，容器或操作系统沙箱应作为独立安全项目实施，而不是恢复评估次数限制。
+- **关联代码/测试**：`src/quant_core/research/runner.py::_RoundClock`、
+  `src/quant_core/research/runner.py::run_once`、`tests/test_research_runner.py`
+
+#### RH-014：成功工件压缩曾被要求保留全部搜索轨迹
+
+- **状态**：resolved
+- **发现日期**：2026-07-18
+- **问题与影响**：旧设计把每次 Development 探针、参数集合和假设切换都视为晋级所需的永久证据，
+  因而认为成功日志压缩会破坏审计。
+- **设计决策**：随 RH-002 采用协作型 Agent 和单轮时间硬预算后，中间搜索路径属于研究员工作过程，
+  不再是评测或晋级契约。耐久证据聚焦冻结输入、最终代码差异、固定 Development/Gate 指标、Decision、
+  Parent Champion 和 Round 时间。
+- **修正**：`result.json.round_timing` 永久保留时间边界；成功轮可以继续删除重复事件和日志，失败及
+  超时原因仍写入结构化结果。无需 evaluation manifest，也不再比较 Agent 总结与全部中间尝试。
+- **验证**：Round 时间契约有类型校验和回归测试；成功工件压缩保留结构化 `result.json`。
+- **遗留风险**：压缩后不能复盘全部探索细节，这是明确接受的可观测性取舍，不影响固定 Gate 和
+  Harness 晋级结论。
+- **关联代码/测试**：`src/quant_core/research/runner.py::run_once`、
+  `src/quant_core/research/workspace.py::compact_artifacts`、`tests/test_research_workspace.py`
 
 #### RH-001：候选 Worktree 导入主工作区代码
 

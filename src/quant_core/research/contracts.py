@@ -51,6 +51,13 @@ class ResearchTask:
             value = budget.get(key)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"task.budget.{key} must be a positive integer")
+        round_minutes = budget.get("round_minutes")
+        if round_minutes is not None and (
+            not isinstance(round_minutes, int)
+            or isinstance(round_minutes, bool)
+            or round_minutes < 1
+        ):
+            raise ValueError("task.budget.round_minutes must be a positive integer when present")
 
         opencode = _required(data, "opencode", dict, "task")
         model = _required(opencode, "model", str, "task.opencode")
@@ -263,6 +270,35 @@ class ExperimentResult:
         feedback = data.get("feedback")
         if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
             raise ValueError("result.feedback must be a non-empty str when present")
+        round_timing = data.get("round_timing")
+        if round_timing is not None:
+            if not isinstance(round_timing, dict) or set(round_timing) != {
+                "started_at",
+                "deadline",
+                "finished_at",
+                "timeout_seconds",
+                "duration_seconds",
+            }:
+                raise ValueError("result.round_timing has invalid fields")
+            for key in ("started_at", "deadline", "finished_at"):
+                _required(round_timing, key, str, "result.round_timing")
+            timeout_seconds = round_timing["timeout_seconds"]
+            if (
+                not isinstance(timeout_seconds, int)
+                or isinstance(timeout_seconds, bool)
+                or timeout_seconds < 1
+            ):
+                raise ValueError("result.round_timing.timeout_seconds must be a positive integer")
+            duration_seconds = round_timing["duration_seconds"]
+            if (
+                not isinstance(duration_seconds, (int, float))
+                or isinstance(duration_seconds, bool)
+                or not math.isfinite(duration_seconds)
+                or duration_seconds < 0
+            ):
+                raise ValueError(
+                    "result.round_timing.duration_seconds must be finite and non-negative"
+                )
         if status == "completed":
             _required(data, "hypothesis", str, "result")
             _required(data, "attempts", str, "result")

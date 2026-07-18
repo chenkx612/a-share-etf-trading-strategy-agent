@@ -7,8 +7,11 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable, Sequence
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,6 +28,101 @@ CommandRunner = Callable[[Sequence[str], Path, Path, int], int]
 AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 EventSink = Callable[..., None]
 _RESEARCH_HISTORY_LIMIT = 12
+_ROUND_CLOCK_FILE = ".quant-research-round.json"
+
+
+@dataclass
+class _RoundClock:
+    path: Path
+    timeout_seconds: int
+    event_sink: EventSink | None
+    event_details: Mapping[str, Any]
+    monotonic: Callable[[], float] = time.monotonic
+
+    def __post_init__(self) -> None:
+        self.started_at = datetime.now(timezone.utc)
+        self.deadline = self.started_at + timedelta(seconds=self.timeout_seconds)
+        self._started_monotonic = self.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._warnings_emitted: set[int] = set()
+
+    @property
+    def deadline_text(self) -> str:
+        return self.deadline.isoformat()
+
+    def _remaining_seconds(self) -> int:
+        elapsed = max(0.0, self.monotonic() - self._started_monotonic)
+        return max(0, int(math.ceil(self.timeout_seconds - elapsed)))
+
+    @staticmethod
+    def _phase(remaining: int) -> str:
+        if remaining <= 60:
+            return "submit_now"
+        if remaining <= 5 * 60:
+            return "finalize"
+        if remaining <= 15 * 60:
+            return "converge"
+        return "research"
+
+    def _write_status(self) -> None:
+        remaining = self._remaining_seconds()
+        write_json_atomic(self.path, {
+            "schema_version": 1,
+            "started_at": self.started_at.isoformat(),
+            "deadline": self.deadline_text,
+            "timeout_seconds": self.timeout_seconds,
+            "remaining_seconds": remaining,
+            "phase": self._phase(remaining),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        for threshold in (15, 5, 1):
+            if (
+                threshold not in self._warnings_emitted
+                and self.timeout_seconds > threshold * 60
+                and remaining <= threshold * 60
+            ):
+                self._warnings_emitted.add(threshold)
+                _emit(
+                    self.event_sink,
+                    "round_time_warning",
+                    remaining_minutes=threshold,
+                    message=f"{threshold} minutes remaining",
+                    **self.event_details,
+                )
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._write_status()
+            remaining = self._remaining_seconds()
+            if remaining == 0:
+                return
+            self._stop.wait(min(5.0, float(remaining)))
+
+    def start(self) -> None:
+        self._write_status()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="quant-research-round-clock",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, finished_monotonic: float | None = None) -> dict[str, Any]:
+        finished = self.monotonic() if finished_monotonic is None else finished_monotonic
+        duration = max(0.0, finished - self._started_monotonic)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        self.path.unlink(missing_ok=True)
+        return {
+            "started_at": self.started_at.isoformat(),
+            "deadline": self.deadline_text,
+            "finished_at": finished_at,
+            "timeout_seconds": self.timeout_seconds,
+            "duration_seconds": duration,
+        }
 
 
 def _emit(event_sink: EventSink | None, event: str, **details: Any) -> None:
@@ -242,6 +340,8 @@ def _prompt(
     test_command: Sequence[str],
     research_history: Sequence[Mapping[str, Any]],
     has_champion: bool,
+    round_deadline: str,
+    round_clock_path: str,
 ) -> str:
     raw = task.raw
     evaluation = raw["evaluation"]
@@ -274,13 +374,18 @@ def _prompt(
         "Treat accepted/rejected as evidence about a specific implementation, not proof that an entire idea is true or false.",
         "A failed round is inconclusive. Do not repeat a rejected implementation unchanged.",
         f"Prior research history (sanitized; exact gate metrics are intentionally omitted): {history}",
-        "Propose one falsifiable hypothesis and keep every development variant within that mechanism.",
-        "Use at most 3 implementation attempts in this round and test at most 6 parameter "
-        "configurations per attempt (18 candidate evaluations total, excluding the baseline).",
-        "Do not start a new signal family or broad parameter sweep after seeing results. If the "
-        "hypothesis is exhausted, submit the best defensible variant or return blocked.",
+        "Start with one primary falsifiable hypothesis and keep the search focused. Implementation "
+        "attempt and parameter counts are heuristic guidance, not hard quotas.",
+        "Avoid broad parameter sweeps and record meaningful hypothesis revisions honestly instead "
+        "of retroactively describing a new signal family as the original mechanism.",
         "Stop development search as soon as a candidate passes the stated constraints and reaches "
         "the configured objective improvement; additional optimization is out of scope.",
+        f"Candidate research deadline (UTC): {round_deadline}. This is a Harness-enforced hard stop.",
+        f"Live Round clock: {round_clock_path}. Read it before evaluations and during finalization; "
+        "remaining_seconds and phase are refreshed by the Harness.",
+        "When the clock phase becomes converge, stop expanding the search. In finalize, preserve "
+        "the best candidate, run focused tests, and prepare the required JSON. In submit_now, "
+        "return immediately. Harness-owned validation after submission is outside this deadline.",
         "After a rejected round, prefer a materially different risk mechanism. Reuse the prior "
         "mechanism only when the history supports one specific, pre-declared corrective change; "
         "do not perform local threshold mining around the rejected candidate.",
@@ -490,9 +595,12 @@ def _write_failed(
     experiment_id: str,
     error: str,
     agent_output: Mapping[str, Any] | None = None,
+    round_timing: Mapping[str, Any] | None = None,
 ) -> Path:
     result_path = output_dir / "result.json"
     payload = {"experiment_id": experiment_id, "status": "failed", "error": error}
+    if round_timing is not None:
+        payload["round_timing"] = dict(round_timing)
     if agent_output is not None:
         for key in (
             "previous_feedback",
@@ -522,6 +630,7 @@ def run_once(
     opencode_runner: AgentRunner = _run_opencode,
     event_sink: EventSink | None = None,
     round_id: str | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Path:
     task = ResearchTask.load(task_path)
     root = Path(workspace).resolve()
@@ -536,6 +645,18 @@ def run_once(
     development_command = _format_command(raw["commands"]["backtest"], development_values)
     development_metrics_path = str(raw["commands"]["metrics_path"]).format_map(development_values)
     test_command = _format_command(raw["commands"]["test"], development_values)
+    opencode = raw["opencode"]
+    command_timeout = int(opencode["timeout_minutes"]) * 60
+    round_timeout = int(raw["budget"].get("round_minutes", opencode["timeout_minutes"])) * 60
+    before = _snapshot(root, out)
+    event_details = {"round": round_id} if round_id is not None else {}
+    round_clock = _RoundClock(
+        root / _ROUND_CLOCK_FILE,
+        round_timeout,
+        event_sink,
+        event_details,
+        monotonic,
+    )
     prompt = _prompt(
         task,
         development_command,
@@ -543,9 +664,9 @@ def run_once(
         test_command,
         research_history,
         task.baseline_mode != "none" if has_champion is None else has_champion,
+        round_clock.deadline_text,
+        _ROUND_CLOCK_FILE,
     )
-    opencode = raw["opencode"]
-    timeout = int(opencode["timeout_minutes"]) * 60
     opencode_command = [
         "opencode", "run", "--auto", "--format", "json",
         "--model", opencode["model"], "--dir", str(root),
@@ -553,29 +674,62 @@ def run_once(
     if variant := opencode.get("variant"):
         opencode_command.extend(["--variant", variant])
 
-    before = _snapshot(root, out)
     events_path = out / "opencode-events.jsonl"
-    event_details = {"round": round_id} if round_id is not None else {}
-    _emit(event_sink, "agent_started", message="agent started", **event_details)
-    exit_code = opencode_runner(
-        opencode_command,
-        prompt,
-        root,
-        events_path,
-        timeout,
+    _emit(
+        event_sink,
+        "agent_started",
+        message="agent started",
+        deadline=round_clock.deadline_text,
+        timeout_seconds=round_timeout,
+        **event_details,
     )
-    if exit_code != 0:
-        _emit(event_sink, "agent_failed", message="agent failed", **event_details)
-        reason = "OpenCode timed out" if exit_code == 124 else "OpenCode session failed"
-        return _write_failed(out, experiment_id, reason)
+    round_clock.start()
+    try:
+        exit_code = opencode_runner(
+            opencode_command,
+            prompt,
+            root,
+            events_path,
+            round_timeout,
+        )
+    finally:
+        finished_monotonic = monotonic()
+        round_timing = round_clock.stop(finished_monotonic)
+    deadline_exceeded = (
+        exit_code == 124
+        or float(round_timing["duration_seconds"]) >= round_timeout
+    )
+    if exit_code != 0 or deadline_exceeded:
+        if deadline_exceeded:
+            _emit(
+                event_sink,
+                "round_deadline_exceeded",
+                message="candidate research deadline exceeded",
+                **event_details,
+            )
+            reason = "Candidate research deadline exceeded"
+        else:
+            _emit(event_sink, "agent_failed", message="agent failed", **event_details)
+            reason = "OpenCode session failed"
+        return _write_failed(out, experiment_id, reason, round_timing=round_timing)
     agent_output = _parse_opencode_output(events_path)
     if agent_output is None:
         _emit(event_sink, "agent_failed", message="invalid agent output", **event_details)
-        return _write_failed(out, experiment_id, "OpenCode produced invalid agent output")
+        return _write_failed(
+            out,
+            experiment_id,
+            "OpenCode produced invalid agent output",
+            round_timing=round_timing,
+        )
     events_path.unlink(missing_ok=True)
     _emit(event_sink, "agent_completed", message="agent completed", **event_details)
     if agent_output["status"] == "blocked":
-        return _write_failed(out, experiment_id, f"OpenCode was blocked: {agent_output['error']}")
+        return _write_failed(
+            out,
+            experiment_id,
+            f"OpenCode was blocked: {agent_output['error']}",
+            round_timing=round_timing,
+        )
 
     after = _snapshot(root, out)
     changed = _changed_files(before, after)
@@ -590,6 +744,7 @@ def run_once(
             experiment_id,
             f"Changes outside editable scope: {', '.join(invalid)}",
             agent_output,
+            round_timing,
         )
     if not changed:
         return _write_failed(
@@ -597,6 +752,7 @@ def run_once(
             experiment_id,
             "OpenCode completed without code changes",
             agent_output,
+            round_timing,
         )
 
     _emit(event_sink, "tests_started", message="tests started", **event_details)
@@ -605,10 +761,16 @@ def run_once(
         test_command,
         root,
         out / "tests.log",
-        timeout,
+        command_timeout,
     ) != 0:
         _emit(event_sink, "tests_failed", message="tests failed", **event_details)
-        return _write_failed(out, experiment_id, "Tests failed", agent_output)
+        return _write_failed(
+            out,
+            experiment_id,
+            "Tests failed",
+            agent_output,
+            round_timing,
+        )
     _emit(event_sink, "tests_passed", message="tests passed", **event_details)
     metrics: dict[str, Any] = {}
     for label in ("development", "gate"):
@@ -630,7 +792,7 @@ def run_once(
             command,
             evaluation_root,
             out / f"{label}.log",
-            timeout,
+            command_timeout,
         ) != 0:
             _emit(
                 event_sink,
@@ -638,14 +800,32 @@ def run_once(
                 message=f"{label} backtest failed",
                 **event_details,
             )
-            return _write_failed(out, experiment_id, f"{label} backtest failed", agent_output)
+            return _write_failed(
+                out,
+                experiment_id,
+                f"{label} backtest failed",
+                agent_output,
+                round_timing,
+            )
         metrics_path = evaluation_root / str(raw["commands"]["metrics_path"]).format_map(values)
         if not metrics_path.exists():
-            return _write_failed(out, experiment_id, f"Missing {label} metrics", agent_output)
+            return _write_failed(
+                out,
+                experiment_id,
+                f"Missing {label} metrics",
+                agent_output,
+                round_timing,
+            )
         try:
             metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return _write_failed(out, experiment_id, f"Invalid {label} metrics", agent_output)
+            return _write_failed(
+                out,
+                experiment_id,
+                f"Invalid {label} metrics",
+                agent_output,
+                round_timing,
+            )
         _emit(
             event_sink,
             f"{label}_completed",
@@ -663,6 +843,7 @@ def run_once(
         "candidate": agent_output["candidate"],
         "changes": {"files": changed},
         "metrics": metrics,
+        "round_timing": round_timing,
     }
     ExperimentResult.from_mapping(payload)
     result_path = out / "result.json"

@@ -88,6 +88,10 @@ python3 -m quant_core.cli research loop \
   `abs<=`；可选 Test 区间必须位于 Gate 之后，Loop 不会读取或评测它。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
+- `budget.round_minutes` 是每轮候选研发的硬时限；未配置时兼容使用
+  `opencode.timeout_minutes`。Harness 会向 Agent 提供绝对截止时间，并在候选工作区刷新
+  `.quant-research-round.json`，其中包含剩余秒数和 `research`、`converge`、`finalize`、
+  `submit_now` 阶段。
 - 固定 evaluator 要求策略实现 `select(daily, universe, start, end)`，返回包含 `date`、
   `symbol`、`target_weight` 的 pandas DataFrame。权重必须有限且非负，每日总和不超过 1。
 
@@ -120,8 +124,9 @@ python3 -m quant_core.cli research clean --task-id <task-id>
 `.research/<task-id>/.tmp/runs/<run>/events.jsonl`，正常结束后清理临时事件与 worktree。
 
 Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止；`rejected` 是正常研究结果，
-不增加连续失败计数。总时长预算只阻止启动下一 Round，不会中断已开始且仍在单轮超时内的
-Agent。中断后重新执行同一命令会恢复活动 Run，没有完整决策的当前 Round 会作为失败证据
+不增加连续失败计数。总时长预算只阻止启动下一 Round；`budget.round_minutes` 会硬终止超时的
+候选研发，并在 `result.json.round_timing` 中保留时间证据。中断后重新执行同一命令会恢复活动
+Run，没有完整决策的当前 Round 会作为失败证据
 落盘；已经正常停止的 Run 不会恢复，而是分配下一个编号。
 
 `research clean` 不会删除结构化 Round 结果、Decision、候选 patch、Champion、冻结的

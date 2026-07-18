@@ -65,6 +65,31 @@ def test_task_requires_positive_budget() -> None:
         ResearchTask.from_mapping(payload)
 
 
+def test_task_requires_positive_round_minutes_when_present() -> None:
+    payload = fixed_task()
+    payload["budget"]["round_minutes"] = 0
+
+    with pytest.raises(ValueError, match="round_minutes"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_result_validates_round_timing_when_present() -> None:
+    payload = completed_result()
+    payload["round_timing"] = {
+        "started_at": "2026-07-18T01:00:00+00:00",
+        "deadline": "2026-07-18T01:30:00+00:00",
+        "finished_at": "2026-07-18T01:20:00+00:00",
+        "timeout_seconds": 1800,
+        "duration_seconds": 1200.0,
+    }
+
+    ExperimentResult.from_mapping(payload)
+
+    payload["round_timing"]["duration_seconds"] = float("nan")
+    with pytest.raises(ValueError, match="duration_seconds"):
+        ExperimentResult.from_mapping(payload)
+
+
 def test_task_requires_exactly_one_editable_strategy_script() -> None:
     payload = fixed_task()
     payload["scope"]["editable"] = ["strategy_a.py", "strategy_b.py"]
