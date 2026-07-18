@@ -47,7 +47,7 @@ Harness 遵循以下核心原则：
 
 - **确定性评测**：策略选择、回测指标、硬约束和晋级规则由固定 Python 代码执行。
 - **数据隔离**：研发阶段只使用 Development 数据；精确 Gate 指标不会反馈给后续研发轮次。
-- **候选隔离**：每轮候选在独立 worktree 中开发，失败或拒绝不会污染下一轮和当前工作分支。
+- **候选隔离**：每轮候选在独立 worktree 和一次性容器中开发，失败或拒绝不会污染下一轮和当前工作分支。
 - **可恢复运行**：Run 状态、累计时间、连续失败、当前 Round 和停止原因都会持久化。
 - **证据可审计**：每轮保存输入、代码差异、日志、指标、决策及其父 Champion。
 - **受控自动化**：循环在达到目标、轮数、时长或连续失败预算时停止，并生成终局复盘。
@@ -59,6 +59,15 @@ Harness 遵循以下核心原则：
 ```bash
 python3 -m pip install -e ".[dev]"
 pytest
+```
+
+构建候选 Agent 镜像：
+
+```bash
+docker build \
+  --file docker/research-agent.Dockerfile \
+  --tag quant-agent-research:latest \
+  .
 ```
 
 运行自动化策略研究循环：
@@ -97,6 +106,40 @@ python3 -m quant_core.cli research loop \
 
 运行前还应确认 OpenCode 模型与认证可用，并且任务声明的测试和回测命令可以在仓库根目录运行。
 Provider 模型名、推理档位、认证和价格属于外部状态，不在仓库中维护静态清单。
+
+### Candidate Agent container
+
+候选研发阶段必须通过 Docker 执行，不会在 Docker 不可用或镜像缺失时回退到宿主机
+OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Root、Gate runtime 和
+主工作区不会进入容器。候选中的 `data/`、`outputs/factors/` 以及不承载回测生成输出的
+`scope.forbidden` 路径会以只读方式重新挂载。候选代码和回测生成目录保持可写。
+
+后续 Round 所需的脱敏研究历史继续由 Harness 注入 Prompt，不会通过挂载原始
+`.research` 提供。若 `research run-once` 的 workspace 自身包含 `.research`，该目录会在
+容器中以空目录覆盖。Agent 容器退出后，测试、Development 复核和 Gate 评估仍由 Harness
+执行。
+
+默认镜像为 `quant-agent-research:latest`，可通过
+`QUANT_RESEARCH_AGENT_IMAGE` 覆盖。Harness 默认将以下宿主机文件只读挂载到容器中：
+
+```text
+~/.local/share/opencode/auth.json
+~/.config/opencode/opencode.jsonc
+```
+
+可分别使用 `QUANT_OPENCODE_AUTH_FILE` 和 `QUANT_OPENCODE_CONFIG_FILE` 覆盖路径。
+这些挂载只用于 OpenCode 认证和配置，不应指向包含其他用户数据的目录。
+
+镜像只包含 OpenCode、基础工具和 `pyproject.toml` 声明的 Python 依赖，不包含项目源码。
+候选代码始终来自当前 worktree 挂载；因此普通源码修改和每轮 Loop 都不需要重新构建镜像，
+只有 Dockerfile、Python 依赖或 OpenCode 版本变化时才需要重新构建。
+
+构建镜像并启动 Docker 后，可运行真实文件边界验收：
+
+```bash
+QUANT_TEST_AGENT_CONTAINER=1 pytest -q \
+  tests/test_research_runner.py::test_agent_container_blocks_host_and_read_only_access
+```
 
 ### Run operations
 

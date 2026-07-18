@@ -7,8 +7,10 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -29,6 +31,8 @@ AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 EventSink = Callable[..., None]
 _RESEARCH_HISTORY_LIMIT = 12
 _ROUND_CLOCK_FILE = ".quant-research-round.json"
+_AGENT_CONTAINER_IMAGE = "quant-agent-research:latest"
+_CONTAINER_WORKSPACE = "/workspace"
 
 
 @dataclass
@@ -174,13 +178,13 @@ def _run_with_failure_log(
     return exit_code
 
 
-def _run_opencode_with_permissions(
+def _run_prompt_process(
     command: Sequence[str],
     prompt: str,
     cwd: Path,
     log_path: Path,
     timeout: int,
-    permissions: Mapping[str, str],
+    extra_env: Mapping[str, str] | None = None,
 ) -> int:
     def terminate(process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
@@ -200,10 +204,7 @@ def _run_opencode_with_permissions(
 
     try:
         with log_path.open("w", encoding="utf-8") as log:
-            env = _workspace_env(
-                cwd,
-                {"OPENCODE_PERMISSION": json.dumps(dict(permissions))},
-            )
+            env = _workspace_env(cwd, extra_env)
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
@@ -228,18 +229,206 @@ def _run_opencode_with_permissions(
         return 127
 
 
-def _run_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
-    return _run_opencode_with_permissions(
+def _run_opencode_with_permissions(
+    command: Sequence[str],
+    prompt: str,
+    cwd: Path,
+    log_path: Path,
+    timeout: int,
+    permissions: Mapping[str, str],
+) -> int:
+    return _run_prompt_process(
         command,
         prompt,
         cwd,
         log_path,
         timeout,
-        {
-            "external_directory": "deny",
-            "question": "deny",
-        },
+        {"OPENCODE_PERMISSION": json.dumps(dict(permissions))},
     )
+
+
+def _container_mount(source: Path, target: str, *, read_only: bool = False) -> list[str]:
+    source_text = str(source.resolve())
+    if "," in source_text:
+        raise ValueError("Docker mount source paths must not contain commas")
+    specification = f"type=bind,src={source_text},dst={target}"
+    if read_only:
+        specification += ",readonly"
+    return ["--mount", specification]
+
+
+def _container_path(path: Path, workspace: Path) -> str:
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Agent container path is outside the candidate workspace: {path}") from exc
+    return f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+
+def _opencode_runtime_mounts() -> list[str]:
+    mounts: list[str] = []
+    auth = Path(
+        os.environ.get(
+            "QUANT_OPENCODE_AUTH_FILE",
+            Path.home() / ".local" / "share" / "opencode" / "auth.json",
+        )
+    ).expanduser()
+    if auth.is_file():
+        mounts.extend(
+            _container_mount(
+                auth,
+                "/home/agent/.local/share/opencode/auth.json",
+                read_only=True,
+            )
+        )
+    config = Path(
+        os.environ.get(
+            "QUANT_OPENCODE_CONFIG_FILE",
+            Path.home() / ".config" / "opencode" / "opencode.jsonc",
+        )
+    ).expanduser()
+    if config.is_file():
+        mounts.extend(
+            _container_mount(
+                config,
+                "/home/agent/.config/opencode/opencode.jsonc",
+                read_only=True,
+            )
+        )
+    return mounts
+
+
+def _docker_opencode_command(
+    command: Sequence[str],
+    cwd: Path,
+    permissions: Mapping[str, str],
+    read_only_paths: Sequence[Path],
+    hidden_mounts: Sequence[tuple[Path, Path]] = (),
+    runtime_home: Path | None = None,
+    container_name: str | None = None,
+) -> list[str]:
+    workspace = cwd.resolve()
+    translated = [
+        _CONTAINER_WORKSPACE if part == str(workspace) else part
+        for part in command
+    ]
+    docker = [
+        "docker",
+        "run",
+        "--init",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--workdir",
+        _CONTAINER_WORKSPACE,
+        "--env",
+        f"OPENCODE_PERMISSION={json.dumps(dict(permissions), separators=(',', ':'))}",
+        "--env",
+        "PYTHONPATH=/workspace/src",
+        *_container_mount(workspace, _CONTAINER_WORKSPACE),
+    ]
+    if container_name is None:
+        docker.append("--rm")
+    else:
+        docker.extend(["--name", container_name])
+    if runtime_home is not None:
+        docker.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        docker.extend(_container_mount(runtime_home, "/home/agent"))
+    mounted: set[Path] = set()
+    for path in read_only_paths:
+        resolved = path.resolve()
+        if resolved in mounted or not resolved.exists():
+            continue
+        target = _container_path(resolved, workspace)
+        docker.extend(_container_mount(resolved, target, read_only=True))
+        mounted.add(resolved)
+    for mask, hidden in hidden_mounts:
+        docker.extend(
+            _container_mount(
+                mask,
+                _container_path(hidden, workspace),
+                read_only=True,
+            )
+        )
+    docker.extend(_opencode_runtime_mounts())
+    docker.append(os.environ.get("QUANT_RESEARCH_AGENT_IMAGE", _AGENT_CONTAINER_IMAGE))
+    docker.extend(translated)
+    return docker
+
+
+def _remove_agent_container(name: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["docker", "rm", "--force", name],
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _run_opencode_container(
+    command: Sequence[str],
+    prompt: str,
+    cwd: Path,
+    log_path: Path,
+    timeout: int,
+    *,
+    read_only_paths: Sequence[Path] = (),
+) -> int:
+    permissions = {
+        "external_directory": "deny",
+        "question": "deny",
+    }
+    container_name = f"quant-agent-{uuid.uuid4().hex}"
+    try:
+        hidden = cwd / ".research"
+        with tempfile.TemporaryDirectory(
+            prefix=".agent-hidden-",
+            dir=log_path.parent,
+        ) as temporary:
+            temporary_root = Path(temporary)
+            runtime_home = temporary_root / "home"
+            (runtime_home / ".local" / "share" / "opencode").mkdir(parents=True)
+            (runtime_home / ".config" / "opencode").mkdir(parents=True)
+            mask = temporary_root / "mask"
+            mask.mkdir()
+            hidden_mounts = (
+                [(mask, hidden)]
+                if hidden.is_dir()
+                else []
+            )
+            container_command = _docker_opencode_command(
+                command,
+                cwd,
+                permissions,
+                read_only_paths,
+                hidden_mounts,
+                runtime_home,
+                container_name,
+            )
+            try:
+                exit_code = _run_prompt_process(
+                    container_command,
+                    prompt,
+                    cwd,
+                    log_path,
+                    timeout,
+                )
+            finally:
+                removed = _remove_agent_container(container_name)
+            if not removed:
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write("\nFailed to remove Agent container")
+                return 127
+            return exit_code
+    except (OSError, ValueError) as exc:
+        log_path.write_text(str(exc), encoding="utf-8")
+        return 127
 
 
 def _run_opencode_read_only(
@@ -303,6 +492,44 @@ def _is_within(path: str, prefixes: Sequence[str]) -> bool:
 
 def _format_command(command: Sequence[str], values: dict[str, str]) -> list[str]:
     return [part.format_map(values) for part in command]
+
+
+def _containerize_prompt_command(command: Sequence[str], workspace: Path) -> list[str]:
+    root = str(workspace.resolve())
+    translated: list[str] = []
+    for part in command:
+        if part == sys.executable:
+            translated.append("python3")
+        elif part == root:
+            translated.append(_CONTAINER_WORKSPACE)
+        elif part.startswith(root + os.sep):
+            relative = Path(part).resolve().relative_to(workspace.resolve())
+            translated.append(f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}")
+        else:
+            translated.append(part)
+    return translated
+
+
+def _agent_read_only_paths(
+    workspace: Path,
+    forbidden: Sequence[str],
+    generated_dir: str,
+) -> list[Path]:
+    candidates = ["data", "outputs/factors", *forbidden]
+    paths: list[Path] = []
+    for candidate in candidates:
+        normalized = candidate.rstrip("/")
+        if (
+            not normalized
+            or normalized == ".research"
+            or normalized.startswith(".research/")
+            or _is_within(generated_dir, [normalized])
+        ):
+            continue
+        path = workspace / normalized
+        if path.exists():
+            paths.append(path)
+    return paths
 
 
 def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: Path) -> dict[str, str]:
@@ -627,7 +854,7 @@ def run_once(
     research_history: Sequence[Mapping[str, Any]] = (),
     has_champion: bool | None = None,
     command_runner: CommandRunner = _run_command,
-    opencode_runner: AgentRunner = _run_opencode,
+    opencode_runner: AgentRunner | None = None,
     event_sink: EventSink | None = None,
     round_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
@@ -657,11 +884,14 @@ def run_once(
         event_details,
         monotonic,
     )
+    agent_development_command = _containerize_prompt_command(development_command, root)
+    agent_metrics_path = _containerize_prompt_command([development_metrics_path], root)[0]
+    agent_test_command = _containerize_prompt_command(test_command, root)
     prompt = _prompt(
         task,
-        development_command,
-        development_metrics_path,
-        test_command,
+        agent_development_command,
+        agent_metrics_path,
+        agent_test_command,
         research_history,
         task.baseline_mode != "none" if has_champion is None else has_champion,
         round_clock.deadline_text,
@@ -685,13 +915,28 @@ def run_once(
     )
     round_clock.start()
     try:
-        exit_code = opencode_runner(
-            opencode_command,
-            prompt,
-            root,
-            events_path,
-            round_timeout,
-        )
+        if opencode_runner is None:
+            generated_dir = Path(development_metrics_path).parent.as_posix()
+            exit_code = _run_opencode_container(
+                opencode_command,
+                prompt,
+                root,
+                events_path,
+                round_timeout,
+                read_only_paths=_agent_read_only_paths(
+                    root,
+                    raw["scope"].get("forbidden", []),
+                    generated_dir,
+                ),
+            )
+        else:
+            exit_code = opencode_runner(
+                opencode_command,
+                prompt,
+                root,
+                events_path,
+                round_timeout,
+            )
     finally:
         finished_monotonic = monotonic()
         round_timing = round_clock.stop(finished_monotonic)
@@ -1011,7 +1256,7 @@ def run_managed_once(
     workspace: str | Path = ".",
     research_root: str | Path = ".research",
     command_runner: CommandRunner = _run_command,
-    opencode_runner: AgentRunner = _run_opencode,
+    opencode_runner: AgentRunner | None = None,
     event_sink: EventSink | None = None,
 ) -> Path:
     """Run one isolated candidate and promote it only when it beats the champion."""

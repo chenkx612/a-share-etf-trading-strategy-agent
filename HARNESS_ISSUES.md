@@ -13,11 +13,10 @@
 
 ## 当前结论
 
-当前仍有 1 个 P0 待解决问题，因此按本文件定义，**不应启动新的 Loop Run**：
+当前没有待解决的 P0，允许启动新的 Loop Run；仍需明确评估以下 P1/P2 遗留问题：
 
 | 优先级 | 编号 | 问题 |
 | --- | --- | --- |
-| P0 | 10 | 候选 Agent 可通过 Bash 访问 Research Root |
 | P1 | 13 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
 | P2 | 4 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 6 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -26,28 +25,7 @@
 
 ### P0：新 Loop 前必须解决
 
-#### 10：候选 Agent 可通过 Bash 访问 Research Root
-
-- **状态**：open
-- **发现日期**：2026-07-18
-- **问题与影响**：候选 Agent 位于隔离 worktree，但通过 Bash 使用主仓库绝对路径，仍能枚举
-  `.research/<task-id>/` 下的 Champion、Run 和 Round 文件。专用读取工具拒绝外部文件读取，
-  Bash 枚举却成功。Agent 理论上可以绕过脱敏历史，直接读取旧 Gate 指标或终局报告，使后续研发发生
-  Gate 泄漏。
-- **触发条件**：OpenCode 配置 `external_directory=deny`，同时允许 Bash；Agent 进程仍继承主机
-  文件系统读取权限。
-- **根因**：worktree 只隔离候选代码，不是文件系统安全边界；工具级 external-directory 规则
-  无法约束 Bash、Python、符号链接或其他子进程。
-- **必须完成的方案**：
-  - 将研发 Agent 放入真实文件系统沙箱或容器。
-  - 只挂载候选 worktree、Development 数据和必要运行环境。
-  - 不挂载 Research Root、Gate runtime、主工作区或历史报告。
-  - Gate 评估继续由独立 Harness 进程执行，候选进程不能访问其路径或环境。
-- **验收标准**：集成测试分别通过读取工具、Bash、Python、相对路径、绝对路径和符号链接尝试访问
-  `.research` 与 Gate runtime，全部失败；候选测试和 Development 回测仍能正常运行。
-- **不可接受的临时方案**：只增加 Prompt 禁止语句、字符串路径黑名单或依赖
-  `external_directory=deny`。
-- **关联代码**：`src/quant_core/research/runner.py::_run_opencode`
+当前无开放 P0。
 
 ### P1：推荐解决，可带风险继续
 
@@ -105,6 +83,29 @@
 ## 二、已解决问题
 
 ### P0：曾阻断可信研发
+
+#### 10：候选 Agent 曾可通过 Bash 访问 Research Root
+
+- **状态**：resolved
+- **发现日期**：2026-07-18
+- **解决日期**：2026-07-19
+- **问题与影响**：候选 Agent 位于隔离 worktree，但通过 Bash 使用主仓库绝对路径，仍能枚举
+  `.research/<task-id>/` 下的 Champion、Run 和 Round 文件。工具级
+  `external_directory=deny` 无法约束 Bash、Python、符号链接或其他子进程，可能造成 Gate 泄漏。
+- **修正**：
+  - 候选 OpenCode 强制通过一次性 Docker 容器运行，只精确挂载当前候选 worktree。
+  - Development 数据、因子缓存和不承载生成输出的固定路径以只读方式覆盖。
+  - Research Root、Gate runtime 和主工作区不挂载；脱敏研究历史继续由 Harness 注入 Prompt。
+  - Docker 不可用或镜像缺失时直接失败，不回退到宿主机执行。
+  - 每个容器使用唯一名称；退出或超时后强制删除，无法确认删除时禁止进入后续 Gate。
+- **验证**：在 macOS Docker Desktop 的 Linux ARM64 runtime 中构建
+  `quant-agent-research:latest`，真实容器测试确认候选可以写自身文件并读取 Development 数据，
+  但不能修改只读数据或固定脚本，也不能通过 Bash、Python、绝对路径或符号链接访问 Gate 文件和
+  原始 `.research`。
+- **信任边界**：不防御 Docker daemon、宿主内核或容器运行时本身被攻破；OpenCode 认证文件仍作为
+  必要运行输入只读挂载，不应指向包含其他用户数据的目录。
+- **关联代码/测试**：`src/quant_core/research/runner.py::_run_opencode_container`、
+  `tests/test_research_runner.py::test_agent_container_blocks_host_and_read_only_access`
 
 #### 2：Development 搜索预算曾依赖 Prompt 次数限制
 

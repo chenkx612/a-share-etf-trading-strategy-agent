@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import tomllib
 from pathlib import Path
 from typing import Sequence
 
+import pytest
+
+import quant_core.research.runner as research_runner
 from quant_core.research import ResearchTask, run_once
 from quant_core.research.runner import (
+    _agent_read_only_paths,
+    _docker_opencode_command,
     _metrics_key,
     _RoundClock,
     _run_opencode_with_permissions,
@@ -141,6 +147,252 @@ def test_opencode_timeout_kills_ordinary_child_processes(tmp_path: Path) -> None
     assert exit_code == 124
     time.sleep(0.7)
     assert not marker.exists()
+
+
+def test_docker_opencode_command_mounts_only_candidate_and_read_only_inputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidate = tmp_path / "research-root" / "task" / "candidate"
+    candidate.mkdir(parents=True)
+    development = candidate / "data"
+    development.mkdir()
+    fixed_script = candidate / "src" / "fixed.py"
+    fixed_script.parent.mkdir()
+    fixed_script.write_text("FIXED = True\n", encoding="utf-8")
+    hidden = candidate / ".research"
+    hidden.mkdir()
+    mask = tmp_path / "empty-mask"
+    mask.mkdir()
+    runtime_home = tmp_path / "agent-home"
+    runtime_home.mkdir()
+    monkeypatch.setenv("QUANT_RESEARCH_AGENT_IMAGE", "test-agent:local")
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_AUTH_FILE",
+        str(tmp_path / "missing-auth.json"),
+    )
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_CONFIG_FILE",
+        str(tmp_path / "missing-config.jsonc"),
+    )
+
+    command = _docker_opencode_command(
+        ["opencode", "run", "--dir", str(candidate)],
+        candidate,
+        {"external_directory": "deny"},
+        [development, fixed_script],
+        [(mask, hidden)],
+        runtime_home,
+        "quant-agent-test",
+    )
+
+    rendered = "\n".join(command)
+    assert f"src={candidate.resolve()},dst=/workspace" in rendered
+    assert f"src={development.resolve()},dst=/workspace/data,readonly" in rendered
+    assert (
+        f"src={fixed_script.resolve()},dst=/workspace/src/fixed.py,readonly"
+        in rendered
+    )
+    assert f"src={mask.resolve()},dst=/workspace/.research,readonly" in rendered
+    assert f"src={runtime_home.resolve()},dst=/home/agent" in rendered
+    assert f"--user\n{os.getuid()}:{os.getgid()}" in rendered
+    assert "--name\nquant-agent-test" in rendered
+    assert str(candidate.parent.resolve()) not in [
+        part.split("src=", 1)[1].split(",dst=", 1)[0]
+        for part in command
+        if "src=" in part
+    ]
+    assert "--dir\n/workspace" in rendered
+    assert command[-2:] == ["--dir", "/workspace"]
+    assert "test-agent:local" in command
+
+
+def test_agent_read_only_paths_preserve_generated_output_directory(tmp_path: Path) -> None:
+    for relative in ("data", "outputs/factors", "outputs/backtests", "tests", ".research"):
+        (tmp_path / relative).mkdir(parents=True, exist_ok=True)
+
+    paths = _agent_read_only_paths(
+        tmp_path,
+        ["tests/", "outputs/", ".research/"],
+        "outputs/backtests/run/metrics.json",
+    )
+
+    assert set(paths) == {
+        tmp_path / "data",
+        tmp_path / "outputs/factors",
+        tmp_path / "tests",
+    }
+
+
+def test_container_runner_removes_container_after_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    removed: list[str] = []
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_AUTH_FILE",
+        str(tmp_path / "missing-auth.json"),
+    )
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_CONFIG_FILE",
+        str(tmp_path / "missing-config.jsonc"),
+    )
+    monkeypatch.setattr(
+        research_runner,
+        "_run_prompt_process",
+        lambda *args, **kwargs: 124,
+    )
+
+    def remove_container(name: str) -> bool:
+        removed.append(name)
+        return True
+
+    monkeypatch.setattr(
+        research_runner,
+        "_remove_agent_container",
+        remove_container,
+    )
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--dir", str(tmp_path)],
+        "prompt",
+        tmp_path,
+        tmp_path / "agent.log",
+        1,
+    )
+
+    assert exit_code == 124
+    assert len(removed) == 1
+    assert removed[0].startswith("quant-agent-")
+
+
+def test_container_runner_fails_when_container_cleanup_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_AUTH_FILE",
+        str(tmp_path / "missing-auth.json"),
+    )
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_CONFIG_FILE",
+        str(tmp_path / "missing-config.jsonc"),
+    )
+    monkeypatch.setattr(
+        research_runner,
+        "_run_prompt_process",
+        lambda *args, **kwargs: 0,
+    )
+    monkeypatch.setattr(
+        research_runner,
+        "_remove_agent_container",
+        lambda name: False,
+    )
+    log_path = tmp_path / "agent.log"
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--dir", str(tmp_path)],
+        "prompt",
+        tmp_path,
+        log_path,
+        1,
+    )
+
+    assert exit_code == 127
+    assert "Failed to remove Agent container" in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    os.environ.get("QUANT_TEST_AGENT_CONTAINER") != "1",
+    reason="set QUANT_TEST_AGENT_CONTAINER=1 after building the research Agent image",
+)
+def test_agent_container_blocks_host_and_read_only_access(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    development = candidate / "data"
+    development.mkdir()
+    input_path = development / "input.txt"
+    input_path.write_text("development", encoding="utf-8")
+    fixed_script = candidate / "src" / "fixed.py"
+    fixed_script.parent.mkdir()
+    fixed_script.write_text("FIXED = True\n", encoding="utf-8")
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    secret = gate / "metrics.json"
+    secret.write_text("gate-secret", encoding="utf-8")
+    raw_history = candidate / ".research"
+    raw_history.mkdir()
+    (raw_history / "result.json").write_text("raw-gate-result", encoding="utf-8")
+    mask = tmp_path / "empty-mask"
+    mask.mkdir()
+    runtime_home = tmp_path / "agent-home"
+    runtime_home.mkdir()
+    (candidate / "gate-link").symlink_to(secret)
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_AUTH_FILE",
+        str(tmp_path / "missing-auth.json"),
+    )
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_CONFIG_FILE",
+        str(tmp_path / "missing-config.jsonc"),
+    )
+    script = (
+        "import subprocess\n"
+        "from pathlib import Path\n"
+        "workspace = Path('/workspace')\n"
+        "(workspace / 'candidate.txt').write_text('ok')\n"
+        "data = workspace / 'data/input.txt'\n"
+        "assert data.read_text() == 'development'\n"
+        "try:\n"
+        "    data.write_text('changed')\n"
+        "except OSError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise AssertionError('development data was writable')\n"
+        "try:\n"
+        "    (workspace / 'src/fixed.py').write_text('changed')\n"
+        "except OSError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise AssertionError('fixed script was writable')\n"
+        f"assert not Path({str(secret)!r}).exists()\n"
+        "assert not (workspace / '.research/result.json').exists()\n"
+        f"assert subprocess.run(['bash', '-lc', 'cat {str(secret)}']).returncode != 0\n"
+        "assert subprocess.run(['bash', '-lc', 'cat gate-link'], cwd=workspace).returncode != 0\n"
+        "assert subprocess.run(['bash', '-lc', 'cat .research/result.json'], cwd=workspace).returncode != 0\n"
+        "try:\n"
+        "    (workspace / 'gate-link').read_text()\n"
+        "except OSError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise AssertionError('gate symlink escaped the container')\n"
+    )
+    command = _docker_opencode_command(
+        ["python3", "-c", script],
+        candidate,
+        {},
+        [development, fixed_script],
+        [(mask, raw_history)],
+        runtime_home,
+    )
+
+    completed = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    assert (candidate / "candidate.txt").read_text(encoding="utf-8") == "ok"
+    assert input_path.read_text(encoding="utf-8") == "development"
+    assert fixed_script.read_text(encoding="utf-8") == "FIXED = True\n"
+    assert secret.read_text(encoding="utf-8") == "gate-secret"
 
 
 def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:

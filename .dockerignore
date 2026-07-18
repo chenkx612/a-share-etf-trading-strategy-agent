@@ -1,0 +1,12 @@
+.git
+.research
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+src
+tests
+data
+outputs
+.agents/skills/*/outputs
