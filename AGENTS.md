@@ -41,10 +41,12 @@ final reporting. Each strategy module owns its trading logic and tunable
 parameter defaults. Fixed simulation settings live in `config.py`, and
 lightweight report output lives in the CLI.
 
-`tests/` holds pytest coverage for framework and harness behavior. `docs/`
-contains framework development documentation only; do not put quantitative
-trading business knowledge there. Skill-specific prompts, knowledge, scripts,
-templates, stock-pool definitions, and intermediate outputs live under
+`tests/` holds pytest coverage for framework and harness behavior. `README.md`
+is the canonical user-facing command and operations guide. `HARNESS_ISSUES.md`
+is the engineering risk and resolution registry; do not create overview
+documents that repeat this file or the README, and do not put quantitative
+trading business knowledge in framework documentation.
+Skill-specific prompts, knowledge, scripts, templates, stock-pool definitions, and intermediate outputs live under
 `.agents/skills/<skill-name>/`. Managed research keeps the task-level strategy
 at `.research/<task-id>/champion.py`, its metadata at `champion.json`, and immutable Loop history under
 `.research/<task-id>/runs/<run>/rounds/<round>/`. It must remain isolated from
@@ -54,13 +56,9 @@ normal framework outputs.
 
 - `python3 -m pip install -e ".[dev]"`: install the package in editable mode with pytest.
 - `pytest`: run the full test suite.
-- `python3 -m quant_core.cli data update --universe path/to/universe.csv --start 2024-01-01 --end 2024-12-31`: fetch/update ETF daily data.
-- `python3 -m quant_core.cli factor compute --start 2024-01-01 --end 2024-12-31`: compute factor tables.
-- `python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31`: run the Sharpe/correlation/threshold strategy backtest.
-- `python3 -m quant_core.cli --root .agents/skills/etf-sharpe-topk/outputs/sector_rotation recommend today --universe .agents/skills/etf-sharpe-topk/outputs/sector_rotation/selected_universe.csv --date 2024-12-31 --top-n 10`: generate skill-scoped recommendations.
-- `python3 -m quant_core.cli research run-once --task path/to/task.toml --experiment-id experiment-001 --output path/to/experiment`: run one candidate-development experiment without champion management.
-- `python3 -m quant_core.cli research loop --task path/to/task.toml --research-root .research`: run the resumable automated strategy-research loop until its configured target or budget stops it.
-- `python3 -m quant_core.cli research clean --task path/to/task.toml --research-root .research`: remove disposable worktrees, derived development data, and redundant successful-run diagnostics without deleting research decisions or the champion.
+
+Use the command examples in `README.md` for framework and Research Harness
+operations instead of maintaining a second command catalog here.
 
 ## Loop & Harness Engineering Rules
 
@@ -89,6 +87,8 @@ normal framework outputs.
 - Never create ad-hoc research roots such as `.research/clean-run` to separate
   Loop invocations. Reuse the configured task root; the Harness allocates
   `runs/001`, `runs/002`, and subsequent Run directories automatically.
+- Before starting a new Loop Run, check `HARNESS_ISSUES.md`; any
+  open P0 blocks further Loop research.
 - Emit concise stage events to stdout and `.tmp/runs/<run>/events.jsonl` while a
   Loop is active so an external Codex supervisor can observe progress without
   requiring permanent successful-session traces.

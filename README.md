@@ -65,57 +65,67 @@ pytest
 
 ```bash
 python3 -m quant_core.cli research loop \
-  --task path/to/task.toml \
-  --research-root .research
+  --task path/to/task.toml
 ```
 
+启动新的 Loop Run 前，先检查
+[Research Harness Issues](HARNESS_ISSUES.md)；存在开放 P0 时不应启动新 Run。
+
+### Task and candidate contract
+
 研究任务在 `task.toml` 中声明目标、数据、Development/Gate 区间、允许修改的范围、
-固定评测命令、硬约束、Champion 改善要求、模型配置和运行预算。Harness 会在
-`.research/<task-id>/champion.py` 保存可直接读取的 Champion 策略，在 `champion.json`
-保存其哈希、来源与指标；每次 Loop 自动分配
-`runs/001`、`runs/002` 等独立目录，轮次写入 `rounds/001`。历史 Run 的状态和报告
-不会被后续 Loop 覆盖。
-成功轮次默认不保留重复的 Agent 输出、原始事件流和成功命令日志；失败轮次仍保留
-诊断材料。
+固定评测命令、硬约束、Champion 改善要求、模型配置和运行预算。每次调用自动分配新的
+编号 Run；重复研发时继续使用默认 `.research`，无需显式传入 `--research-root`。当前
+`task.toml` 同时是可直接运行的任务配置示例，字段由
+`src/quant_core/research/contracts.py` 验证。
 
-运行期间，Harness 会把阶段事件实时打印到控制台，并同步写入
-`.tmp/runs/<run>/events.jsonl`，方便启动 Loop 的 Codex 或人工监控 Agent、测试、
-Development、Gate 和决策进度。Run 正常结束后删除这份临时事件流。
+- `scope.editable` 当前只能声明一个仓库相对策略文件。
+- `baseline.mode = "workspace"` 从工作区策略初始化 Champion；`"none"` 用于 0→1 研发，
+  可配合 `baseline.exclude` 从候选基座排除旧策略实现。
+- 回测命令支持 `{python}`、`{universe}`、`{start}`、`{end}`、`{run_id}`、
+  `{strategy_name}` 和 `{strategy_module}` 占位符；指标路径必须包含 `{run_id}`。
+- 当前只支持不重叠的固定 Development/Gate 区间。硬约束运算符为 `>=`、`<=` 和
+  `abs<=`；可选 Test 区间必须位于 Gate 之后，Loop 不会读取或评测它。
+- `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
+  `evaluation.target.objective_at_least` 可在目标达成后提前停止。
+- 固定 evaluator 要求策略实现 `select(daily, universe, start, end)`，返回包含 `date`、
+  `symbol`、`target_weight` 的 pandas DataFrame。权重必须有限且非负，每日总和不超过 1。
 
-重复运行时继续使用同一个 `--research-root`；不要创建 `.research/clean-run` 一类临时根目录。
-Harness 会自动创建下一个编号 Run。
+运行前还应确认 OpenCode 模型与认证可用，并且任务声明的测试和回测命令可以在仓库根目录运行。
+Provider 模型名、推理档位、认证和价格属于外部状态，不在仓库中维护静态清单。
 
-调试时可以只运行一轮：
+### Run operations
+
+常用研究命令：
 
 ```bash
 # 运行一次候选研发，不管理 Champion
 python3 -m quant_core.cli research run-once \
-  --task path/to/task.toml \
+  --task task.toml \
   --experiment-id experiment-001 \
   --output path/to/experiment
+
+# 重新生成最近或指定 Run 的终局报告
+python3 -m quant_core.cli research report --task task.toml
+python3 -m quant_core.cli research report --task task.toml --run 2
+
+# 清理临时 worktree、派生缓存和冗余成功日志
+python3 -m quant_core.cli research clean --task task.toml
+python3 -m quant_core.cli research clean --task-id <task-id>
 ```
 
-循环结束后会自动生成复盘，也可以单独补生成或重试：
+任务级 Champion 保存在 `.research/<task-id>/champion.py` 和 `champion.json`；每轮的
+`result.json`、`decision.json` 和候选 patch 保存在 `runs/<run>/rounds/<round>/`，终局复盘
+保存在 `runs/<run>/report.md`。活动 Loop 的阶段事件会同时输出到终端和
+`.research/<task-id>/.tmp/runs/<run>/events.jsonl`，正常结束后清理临时事件与 worktree。
 
-```bash
-python3 -m quant_core.cli research report \
-  --task path/to/task.toml \
-  --run 1 \
-  --research-root .research
-```
+Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止；`rejected` 是正常研究结果，
+不增加连续失败计数。总时长预算只阻止启动下一 Round，不会中断已开始且仍在单轮超时内的
+Agent。中断后重新执行同一命令会恢复活动 Run，没有完整决策的当前 Round 会作为失败证据
+落盘；已经正常停止的 Run 不会恢复，而是分配下一个编号。
 
-省略 `--run` 时默认重建最近一次 Run 的报告。
-
-清理中断残留、Development 缓存和旧版冗余日志：
-
-```bash
-python3 -m quant_core.cli research clean \
-  --task-id <task-id> \
-  --research-root .research
-```
-
-清理命令不会删除 `result.json`、`decision.json`、候选 patch、Champion、
-Gate 数据快照或最终报告，也不会在 Loop 正在运行时执行。
+`research clean` 不会删除结构化 Round 结果、Decision、候选 patch、Champion、冻结的
+Evaluation 数据或终局报告，也不会清理仍在运行的 Loop。
 
 ## Quant framework
 
@@ -141,7 +151,7 @@ src/quant_core/factors/   # Deterministic factor calculations
 src/quant_core/strategy/  # Candidate and built-in strategy implementations
 src/quant_core/backtest/  # Fixed simulation engine and metrics
 tests/                    # Framework and harness tests
-docs/                     # Framework engineering documentation
+HARNESS_ISSUES.md         # Prioritized Harness issue and resolution history
 .agents/skills/           # Task knowledge, prompts, scripts, assets, and outputs
 .research/<task-id>/      # Champion, numbered Run history, cache, and temp observation
 ```
@@ -153,15 +163,6 @@ docs/                     # Framework engineering documentation
 ```bash
 python3 -m quant_core.cli --root .agents/skills/etf-sharpe-topk/outputs/sector_rotation factor compute --start 2026-05-01 --end 2026-05-31
 ```
-
-## Docs
-
-- [框架开发文档](docs/README.md)
-- [框架架构](docs/architecture.md)
-- [Loop Harness 设计与实施状态](docs/loop-harness.md)
-- [Loop Harness 任务与结果契约](docs/loop-harness-contracts.md)
-- [Skill 契约](docs/skill_contract.md)
-- [Research Harness 问题与技术方案](docs/research-harness-lessons.md)
 
 ## Scope
 
