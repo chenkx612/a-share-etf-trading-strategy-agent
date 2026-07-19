@@ -1,0 +1,4 @@
+interface:
+  display_name: "ETF Vol-Adaptive Top-K"
+  short_description: "基于波动自适应残差 Sharpe 生成 ETF 次日持仓"
+  default_prompt: "使用 $etf-vol-adaptive-topk 生成下一交易日 ETF 与现金目标持仓。"
