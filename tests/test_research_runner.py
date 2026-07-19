@@ -14,12 +14,15 @@ import pytest
 import quant_core.research.runner as research_runner
 from quant_core.research import ResearchTask, run_once
 from quant_core.research.runner import (
+    AgentContainerInfrastructureError,
     _agent_read_only_paths,
     _docker_opencode_command,
     _metrics_key,
     _RoundClock,
     _run_opencode_with_permissions,
+    _stage_opencode_runtime,
     _workspace_env,
+    preflight_agent_container,
 )
 
 
@@ -207,6 +210,79 @@ def test_docker_opencode_command_mounts_only_candidate_and_read_only_inputs(
     assert "test-agent:local" in command
 
 
+def test_opencode_runtime_is_staged_inside_single_home_mount(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "host-auth.json"
+    config = tmp_path / "host-config.jsonc"
+    models = tmp_path / "host-models.json"
+    auth.write_text('{"token": "secret"}\n', encoding="utf-8")
+    config.write_text('{"model": "test"}\n', encoding="utf-8")
+    models.write_text('{"xai": {"models": {}}}\n', encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+    monkeypatch.setenv("QUANT_OPENCODE_CONFIG_FILE", str(config))
+    monkeypatch.setenv("QUANT_OPENCODE_MODELS_FILE", str(models))
+    runtime_home = tmp_path / "runtime-home"
+
+    _stage_opencode_runtime(runtime_home)
+    command = _docker_opencode_command(
+        ["true"],
+        tmp_path,
+        {},
+        [],
+        runtime_home=runtime_home,
+    )
+
+    assert (
+        runtime_home / ".local/share/opencode/auth.json"
+    ).read_text(encoding="utf-8") == auth.read_text(encoding="utf-8")
+    assert (
+        runtime_home / ".config/opencode/opencode.jsonc"
+    ).read_text(encoding="utf-8") == config.read_text(encoding="utf-8")
+    assert (
+        runtime_home / ".cache/opencode/models.json"
+    ).read_text(encoding="utf-8") == models.read_text(encoding="utf-8")
+    assert (runtime_home / ".local/share/opencode/auth.json").stat().st_mode & 0o777 == 0o600
+    rendered = "\n".join(command)
+    assert f"src={runtime_home.resolve()},dst=/home/agent" in rendered
+    assert str(auth.resolve()) not in rendered
+    assert str(config.resolve()) not in rendered
+    assert str(models.resolve()) not in rendered
+
+
+def test_agent_container_preflight_reports_mount_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fail_container(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        *,
+        read_only_paths: Sequence[Path] = (),
+    ) -> int:
+        log_path.write_text(
+            "docker: Error response from daemon: invalid mount config for type bind",
+            encoding="utf-8",
+        )
+        return 125
+
+    monkeypatch.setattr(research_runner, "_run_opencode_container", fail_container)
+    task = ResearchTask.from_mapping(tomllib.loads(TASK_TOML))
+
+    with pytest.raises(
+        AgentContainerInfrastructureError,
+        match="invalid mount config",
+    ):
+        preflight_agent_container(task, tmp_path / ".research")
+
+    preflight_root = tmp_path / ".research/runner-test/.tmp/container-preflight"
+    assert list(preflight_root.iterdir()) == []
+
+
 def test_agent_read_only_paths_preserve_generated_output_directory(tmp_path: Path) -> None:
     for relative in ("data", "outputs/factors", "outputs/backtests", "tests", ".research"):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
@@ -229,6 +305,7 @@ def test_container_runner_removes_container_after_timeout(
     monkeypatch,
 ) -> None:
     removed: list[str] = []
+    invocations: list[tuple[Sequence[str], str]] = []
     monkeypatch.setenv(
         "QUANT_OPENCODE_AUTH_FILE",
         str(tmp_path / "missing-auth.json"),
@@ -237,11 +314,17 @@ def test_container_runner_removes_container_after_timeout(
         "QUANT_OPENCODE_CONFIG_FILE",
         str(tmp_path / "missing-config.jsonc"),
     )
-    monkeypatch.setattr(
-        research_runner,
-        "_run_prompt_process",
-        lambda *args, **kwargs: 124,
-    )
+    def time_out(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        invocations.append((command, prompt))
+        return 124
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", time_out)
 
     def remove_container(name: str) -> bool:
         removed.append(name)
@@ -264,6 +347,22 @@ def test_container_runner_removes_container_after_timeout(
     assert exit_code == 124
     assert len(removed) == 1
     assert removed[0].startswith("quant-agent-")
+    assert invocations[0][0][-1] == "prompt"
+    assert invocations[0][1] == ""
+
+
+def test_container_cleanup_accepts_an_already_absent_container(monkeypatch) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            1,
+            stdout="Error response from daemon: No such container: quant-agent-test",
+        ),
+    )
+
+    assert research_runner._remove_agent_container("quant-agent-test")
 
 
 def test_container_runner_fails_when_container_cleanup_is_unconfirmed(
@@ -300,6 +399,56 @@ def test_container_runner_fails_when_container_cleanup_is_unconfirmed(
 
     assert exit_code == 127
     assert "Failed to remove Agent container" in log_path.read_text(encoding="utf-8")
+
+
+def test_container_runner_deletes_staged_runtime_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    config = tmp_path / "opencode.jsonc"
+    models = tmp_path / "models.json"
+    auth.write_text('{"xai": "credential"}', encoding="utf-8")
+    config.write_text("{}", encoding="utf-8")
+    models.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+    monkeypatch.setenv("QUANT_OPENCODE_CONFIG_FILE", str(config))
+    monkeypatch.setenv("QUANT_OPENCODE_MODELS_FILE", str(models))
+    runtime_homes: list[Path] = []
+
+    def succeed(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        home_mount = next(
+            part
+            for part in command
+            if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+        )
+        runtime_home = Path(home_mount.split("src=", 1)[1].split(",dst=", 1)[0])
+        runtime_homes.append(runtime_home)
+        assert (runtime_home / ".local/share/opencode/auth.json").is_file()
+        assert (runtime_home / ".config/opencode/opencode.jsonc").is_file()
+        assert (runtime_home / ".cache/opencode/models.json").is_file()
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", succeed)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run"],
+        "probe",
+        tmp_path,
+        tmp_path / "agent.log",
+        1,
+    )
+
+    assert exit_code == 0
+    assert len(runtime_homes) == 1
+    assert not runtime_homes[0].exists()
 
 
 @pytest.mark.skipif(
@@ -503,6 +652,43 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         "gate_started",
         "gate_completed",
     ]
+
+
+def test_run_once_classifies_container_initialization_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+
+    def fail_container(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        *,
+        read_only_paths: Sequence[Path] = (),
+    ) -> int:
+        log_path.write_text(
+            "docker: Error response from daemon: OCI runtime create failed",
+            encoding="utf-8",
+        )
+        return 125
+
+    monkeypatch.setattr(research_runner, "_run_opencode_container", fail_container)
+
+    result_path = run_once(
+        task_path,
+        "experiment-infrastructure",
+        tmp_path / "experiment-infrastructure",
+        workspace=tmp_path,
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    assert result["failure_kind"] == "infrastructure"
+    assert "OCI runtime create failed" in result["error"]
 
 
 def test_metrics_cache_key_changes_with_strategy_module() -> None:

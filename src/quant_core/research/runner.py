@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,6 +34,10 @@ _RESEARCH_HISTORY_LIMIT = 12
 _ROUND_CLOCK_FILE = ".quant-research-round.json"
 _AGENT_CONTAINER_IMAGE = "quant-agent-research:latest"
 _CONTAINER_WORKSPACE = "/workspace"
+
+
+class AgentContainerInfrastructureError(RuntimeError):
+    """Raised when the isolated Agent container cannot be started safely."""
 
 
 @dataclass
@@ -266,37 +271,46 @@ def _container_path(path: Path, workspace: Path) -> str:
     return f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
 
 
-def _opencode_runtime_mounts() -> list[str]:
-    mounts: list[str] = []
-    auth = Path(
-        os.environ.get(
-            "QUANT_OPENCODE_AUTH_FILE",
-            Path.home() / ".local" / "share" / "opencode" / "auth.json",
-        )
-    ).expanduser()
-    if auth.is_file():
-        mounts.extend(
-            _container_mount(
-                auth,
-                "/home/agent/.local/share/opencode/auth.json",
-                read_only=True,
-            )
-        )
-    config = Path(
-        os.environ.get(
-            "QUANT_OPENCODE_CONFIG_FILE",
-            Path.home() / ".config" / "opencode" / "opencode.jsonc",
-        )
-    ).expanduser()
-    if config.is_file():
-        mounts.extend(
-            _container_mount(
-                config,
-                "/home/agent/.config/opencode/opencode.jsonc",
-                read_only=True,
-            )
-        )
-    return mounts
+def _opencode_runtime_sources() -> tuple[tuple[Path, Path], ...]:
+    return (
+        (
+            Path(
+                os.environ.get(
+                    "QUANT_OPENCODE_AUTH_FILE",
+                    Path.home() / ".local" / "share" / "opencode" / "auth.json",
+                )
+            ).expanduser(),
+            Path(".local/share/opencode/auth.json"),
+        ),
+        (
+            Path(
+                os.environ.get(
+                    "QUANT_OPENCODE_CONFIG_FILE",
+                    Path.home() / ".config" / "opencode" / "opencode.jsonc",
+                )
+            ).expanduser(),
+            Path(".config/opencode/opencode.jsonc"),
+        ),
+        (
+            Path(
+                os.environ.get(
+                    "QUANT_OPENCODE_MODELS_FILE",
+                    Path.home() / ".cache" / "opencode" / "models.json",
+                )
+            ).expanduser(),
+            Path(".cache/opencode/models.json"),
+        ),
+    )
+
+
+def _stage_opencode_runtime(runtime_home: Path) -> None:
+    for source, relative in _opencode_runtime_sources():
+        if not source.is_file():
+            continue
+        destination = runtime_home / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o600)
 
 
 def _docker_opencode_command(
@@ -350,7 +364,6 @@ def _docker_opencode_command(
                 read_only=True,
             )
         )
-    docker.extend(_opencode_runtime_mounts())
     docker.append(os.environ.get("QUANT_RESEARCH_AGENT_IMAGE", _AGENT_CONTAINER_IMAGE))
     docker.extend(translated)
     return docker
@@ -361,14 +374,17 @@ def _remove_agent_container(name: str) -> bool:
         completed = subprocess.run(
             ["docker", "rm", "--force", name],
             text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             check=False,
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return completed.returncode == 0
+    return (
+        completed.returncode == 0
+        or "no such container" in completed.stdout.casefold()
+    )
 
 
 def _run_opencode_container(
@@ -386,6 +402,12 @@ def _run_opencode_container(
     }
     container_name = f"quant-agent-{uuid.uuid4().hex}"
     try:
+        container_input = prompt
+        container_command_parts = list(command)
+        if container_command_parts[:2] == ["opencode", "run"]:
+            # Current OpenCode requires the message as a positional argument.
+            container_command_parts.append(prompt)
+            container_input = ""
         hidden = cwd / ".research"
         with tempfile.TemporaryDirectory(
             prefix=".agent-hidden-",
@@ -395,6 +417,7 @@ def _run_opencode_container(
             runtime_home = temporary_root / "home"
             (runtime_home / ".local" / "share" / "opencode").mkdir(parents=True)
             (runtime_home / ".config" / "opencode").mkdir(parents=True)
+            _stage_opencode_runtime(runtime_home)
             mask = temporary_root / "mask"
             mask.mkdir()
             hidden_mounts = (
@@ -403,7 +426,7 @@ def _run_opencode_container(
                 else []
             )
             container_command = _docker_opencode_command(
-                command,
+                container_command_parts,
                 cwd,
                 permissions,
                 read_only_paths,
@@ -414,7 +437,7 @@ def _run_opencode_container(
             try:
                 exit_code = _run_prompt_process(
                     container_command,
-                    prompt,
+                    container_input,
                     cwd,
                     log_path,
                     timeout,
@@ -429,6 +452,107 @@ def _run_opencode_container(
     except (OSError, ValueError) as exc:
         log_path.write_text(str(exc), encoding="utf-8")
         return 127
+
+
+def _container_infrastructure_error(log_path: Path) -> str | None:
+    try:
+        detail = log_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    markers = (
+        "docker: Error response from daemon",
+        "Cannot connect to the Docker daemon",
+        "failed to connect to the docker API",
+        "invalid mount config for type",
+        "OCI runtime create failed",
+        "Unable to find image",
+        "pull access denied",
+        "No such image",
+        "Failed to remove Agent container",
+    )
+    folded = detail.casefold()
+    if not any(marker.casefold() in folded for marker in markers):
+        return None
+    compact = " ".join(detail.split())
+    return compact[:2000]
+
+
+def preflight_agent_container(
+    task: ResearchTask,
+    research_root: Path,
+) -> None:
+    """Verify the real Agent mount topology before allocating a Loop Run."""
+    preflight_root = research_root / task.task_id / ".tmp" / "container-preflight"
+    preflight_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="probe-", dir=preflight_root) as temporary:
+        root = Path(temporary)
+        candidate = root / "workspace"
+        candidate.mkdir()
+        development = candidate / "data"
+        development.mkdir()
+        input_path = development / "input.txt"
+        input_path.write_text("development", encoding="utf-8")
+        hidden = candidate / ".research"
+        hidden.mkdir()
+        (hidden / "sentinel.json").write_text("hidden", encoding="utf-8")
+        writable = candidate / "candidate.txt"
+        expected_runtime_files = [
+            f"/home/agent/{relative.as_posix()}"
+            for source, relative in _opencode_runtime_sources()
+            if source.is_file()
+        ]
+        configured_model = str(task.raw["opencode"]["model"])
+        provider = configured_model.partition("/")[0]
+        script = "\n".join([
+            "import subprocess",
+            "from pathlib import Path",
+            "workspace = Path('/workspace')",
+            "(workspace / 'candidate.txt').write_text('ok', encoding='utf-8')",
+            "data = workspace / 'data/input.txt'",
+            "assert data.read_text(encoding='utf-8') == 'development'",
+            "try:",
+            "    data.write_text('changed', encoding='utf-8')",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise AssertionError('development input was writable')",
+            "assert not (workspace / '.research/sentinel.json').exists()",
+            *[
+                f"assert Path({path!r}).is_file()"
+                for path in expected_runtime_files
+            ],
+            (
+                "models = subprocess.run("
+                f"['opencode', 'models', {provider!r}], "
+                "text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, "
+                "check=False, timeout=30)"
+            ),
+            "assert models.returncode == 0, models.stdout",
+            f"assert {configured_model!r} in models.stdout.splitlines(), models.stdout",
+        ])
+        log_path = root / "preflight.log"
+        exit_code = _run_opencode_container(
+            ["python3", "-c", script],
+            "",
+            candidate,
+            log_path,
+            60,
+            read_only_paths=[development],
+        )
+        if exit_code != 0:
+            detail = _container_infrastructure_error(log_path)
+            if detail is None:
+                try:
+                    detail = " ".join(log_path.read_text(encoding="utf-8").split())[:2000]
+                except OSError:
+                    detail = f"container exited with code {exit_code}"
+            raise AgentContainerInfrastructureError(
+                f"Agent container preflight failed: {detail}"
+            )
+        if not writable.is_file():
+            raise AgentContainerInfrastructureError(
+                "Agent container preflight did not persist its workspace write"
+            )
 
 
 def _run_opencode_read_only(
@@ -823,11 +947,14 @@ def _write_failed(
     error: str,
     agent_output: Mapping[str, Any] | None = None,
     round_timing: Mapping[str, Any] | None = None,
+    failure_kind: str | None = None,
 ) -> Path:
     result_path = output_dir / "result.json"
     payload = {"experiment_id": experiment_id, "status": "failed", "error": error}
     if round_timing is not None:
         payload["round_timing"] = dict(round_timing)
+    if failure_kind is not None:
+        payload["failure_kind"] = failure_kind
     if agent_output is not None:
         for key in (
             "previous_feedback",
@@ -953,10 +1080,27 @@ def run_once(
                 **event_details,
             )
             reason = "Candidate research deadline exceeded"
+            failure_kind = None
         else:
             _emit(event_sink, "agent_failed", message="agent failed", **event_details)
-            reason = "OpenCode session failed"
-        return _write_failed(out, experiment_id, reason, round_timing=round_timing)
+            infrastructure_error = (
+                _container_infrastructure_error(events_path)
+                if opencode_runner is None
+                else None
+            )
+            if infrastructure_error is None:
+                reason = "OpenCode session failed"
+                failure_kind = None
+            else:
+                reason = f"Agent container infrastructure failure: {infrastructure_error}"
+                failure_kind = "infrastructure"
+        return _write_failed(
+            out,
+            experiment_id,
+            reason,
+            round_timing=round_timing,
+            failure_kind=failure_kind,
+        )
     agent_output = _parse_opencode_output(events_path)
     if agent_output is None:
         _emit(event_sink, "agent_failed", message="invalid agent output", **event_details)
@@ -1322,6 +1466,8 @@ def run_managed_once(
             "decision": "failed",
             "reasons": [result.get("error")],
         }
+        if result.get("failure_kind") == "infrastructure":
+            decision["failure_kind"] = "infrastructure"
         write_json_atomic(decision_path, decision)
         manager.reject(candidate, state, record_id)
         return result_path

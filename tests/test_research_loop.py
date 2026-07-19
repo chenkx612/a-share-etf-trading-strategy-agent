@@ -184,6 +184,71 @@ def test_loop_stops_after_consecutive_failed_rounds(
     assert "[001/003] completed: failed" in output
 
 
+def test_container_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+
+    def fail_preflight(task, research_root: Path) -> None:
+        raise RuntimeError("container mount unavailable")
+
+    with pytest.raises(RuntimeError, match="container mount unavailable"):
+        run_loop(
+            task,
+            workspace=tmp_path,
+            managed_runner=_runner(["rejected"]),
+            reporter=_reporter,
+            container_preflight=fail_preflight,
+        )
+
+    assert not (tmp_path / ".research/loop-test/runs").exists()
+
+
+def test_infrastructure_failure_stops_after_one_round(tmp_path: Path) -> None:
+    task = _task(tmp_path, max_rounds=5, max_failures=3)
+
+    def fail_infrastructure(
+        task_path: Path,
+        experiment_id: str,
+        *,
+        workspace: Path,
+        research_root: Path,
+        run_number: int,
+        event_sink,
+    ) -> Path:
+        experiment = (
+            research_root / "loop-test" / "runs" / f"{run_number:03d}"
+            / "rounds" / experiment_id
+        )
+        experiment.mkdir()
+        result_path = experiment / "result.json"
+        result_path.write_text(json.dumps({
+            "experiment_id": f"{run_number:03d}/{experiment_id}",
+            "status": "failed",
+            "error": "Agent container infrastructure failure: bind source unavailable",
+            "failure_kind": "infrastructure",
+        }), encoding="utf-8")
+        (experiment / "decision.json").write_text(json.dumps({
+            "experiment_id": f"{run_number:03d}/{experiment_id}",
+            "decision": "failed",
+            "failure_kind": "infrastructure",
+            "reasons": ["bind source unavailable"],
+        }), encoding="utf-8")
+        return result_path
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=fail_infrastructure,
+        reporter=_reporter,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["rounds_completed"] == 1
+    assert state["failed"] == 1
+    assert state["round_ids"] == ["001"]
+    assert not (state_path.parent / "rounds/002").exists()
+
+
 def test_rejected_round_breaks_a_failure_streak(tmp_path: Path) -> None:
     task = _task(tmp_path, max_rounds=3, max_failures=2)
 

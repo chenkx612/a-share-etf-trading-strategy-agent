@@ -11,12 +11,17 @@ from typing import Any
 
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.report import generate_loop_report
-from quant_core.research.runner import run_managed_once, target_reached
+from quant_core.research.runner import (
+    preflight_agent_container,
+    run_managed_once,
+    target_reached,
+)
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 
 ManagedRunner = Callable[..., Path]
 LoopReporter = Callable[[Path, ResearchWorkspace, dict[str, Any]], Path]
+ContainerPreflight = Callable[[ResearchTask, Path], None]
 _ROUND_ID = re.compile(r"^(\d+)$")
 
 
@@ -172,6 +177,7 @@ def run_loop(
     managed_runner: ManagedRunner = run_managed_once,
     reporter: LoopReporter = generate_loop_report,
     monotonic: Callable[[], float] = time.monotonic,
+    container_preflight: ContainerPreflight | None = None,
 ) -> Path:
     """Run managed research rounds until one of the configured budgets is exhausted."""
     task_file = Path(task_path).resolve()
@@ -207,12 +213,23 @@ def run_loop(
         if state.get("task_fingerprint") != fingerprint:
             raise ValueError("task.toml changed while a research loop was running")
         manager = base_manager.for_run(run_number)
+    else:
+        run_number = base_manager.next_run_number()
+        manager = base_manager.for_run(run_number)
+
+    # Injected managed runners own their execution environment. The production
+    # runner must prove its Docker boundary before a Run is allocated or resumed.
+    preflight = container_preflight
+    if preflight is None and managed_runner is run_managed_once:
+        preflight = preflight_agent_container
+    if preflight is not None:
+        preflight(task, managed_root)
+
+    if active_runs:
         state["status"] = "running"
         state["stop_reason"] = None
         lifecycle_event = ("run_resumed", "resumed")
     else:
-        run_number = base_manager.next_run_number()
-        manager = base_manager.for_run(run_number)
         manager.rounds.mkdir(parents=True, exist_ok=False)
         state = _new_state(task, fingerprint, run_number)
         lifecycle_event = ("run_started", "started")
@@ -300,6 +317,7 @@ def run_loop(
             raise
 
         state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
         decision_path = result_path.parent / "decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8")).get("decision", "failed")
         _record_decision(state, round_id, str(decision))
@@ -310,3 +328,12 @@ def run_loop(
             message=f"completed: {decision}",
         )
         _save(loop_state_path, state)
+        if result.get("failure_kind") == "infrastructure":
+            return _finish_with_report(
+                task_file,
+                manager,
+                loop_state_path,
+                state,
+                "infrastructure_failure",
+                reporter,
+            )

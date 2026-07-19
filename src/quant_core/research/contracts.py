@@ -267,6 +267,11 @@ class ExperimentResult:
         status = _required(data, "status", str, "result")
         if status not in {"completed", "failed"}:
             raise ValueError("result.status must be 'completed' or 'failed'")
+        failure_kind = data.get("failure_kind")
+        if failure_kind is not None and failure_kind != "infrastructure":
+            raise ValueError("result.failure_kind must be 'infrastructure' when present")
+        if status == "completed" and failure_kind is not None:
+            raise ValueError("completed result must not declare failure_kind")
         feedback = data.get("feedback")
         if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
             raise ValueError("result.feedback must be a non-empty str when present")

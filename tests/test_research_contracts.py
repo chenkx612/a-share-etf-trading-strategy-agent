@@ -476,3 +476,22 @@ def test_failed_result_only_requires_error() -> None:
     })
 
     assert result.experiment_id == "experiment-001"
+
+
+def test_failed_result_accepts_infrastructure_classification() -> None:
+    result = ExperimentResult.from_mapping({
+        "experiment_id": "experiment-001",
+        "status": "failed",
+        "error": "Docker bind source unavailable",
+        "failure_kind": "infrastructure",
+    })
+
+    assert result.raw["failure_kind"] == "infrastructure"
+
+
+def test_completed_result_rejects_failure_classification() -> None:
+    payload = completed_result()
+    payload["failure_kind"] = "infrastructure"
+
+    with pytest.raises(ValueError, match="completed result"):
+        ExperimentResult.from_mapping(payload)

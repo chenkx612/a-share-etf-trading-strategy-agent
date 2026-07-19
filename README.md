@@ -120,15 +120,22 @@ OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Ro
 执行。
 
 默认镜像为 `quant-agent-research:latest`，可通过
-`QUANT_RESEARCH_AGENT_IMAGE` 覆盖。Harness 默认将以下宿主机文件只读挂载到容器中：
+`QUANT_RESEARCH_AGENT_IMAGE` 覆盖。Harness 默认读取以下宿主机文件：
 
 ```text
 ~/.local/share/opencode/auth.json
 ~/.config/opencode/opencode.jsonc
+~/.cache/opencode/models.json
 ```
 
-可分别使用 `QUANT_OPENCODE_AUTH_FILE` 和 `QUANT_OPENCODE_CONFIG_FILE` 覆盖路径。
-这些挂载只用于 OpenCode 认证和配置，不应指向包含其他用户数据的目录。
+可分别使用 `QUANT_OPENCODE_AUTH_FILE`、`QUANT_OPENCODE_CONFIG_FILE` 和
+`QUANT_OPENCODE_MODELS_FILE` 覆盖路径。Harness 将存在的文件复制到一次性 runtime home，
+再只挂载该 home；容器结束后删除临时副本，避免 Docker 不兼容的嵌套 bind mount。
+这些输入只用于 OpenCode 认证、配置和模型目录，不应指向包含其他用户数据的文件。
+
+新 Loop 分配 Run 编号前会用真实研究镜像执行容器预检，验证候选目录可写、固定输入只读、
+Research Root 被遮蔽、OpenCode runtime 文件可见且任务配置的模型存在。预检失败不会创建
+Run 或消耗 Round；运行中识别出的容器基础设施故障会立即停止 Run，不会连续重试至耗尽预算。
 
 镜像只包含 OpenCode、基础工具和 `pyproject.toml` 声明的 Python 依赖，不包含项目源码。
 候选代码始终来自当前 worktree 挂载；因此普通源码修改和每轮 Loop 都不需要重新构建镜像，

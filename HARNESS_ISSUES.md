@@ -18,6 +18,7 @@
 | 优先级 | 编号 | 问题 |
 | --- | --- | --- |
 | P1 | 13 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
+| P1 | 16 | 临时 Development runtime 缺失会清空耐久 Champion 指标 |
 | P2 | 4 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 6 | 中断或基础设施失败仍会消耗研发轮次 |
 
@@ -51,6 +52,32 @@
   参数挖掘目标。
 - **关联模块**：`src/quant_core/research/runner.py`、`src/quant_core/research/evaluator.py`
 
+#### 16：临时 Development runtime 缺失会清空耐久 Champion 指标
+
+- **状态**：open
+- **发现日期**：2026-07-19
+- **问题与影响**：Run `003` 启动时，因 disposable Development runtime 目录不存在，
+  `champion.json` 中原本完整的 Development/Gate 指标和 `champion_metrics_key` 被写成 `null`。
+  随后三轮 Agent 均在容器初始化阶段失败，没有评测可重新填充指标；终局报告因此声称本 Run 无法报告
+  当前 Champion 指标。历史 Run `001` 的接受证据仍在，既有晋级决定未改变，但任务级耐久摘要被临时
+  缓存状态降级。
+- **根因**：`ResearchWorkspace._prepare_runtime` 把“需要重建 Development 派生缓存”和“已记录
+  Champion 指标失效”绑定处理。仅仅缺少可重建的 Development runtime，也会无条件清空
+  `champion_metrics`；而 Agent 失败路径不会重跑 Champion evaluator。
+- **推荐方案**：
+  - 把指标的适用性元数据与指标值分开保存。临时 runtime 缺失只触发缓存重建，不应删除已经冻结的
+    Development/Gate 证据。
+  - 只有数据内容指纹、固定区间、evaluator 契约或策略哈希变化时才标记指标需要重算；保留旧值并明确
+    标注 `stale`，直到新评测原子替换，而不是先写 `null`。
+  - 终局报告在本 Run 无候选评测时仍应读取最近有效 Champion 指标，并注明其来源 Run 和适用指纹。
+- **验收标准**：删除 Development runtime 后启动一个在 Agent 阶段失败的 Run，确认缓存可重建、
+  `champion.json` 的最近有效指标不丢失，报告能正确引用来源 Run；再改变固定评测输入，确认旧指标只被
+  标记失效且不能用于晋级比较。
+- **遗留风险**：在修复前可从历史接受 Round 的 `result.json`/`decision.json` 或 Run 报告恢复解释，
+  但不得手工回填 `champion.json`，以免绕过原子状态语义。
+- **关联代码**：`src/quant_core/research/workspace.py::_prepare_runtime`、
+  `src/quant_core/research/report.py::generate_loop_report`
+
 ### P2：有时间时优化
 
 #### 4：仍依赖 Prompt 阻止加载无关 Skill
@@ -83,6 +110,45 @@
 ## 二、已解决问题
 
 ### P0：曾阻断可信研发
+
+#### 15：Docker 嵌套 bind mount 在当前 runtime 失败且连续耗尽 Run
+
+- **状态**：resolved
+- **发现日期**：2026-07-19
+- **解决日期**：2026-07-19
+- **问题与影响**：真实 Run `003` 的三个候选均在 OpenCode 启动前失败，未产生假设、代码或评测；
+  Harness 在不足一秒内把三次相同基础设施故障分别计为失败轮次，并因
+  `max_consecutive_failures` 停止整个 Run。
+- **根因**：
+  - Runner 先把临时 `runtime_home` bind mount 到 `/home/agent`，再从其他宿主目录把 OpenCode
+    认证和配置文件挂到其子路径；Docker Desktop 29.6.1/containerd runtime 对该拓扑稳定报
+    `outside of rootfs`。
+  - 容器临时 home 只获得认证和配置，遗漏 `~/.cache/opencode/models.json`，导致容器模型目录与
+    宿主机不一致并把有效的 `xai/grok-4.5` 误判为不存在。
+  - 当前 OpenCode 1.17.13 要求 `opencode run` 的 message 为位置参数，原 Runner 只通过 stdin
+    传递 Prompt。
+  - Loop 启动前没有真实容器预检；容器初始化错误被压缩为通用 `OpenCode session failed`，同源
+    故障会持续消耗 Round。
+- **修正**：
+  - 将 `auth.json`、`opencode.jsonc` 和 `models.json` 复制到一次性 runtime home，只把该 home
+    挂载一次；临时副本权限设为 `0600`，容器结束后随临时目录删除。
+  - Prompt 改为 OpenCode 位置参数传入，容器仍在结束或超时后强制删除。
+  - 新 Loop 分配 Run 编号前执行真实镜像预检，验证候选写入、Development 只读、Research Root
+    遮蔽、runtime 文件可见，并确认 `task.toml` 配置的模型出现在容器模型目录中。预检失败不创建 Run。
+  - OCI/container init、bind source、镜像和容器清理错误写入 `failure_kind=infrastructure` 并保留
+    原始诊断；若运行中仍发生此类错误，Loop 在首个失败 Round 后以
+    `infrastructure_failure` 停止，不再连续重试。
+- **验证**：
+  - 在当前 Docker Desktop 29.6.1/containerd runtime 上，真实预检通过，并确认容器内
+    `opencode auth list` 显示 `xAI oauth`。
+  - `xai/grok-4.5` 真实容器会话退出码为 0，返回结果可被 Harness 解析；没有修改模型配置。
+  - 真实容器边界测试通过：候选可写自身文件，但不能修改只读数据，也不能通过绝对路径或符号链接访问
+    Gate/Research Root。
+  - 单元测试覆盖单一 home 挂载、runtime 文件复制和清理、模型目录预检、基础设施错误分类、预检不
+    分配 Run 及运行中故障单轮熔断。
+- **历史处置**：Run `003` 的三个失败 Round 保持原样作为审计证据，没有删除工件或编辑 Loop state。
+- **关联问题/代码**：问题 6；`src/quant_core/research/runner.py::_stage_opencode_runtime`、
+  `preflight_agent_container`、`_run_opencode_container`，`src/quant_core/research/loop.py`
 
 #### 10：候选 Agent 曾可通过 Bash 访问 Research Root
 

@@ -81,6 +81,7 @@ def _experiment_records(
             "submitted_candidate": result.get("candidate"),
             "metrics": result.get("metrics"),
             "error": result.get("error"),
+            "failure_kind": result.get("failure_kind"),
         })
     return records
 
