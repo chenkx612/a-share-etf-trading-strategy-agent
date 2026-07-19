@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -42,6 +43,14 @@ DEFAULT_UNIVERSE = (
     / "sector_rotation_universe.csv"
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / ".agents" / "skills" / "etf-vol-adaptive-topk" / "outputs"
+DEFAULT_PARAMS_FILE = (
+    REPO_ROOT
+    / ".agents"
+    / "skills"
+    / "etf-vol-adaptive-topk"
+    / "references"
+    / "accepted_params.json"
+)
 OUTPUT_COLUMNS = [
     "record_type",
     "signal_date",
@@ -64,31 +73,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default=".")
     parser.add_argument("--universe", default=str(DEFAULT_UNIVERSE))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--params-file", default=str(DEFAULT_PARAMS_FILE))
     parser.add_argument(
         "--skip-refresh",
         action="store_true",
         help="Use local qfq data without calling the market-data update command.",
     )
-    parser.add_argument("--top-n", type=int, default=DEFAULTS.top_n)
-    parser.add_argument("--sharpe-window", type=int, default=DEFAULTS.sharpe_window)
-    parser.add_argument("--factor-lower-bound", type=float, default=DEFAULTS.factor_lower_bound)
-    parser.add_argument("--corr-window", type=int, default=DEFAULTS.corr_window)
-    parser.add_argument("--corr-threshold", type=float, default=DEFAULTS.corr_threshold)
-    parser.add_argument("--stop-loss-pct", type=float, default=DEFAULTS.stop_loss_pct)
-    parser.add_argument("--vol-short-window", type=int, default=DEFAULTS.vol_short_window)
-    parser.add_argument("--vol-long-window", type=int, default=DEFAULTS.vol_long_window)
-    parser.add_argument("--vol-ratio-threshold", type=float, default=DEFAULTS.vol_ratio_threshold)
-    parser.add_argument("--risk-off-top-n", type=int, default=DEFAULTS.risk_off_top_n)
-    parser.add_argument("--risk-off-gross", type=float, default=DEFAULTS.risk_off_gross)
+    parser.add_argument("--top-n", type=int)
+    parser.add_argument("--sharpe-window", type=int)
+    parser.add_argument("--factor-lower-bound", type=float)
+    parser.add_argument("--corr-window", type=int)
+    parser.add_argument("--corr-threshold", type=float)
+    parser.add_argument("--stop-loss-pct", type=float)
+    parser.add_argument("--vol-short-window", type=int)
+    parser.add_argument("--vol-long-window", type=int)
+    parser.add_argument("--vol-ratio-threshold", type=float)
+    parser.add_argument("--risk-off-top-n", type=int)
+    parser.add_argument("--risk-off-gross", type=float)
     parser.add_argument(
         "--residual-sharpe-window",
         type=int,
-        default=DEFAULTS.residual_sharpe_window,
     )
     parser.add_argument(
         "--residual-blend-alpha",
         type=float,
-        default=DEFAULTS.residual_blend_alpha,
     )
     return parser.parse_args()
 
@@ -131,21 +139,62 @@ def refresh_data(
     )
 
 
-def build_params(args: argparse.Namespace) -> VolAdaptiveResidualSharpeParams:
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_accepted_state(path: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if not path.is_file():
+        return {}, None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    parameters = payload.get("parameters", payload)
+    if not isinstance(parameters, dict):
+        raise ValueError(f"Invalid parameter state: {path}")
+    return parameters, payload
+
+
+def verify_universe_state(state: dict[str, Any] | None, universe_path: Path) -> bool:
+    expected_hash = state.get("universe_sha256") if state else None
+    if not expected_hash:
+        return False
+    if file_sha256(universe_path) != expected_hash:
+        raise ValueError(
+            "Accepted parameters do not match the canonical ETF universe; "
+            "rerun or repair research promotion before generating holdings"
+        )
+    return True
+
+
+def build_params(
+    args: argparse.Namespace,
+    accepted: dict[str, Any] | None = None,
+) -> VolAdaptiveResidualSharpeParams:
+    accepted = accepted or {}
+
+    def value(name: str) -> Any:
+        explicit = getattr(args, name)
+        if explicit is not None:
+            return explicit
+        return accepted.get(name, getattr(DEFAULTS, name))
+
     return VolAdaptiveResidualSharpeParams(
-        top_n=args.top_n,
-        sharpe_window=args.sharpe_window,
-        factor_lower_bound=args.factor_lower_bound,
-        corr_window=args.corr_window,
-        corr_threshold=args.corr_threshold,
-        stop_loss_pct=args.stop_loss_pct,
-        vol_short_window=args.vol_short_window,
-        vol_long_window=args.vol_long_window,
-        vol_ratio_threshold=args.vol_ratio_threshold,
-        risk_off_top_n=args.risk_off_top_n,
-        risk_off_gross=args.risk_off_gross,
-        residual_sharpe_window=args.residual_sharpe_window,
-        residual_blend_alpha=args.residual_blend_alpha,
+        top_n=value("top_n"),
+        sharpe_window=value("sharpe_window"),
+        factor_lower_bound=value("factor_lower_bound"),
+        corr_window=value("corr_window"),
+        corr_threshold=value("corr_threshold"),
+        stop_loss_pct=value("stop_loss_pct"),
+        vol_short_window=value("vol_short_window"),
+        vol_long_window=value("vol_long_window"),
+        vol_ratio_threshold=value("vol_ratio_threshold"),
+        risk_off_top_n=value("risk_off_top_n"),
+        risk_off_gross=value("risk_off_gross"),
+        residual_sharpe_window=value("residual_sharpe_window"),
+        residual_blend_alpha=value("residual_blend_alpha"),
     )
 
 
@@ -161,13 +210,6 @@ def build_output(
         "target_gross": 0.0,
         "target_cash": 1.0,
     }
-    actual_gross = round(
-        float(selected["target_weight"].sum()) if not selected.empty else 0.0,
-        12,
-    )
-    risk_regime["actual_target_gross"] = actual_gross
-    risk_regime["actual_target_cash"] = round(max(0.0, 1.0 - actual_gross), 12)
-
     common = {
         "signal_date": signal_date,
         "holding_for": "next_trading_day",
@@ -186,6 +228,19 @@ def build_output(
         }
         for row in selected.itertuples(index=False)
     ]
+    target_gross = round(
+        float(selected["target_weight"].sum()) if not selected.empty else 0.0,
+        12,
+    )
+    if holding_rows:
+        rounded_gross = sum(row["target_weight"] for row in holding_rows)
+        holding_rows[-1]["target_weight"] = round(
+            holding_rows[-1]["target_weight"] + target_gross - rounded_gross,
+            12,
+        )
+    actual_gross = round(sum(row["target_weight"] for row in holding_rows), 12)
+    risk_regime["actual_target_gross"] = actual_gross
+    risk_regime["actual_target_cash"] = round(max(0.0, 1.0 - actual_gross), 12)
     holding_rows.append({
         "record_type": "cash",
         **common,
@@ -219,6 +274,7 @@ def main() -> None:
     data_root = Path(args.data_root).resolve()
     universe_path = Path(args.universe).resolve()
     output_dir = Path(args.output_dir).resolve()
+    params_file = Path(args.params_file).resolve()
     if not universe_path.is_file():
         raise FileNotFoundError(f"ETF universe does not exist: {universe_path}")
     if not args.skip_refresh:
@@ -228,7 +284,9 @@ def main() -> None:
     universe = load_universe(universe_path)
     signal_date = resolve_complete_universe_date(daily, universe, args.date)
     symbols = set(universe["symbol"].astype(str))
-    params = build_params(args)
+    accepted_params, accepted_state = load_accepted_state(params_file)
+    universe_state_verified = verify_universe_state(accepted_state, universe_path)
+    params = build_params(args, accepted_params)
     factors = compute_factors(daily, sharpe_windows=[params.sharpe_window])
     selected = select_vol_adaptive_residual_sharpe(
         factors[factors["symbol"].astype(str).isin(symbols)].copy(),
@@ -249,6 +307,8 @@ def main() -> None:
         "holding_for": "next_trading_day",
         "universe": str(universe_path),
         "parameters": asdict(params),
+        "parameters_source": str(params_file) if accepted_params else "strategy_defaults",
+        "parameters_universe_verified": universe_state_verified,
         "risk_regime": risk_regime,
         "holdings": records_without_nulls(output),
         "filters": filters,

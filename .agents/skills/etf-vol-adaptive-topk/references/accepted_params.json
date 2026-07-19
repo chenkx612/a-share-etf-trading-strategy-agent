@@ -1,0 +1,150 @@
+{
+  "strategy": "vol-adaptive-residual-sharpe",
+  "accepted_date": "2026-07-17",
+  "mode": "weekly",
+  "parameters": {
+    "top_n": 4,
+    "sharpe_window": 25,
+    "factor_lower_bound": 0.0,
+    "corr_window": 100,
+    "corr_threshold": 0.9,
+    "stop_loss_pct": 0.1,
+    "vol_short_window": 10,
+    "vol_long_window": 60,
+    "vol_ratio_threshold": 1.3,
+    "risk_off_top_n": 3,
+    "risk_off_gross": 0.4,
+    "residual_sharpe_window": 25,
+    "residual_blend_alpha": 0.15
+  },
+  "universe_sha256": "3ddfa270cca43f0afc5a9f944ffa0ff14261767ba66f2f326e43df03acf0ae86",
+  "acceptance": {
+    "decision": "accepted refreshed parameters; pruned 159201",
+    "windows": {
+      "research_start": "2025-07-18",
+      "research_end": "2026-07-17",
+      "lookback_months": 12
+    },
+    "minimum_improvement": 0.05,
+    "previous_universe_sha256": "9ffc49186d915536a27fbaabe9a5563b9c6ee12b2a847b21d05eae240a2640e4",
+    "previous_parameters": {
+      "top_n": 5,
+      "sharpe_window": 25,
+      "factor_lower_bound": 0.0,
+      "corr_window": 100,
+      "corr_threshold": 0.9,
+      "stop_loss_pct": 0.1,
+      "vol_short_window": 10,
+      "vol_long_window": 60,
+      "vol_ratio_threshold": 1.4,
+      "risk_off_top_n": 3,
+      "risk_off_gross": 0.4,
+      "residual_sharpe_window": 25,
+      "residual_blend_alpha": 0.27
+    },
+    "previous_state_accepted_date": "2026-07-17",
+    "reviewed_candidates": [
+      {
+        "symbol": "515450",
+        "name": "红利低波50ETF南方",
+        "fund_size": 20070061761.0,
+        "date": "2026-07-17",
+        "latest_price": 1.396,
+        "return_pct": 0.87,
+        "theme": "finance",
+        "in_base_pool": false,
+        "base_theme_overlap": true,
+        "base_theme_matches": "513090:香港证券ETF;512800:银行ETF华宝",
+        "base_name_duplicate": false,
+        "manual_override": true
+      },
+      {
+        "symbol": "510050",
+        "name": "上证50ETF华夏",
+        "fund_size": 23888138844.0,
+        "date": "2026-07-17",
+        "latest_price": 2.931,
+        "return_pct": -2.43,
+        "theme": "broad_index",
+        "in_base_pool": false,
+        "base_theme_overlap": true,
+        "base_theme_matches": "159915:创业板ETF",
+        "base_name_duplicate": false,
+        "manual_override": true
+      },
+      {
+        "symbol": "513500",
+        "name": "标普500ETF博时",
+        "fund_size": 25179275236.0,
+        "date": "2026-07-17",
+        "latest_price": 2.503,
+        "return_pct": -2.87,
+        "theme": "broad_index",
+        "in_base_pool": false,
+        "base_theme_overlap": true,
+        "base_theme_matches": "159915:创业板ETF",
+        "base_name_duplicate": false,
+        "manual_override": true
+      }
+    ],
+    "selected": {
+      "pool_label": "remove_159201",
+      "pool_size": 19,
+      "symbols": [
+        "159206",
+        "159259",
+        "159326",
+        "159502",
+        "159509",
+        "159518",
+        "159636",
+        "159819",
+        "159852",
+        "159915",
+        "159981",
+        "164824",
+        "512690",
+        "512800",
+        "513090",
+        "513100",
+        "515880",
+        "518880",
+        "588170"
+      ],
+      "parameters": {
+        "top_n": 4,
+        "sharpe_window": 25,
+        "factor_lower_bound": 0.0,
+        "corr_window": 100,
+        "corr_threshold": 0.9,
+        "stop_loss_pct": 0.1,
+        "vol_short_window": 10,
+        "vol_long_window": 60,
+        "vol_ratio_threshold": 1.3,
+        "risk_off_top_n": 3,
+        "risk_off_gross": 0.4,
+        "residual_sharpe_window": 25,
+        "residual_blend_alpha": 0.15
+      },
+      "research_window": {
+        "total_return": 1.4905120380000003,
+        "annual_return": 1.5862125157536409,
+        "annual_volatility": 0.3091700776191585,
+        "sharpe": 5.1305499159836785,
+        "sortino": 7.799996237689179,
+        "max_drawdown": -0.1165235871441217,
+        "avg_turnover": 0.28007904193992944
+      },
+      "valid": true
+    },
+    "pruning_challenge": {
+      "evaluated": true,
+      "removed_symbol": "159201",
+      "removed_name": "自由现金流ETF",
+      "removed_contribution": -0.018489622209196328,
+      "accepted": true,
+      "before_sortino": 6.988801951000884,
+      "after_sortino": 7.799996237689179
+    }
+  }
+}

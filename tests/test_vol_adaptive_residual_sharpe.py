@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
@@ -13,16 +14,17 @@ from quant_core.strategy.vol_adaptive_residual_sharpe import (
 )
 
 
-def load_recommendation_script():
+def load_skill_script(filename: str):
     path = (
         Path(__file__).resolve().parents[1]
         / ".agents"
         / "skills"
         / "etf-vol-adaptive-topk"
         / "scripts"
-        / "recommend_next_holdings.py"
+        / filename
     )
-    spec = importlib.util.spec_from_file_location("recommend_next_holdings", path)
+    module_name = filename.removesuffix(".py")
+    spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -111,14 +113,14 @@ def test_reported_score_is_the_residual_blended_rank_score() -> None:
 
 
 def test_recommendation_output_separates_holdings_from_filter_audit() -> None:
-    script = load_recommendation_script()
+    script = load_skill_script("recommend_next_holdings.py")
     selected = pd.DataFrame([
         {
             "date": pd.Timestamp("2026-07-17"),
             "symbol": symbol,
             "name": name,
             "score": score,
-            "target_weight": 0.6 / 3.0,
+            "target_weight": 0.4 / 3.0,
         }
         for symbol, name, score in [
             ("159502", "标普生物科技ETF", 5.8),
@@ -132,8 +134,8 @@ def test_recommendation_output_separates_holdings_from_filter_audit() -> None:
         "vol_ratio": 1.37,
         "vol_ratio_threshold": 1.3,
         "active_top_n": 3,
-        "target_gross": 0.6,
-        "target_cash": 0.4,
+        "target_gross": 0.4,
+        "target_cash": 0.6,
     }]
     selected.attrs["filter_events"] = [{
         "date": "2026-07-17",
@@ -150,8 +152,238 @@ def test_recommendation_output_separates_holdings_from_filter_audit() -> None:
     assert output.columns.tolist() == script.OUTPUT_COLUMNS
     assert "filter" not in output.columns
     assert set(output["record_type"]) == {"holding", "cash"}
-    assert output.loc[output["record_type"] == "holding", "target_weight"].tolist() == [0.2, 0.2, 0.2]
-    assert output.loc[output["record_type"] == "cash", "target_weight"].item() == 0.4
-    assert output["target_weight"].sum() == pytest.approx(1.0)
+    assert output.loc[output["record_type"] == "holding", "target_weight"].tolist() == [
+        0.133333333333,
+        0.133333333333,
+        0.133333333334,
+    ]
+    assert output.loc[output["record_type"] == "cash", "target_weight"].item() == 0.6
+    assert output["target_weight"].sum() == 1.0
     assert filters[0]["filter"] == "correlation"
-    assert risk_regime["actual_target_gross"] == 0.6
+    assert risk_regime["actual_target_gross"] == 0.4
+
+
+def test_weekly_research_uses_bounded_two_stage_grids() -> None:
+    script = load_skill_script("run_research_cycle.py")
+
+    ranking = script.ranking_grid()
+    assert len(ranking) == 54
+    assert all(params.residual_sharpe_window == params.sharpe_window for params in ranking)
+
+    risk = script.risk_grid(ranking[0])
+    assert len(risk) <= 19
+    assert all(params.risk_off_top_n <= params.top_n for params in risk)
+
+
+def test_research_challenge_uses_recent_window_improvement() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    candidate = {
+        "valid": True,
+        "research_window": {"sortino": 1.2},
+    }
+
+    assert script.passes_challenge(
+        candidate,
+        baseline={"sortino": 1.0},
+        minimum_improvement=0.05,
+    )
+    assert not script.passes_challenge(
+        candidate,
+        baseline={"sortino": 1.18},
+        minimum_improvement=0.05,
+    )
+
+
+def test_research_challenge_rejects_invalid_result() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    candidate = {
+        "valid": False,
+        "research_window": {"sortino": 2.0},
+    }
+
+    assert not script.passes_challenge(
+        candidate,
+        baseline={"sortino": 1.0},
+        minimum_improvement=0.05,
+    )
+
+
+def test_daily_recommendation_rejects_mismatched_promoted_universe(tmp_path: Path) -> None:
+    script = load_skill_script("recommend_next_holdings.py")
+    universe = tmp_path / "universe.csv"
+    universe.write_text("symbol,name\nA,ETF A\n", encoding="utf-8")
+    state = {"universe_sha256": script.file_sha256(universe)}
+
+    assert script.verify_universe_state(state, universe)
+
+    universe.write_text("symbol,name\nB,ETF B\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="do not match"):
+        script.verify_universe_state(state, universe)
+
+
+def test_research_dry_run_is_a_proposal_not_an_applied_change() -> None:
+    script = load_skill_script("run_research_cycle.py")
+
+    assert script.promotion_status(changed=True, apply=False) == "proposed"
+    assert script.promotion_status(changed=True, apply=True) == "applied"
+    assert script.promotion_status(changed=False, apply=True) == "unchanged"
+
+
+def test_candidate_pool_preserves_reviewed_candidate_metadata() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    base = pd.DataFrame([{"symbol": "A", "name": "ETF A", "fund_size": 1.0}])
+
+    result = script.candidate_pool(
+        base,
+        "B",
+        names={"B": "Fallback"},
+        metadata={"B": {"name": "Reviewed ETF", "fund_size": 12.5}},
+    )
+
+    candidate = result.loc[result["symbol"] == "B"].iloc[0]
+    assert candidate["name"] == "Reviewed ETF"
+    assert candidate["fund_size"] == 12.5
+
+
+def test_proposal_selection_considers_every_candidate_that_passes_threshold() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    pool = pd.DataFrame([{"symbol": "A"}])
+    failed_candidate = {
+        "valid": True,
+        "research_window": {"sortino": 0.9},
+    }
+    passed_candidate = {
+        "valid": True,
+        "research_window": {"sortino": 1.2},
+    }
+
+    selected = script.choose_best_proposal(
+        [
+            (failed_candidate, pool, "failed"),
+            (passed_candidate, pool, "passed"),
+        ],
+        baseline={"sortino": 1.0},
+        minimum_improvement=0.05,
+    )
+
+    assert selected is not None
+    assert selected[0] is passed_candidate
+
+
+def test_best_proposal_compares_parameter_refresh_with_addition() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    base_pool = pd.DataFrame([{"symbol": "A"}])
+    added_pool = pd.DataFrame([{"symbol": "A"}, {"symbol": "B"}])
+    parameter_refresh = {"valid": True, "research_window": {"sortino": 1.3}}
+    addition = {"valid": True, "research_window": {"sortino": 1.2}}
+
+    selected = script.choose_best_proposal(
+        [
+            (addition, added_pool, "addition"),
+            (parameter_refresh, base_pool, "parameter refresh"),
+        ],
+        baseline={"sortino": 1.0},
+        minimum_improvement=0.05,
+    )
+
+    assert selected is not None
+    assert selected[0] is parameter_refresh
+    assert selected[2] == "parameter refresh"
+
+
+def test_research_json_writer_replaces_nan_with_null(tmp_path: Path) -> None:
+    script = load_skill_script("run_research_cycle.py")
+    path = tmp_path / "result.json"
+
+    script.write_json_atomic(path, {"missing": float("nan")})
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=lambda value: pytest.fail(f"invalid JSON constant: {value}"),
+    )
+
+    assert payload == {"missing": None}
+
+
+def test_benchmark_curve_uses_open_prices_and_reports_drawdown() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    dates = pd.bdate_range("2026-01-02", periods=3)
+    daily = pd.DataFrame({
+        "date": dates,
+        "symbol": ["510300"] * 3,
+        "open": [100.0, 110.0, 99.0],
+    })
+
+    curve, metrics = script.benchmark_equity_curve(
+        daily,
+        "510300",
+        dates[0],
+        dates[-1],
+    )
+
+    assert curve["equity"].tolist() == [1.0, 1.1, 0.99]
+    assert metrics["max_drawdown"] == pytest.approx(-0.1)
+
+
+def test_equity_curve_chart_is_written_as_png(tmp_path: Path) -> None:
+    script = load_skill_script("run_research_cycle.py")
+    dates = pd.bdate_range("2026-01-02", periods=3)
+    strategy_curve = pd.DataFrame({
+        "date": dates,
+        "equity": [1.0, 1.1, 1.05],
+    })
+    benchmark_curve = pd.DataFrame({
+        "date": dates,
+        "equity": [1.0, 1.02, 1.01],
+    })
+    path = tmp_path / "equity_curve.png"
+
+    script.write_equity_curve_chart(
+        strategy_curve,
+        benchmark_curve,
+        {"annual_return": 0.2, "max_drawdown": -0.05},
+        {"annual_return": 0.08, "max_drawdown": -0.02},
+        "CSI 300 ETF (510300)",
+        12,
+        path,
+    )
+
+    assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_research_cleanup_keeps_only_auditable_outputs(tmp_path: Path) -> None:
+    script = load_skill_script("run_research_cycle.py")
+    keep = [
+        "research_summary.json",
+        "grid_results.csv",
+        "universe_before.csv",
+        "params_before.json",
+    ]
+    remove = list(script.DISPOSABLE_RESEARCH_FILES) + ["equity_curve_2026-07-17.png"]
+    for name in keep + remove:
+        (tmp_path / name).write_text("test", encoding="utf-8")
+
+    script.remove_disposable_research_files(tmp_path)
+
+    assert all((tmp_path / name).exists() for name in keep)
+    assert all(not (tmp_path / name).exists() for name in remove)
+
+
+def test_compact_grid_evaluation_does_not_repeat_pool_symbols() -> None:
+    script = load_skill_script("run_research_cycle.py")
+    evaluation = {
+        "pool_label": "add_B",
+        "pool_size": 2,
+        "symbols": ["A", "B"],
+        "parameters": {"top_n": 1},
+        "valid": True,
+        "research_window": {
+            "annual_return": 0.2,
+            "max_drawdown": -0.1,
+            "sortino": 1.5,
+        },
+    }
+
+    compact = script.compact_evaluation(evaluation)
+
+    assert "symbols" not in compact
+    assert compact["metrics"]["annual_return"] == 0.2

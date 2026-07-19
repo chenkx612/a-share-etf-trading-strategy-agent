@@ -1,55 +1,156 @@
 ---
 name: etf-vol-adaptive-topk
-description: Generate an auditable next-trading-day ETF and cash target portfolio with src/quant_core/strategy/vol_adaptive_residual_sharpe.py. Use when Codex needs current holdings advice for the sector-rotation ETF universe, including risk-off state and stop-loss or correlation filters; accept explicit strategy parameters and otherwise use the strategy defaults.
+description: Maintain the sector-rotation ETF universe and parameters for vol-adaptive-residual-sharpe, then generate auditable next-trading-day ETF and cash holdings. Use for daily recommendations, weekly post-close three-candidate add/prune/grid research, or an early parameter-only search explicitly triggered by abnormal markets.
 ---
 
 # ETF Vol-Adaptive Top-K
 
 Run from the repository root.
 
-## Workflow
+```bash
+TRADE_DATE="${TRADE_DATE:-$(date +%F)}"
+RUN_DIR=".agents/skills/etf-vol-adaptive-topk/outputs/research"
+```
 
-1. Default the requested date to today and the universe to
-   `.agents/skills/etf-sharpe-topk/references/sector_rotation_universe.csv`.
-   This is the single durable sector-rotation pool; do not copy or mutate it.
-2. Run the recommendation script. It refreshes stale qfq daily data for the
-   selected universe, uses the latest complete signal date on or before the
-   request, and writes ETF plus cash target weights.
-3. Use strategy defaults unless the user supplies parameters or provides a
-   previously accepted parameter set. Do not optimize parameters inside this
-   skill. Parameter promotion belongs to the deterministic Research Harness.
-4. Treat the output as the target portfolio for the next trading day after the
-   signal date. Never describe the signal date as the execution date.
-5. Use `--skip-refresh` only for an explicit offline/local-data run.
+## Cadence
 
-## Command
+- Every trading day: refresh qfq data and generate next-trading-day holdings.
+- After the last trading day of each week closes: review exactly three ETF
+  candidates, run add challenges, optimize parameters, and run one prune
+  challenge on the latest lookback window. Apply only changes that improve the
+  objective by the fixed threshold.
+- Abnormal market: allow an explicit early parameter-only research cycle. Do
+  not discover candidates, add ETFs, or prune the pool in this mode.
+
+An abnormal trigger is a supervisor/user decision based on observed risk state,
+such as a risk-off transition or an unusually large volatility-ratio expansion.
+Do not silently turn every risk-off day into a research run.
+
+## Daily Recommendation
 
 ```bash
 python3 .agents/skills/etf-vol-adaptive-topk/scripts/recommend_next_holdings.py \
-  --date "${TRADE_DATE:-$(date +%F)}"
+  --date "$TRADE_DATE"
 ```
 
-Pass `--universe`, `--data-root`, `--output-dir`, or individual strategy
-parameters only when needed.
+The command uses the canonical pool at
+`.agents/skills/etf-sharpe-topk/references/sector_rotation_universe.csv` and the
+last accepted parameters at `references/accepted_params.json`; strategy defaults
+apply until the first accepted research cycle.
+
+## Weekly Research
+
+1. Discover candidates with the reusable `$etf-sharpe-topk` stage:
+
+```bash
+python3 .agents/skills/etf-sharpe-topk/scripts/select_etf_candidates.py \
+  --date "$TRADE_DATE" \
+  --output-dir "$RUN_DIR"
+```
+
+2. Read `candidate_selected.csv` and `candidate_shortlist.csv`. Perform the
+   mandatory AI semantic de-duplication review from `$etf-sharpe-topk`, finish
+   with exactly three symbols, and set `CANDIDATES`. Exclude money-market or
+   cash-management ETFs because this strategy already models cash explicitly.
+3. Prepare reviewed candidates and refresh their data:
+
+```bash
+python3 .agents/skills/etf-sharpe-topk/scripts/prepare_etf_pool_run.py \
+  --date "$TRADE_DATE" \
+  --root "$RUN_DIR" \
+  --candidates "$CANDIDATES"
+```
+
+4. Refresh the qfq CSI 300 ETF benchmark:
+
+```bash
+python3 .agents/skills/etf-vol-adaptive-topk/scripts/refresh_csi300_benchmark.py \
+  --date "$TRADE_DATE"
+```
+
+5. Run the deterministic weekly challenge and persist accepted state:
+
+```bash
+python3 .agents/skills/etf-vol-adaptive-topk/scripts/run_research_cycle.py \
+  --date "$TRADE_DATE" \
+  --root "$RUN_DIR" \
+  --apply
+```
+
+6. Generate the final next-trading-day holdings:
+
+```bash
+python3 .agents/skills/etf-vol-adaptive-topk/scripts/recommend_next_holdings.py \
+  --date "$TRADE_DATE"
+```
+
+The research command:
+
+- uses the latest 12 months by default; override with `--lookback-months`;
+- uses all data in that window for parameter search and stock-pool challenges;
+- searches risk parameters in a second bounded grid;
+- compares the base pool with each one-candidate addition;
+- challenges the selected pool by removing only its lowest-contribution ETF;
+- requires parameter, addition, and prune proposals to improve Sortino by the
+  configured minimum on the same recent window;
+- accepts changes only when validity constraints and the threshold pass;
+- plots the selected strategy and `510300` CSI 300 ETF baseline over the same
+  lookback window, with annualized return and maximum drawdown on the chart;
+- backs up the previous universe/parameters before promotion;
+- stores the accepted evidence snapshot with the parameters and verifies that
+  the promoted parameters still match the canonical universe before each daily
+  recommendation.
+
+## Abnormal-Market Parameter Search
+
+```bash
+python3 .agents/skills/etf-vol-adaptive-topk/scripts/refresh_csi300_benchmark.py \
+  --date "$TRADE_DATE"
+
+python3 .agents/skills/etf-vol-adaptive-topk/scripts/run_research_cycle.py \
+  --date "$TRADE_DATE" \
+  --mode abnormal \
+  --root "$RUN_DIR" \
+  --apply
+
+python3 .agents/skills/etf-vol-adaptive-topk/scripts/recommend_next_holdings.py \
+  --date "$TRADE_DATE"
+```
+
+This mode may update parameters but must not change the ETF universe.
 
 ## Outputs
 
-- `outputs/recommendation_<signal-date>_sector-rotation.csv`: executable ETF
-  and cash target holdings only.
-- `outputs/recommendation_summary.json`: requested date, signal date,
-  parameters, risk regime, complete holdings, stop-loss/correlation filter
-  audit, and output path.
+- Daily `outputs/recommendation_<signal-date>_sector-rotation.csv`: executable
+  ETF and cash holdings only.
+- Daily `outputs/recommendation_summary.json`: signal, parameters, risk state,
+  holdings, and filter audit.
+- Research `outputs/research/research_summary.json`: reviewed additions, each
+  pool's best grid result, prune attempt, annualized return, maximum drawdown,
+  selected pool/parameters, and promotion decision.
+- Research `outputs/research/grid_results.csv`: complete deterministic grid
+  rows for detailed audit.
+- `outputs/equity_curve_<research-date>.png`: selected
+  strategy versus the qfq `510300` CSI 300 ETF baseline for the same N-month
+  research window, annotated with annualized return and maximum drawdown.
+- Research backups `outputs/research/universe_before.csv` and
+  `params_before.json`: present only when the corresponding accepted state was
+  replaced.
+- `references/accepted_params.json`: self-contained last promoted parameter
+  contract, universe fingerprint, and acceptance evidence.
 
-ETF and cash target weights must sum to 1.0. If no ETF passes, output 100% cash.
+Candidate-selection and refresh files, plus duplicate best/evaluation/selected
+files, are removed after a successful research summary is written.
+
+ETF and cash weights must sum to 1.0. Recommendation dates are signal dates;
+holdings apply to the next trading day.
 
 ## Final Report
 
-Reply in Chinese. Include:
+Reply in Chinese. For daily runs, report the signal date, ETF/cash weights,
+risk state, and actual filters. For research runs, report the three reviewed
+candidates, lookback window, selected pool/parameters, recent-window metrics,
+prune decision, and the explicit promotion status (`proposed`,
+`applied`, or `unchanged`).
 
-- 信号日期及“适用于下一交易日”的说明。
-- ETF 和现金的 symbol、名称、score、target weight。
-- risk-off、波动率比值与阈值、风险档目标仓位、实际总仓位和现金。
-- 仅在存在时列出 stop-loss 和 correlation 过滤事件。
-
-Do not report backtest metrics or claim the parameters are optimal unless they
-came from a separately completed and accepted Research Harness result.
+Do not claim a rejected proposal changed the accepted pool or parameters.
