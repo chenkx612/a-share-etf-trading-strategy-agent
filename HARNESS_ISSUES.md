@@ -56,7 +56,8 @@
 
 - **状态**：open
 - **发现日期**：2026-07-19
-- **问题与影响**：Run `003` 启动时，因 disposable Development runtime 目录不存在，
+- **问题与影响**：一次故障 Run（当时编号 `003`，后按用户要求从研究历史移除）启动时，因
+  disposable Development runtime 目录不存在，
   `champion.json` 中原本完整的 Development/Gate 指标和 `champion_metrics_key` 被写成 `null`。
   随后三轮 Agent 均在容器初始化阶段失败，没有评测可重新填充指标；终局报告因此声称本 Run 无法报告
   当前 Champion 指标。历史 Run `001` 的接受证据仍在，既有晋级决定未改变，但任务级耐久摘要被临时
@@ -146,7 +147,9 @@
     Gate/Research Root。
   - 单元测试覆盖单一 home 挂载、runtime 文件复制和清理、模型目录预检、基础设施错误分类、预检不
     分配 Run 及运行中故障单轮熔断。
-- **历史处置**：Run `003` 的三个失败 Round 保持原样作为审计证据，没有删除工件或编辑 Loop state。
+- **历史处置**：确认故障根因、完成修复和验收后，按用户要求删除 Run `003` 的系统失败工件，避免其
+  进入后续策略研究历史；同时从冻结的 `001/004` 结果恢复 Champion 指标，并把
+  `last_round_id` 恢复为 `002/005`。本条只保留框架工程证据，不把该故障 Run 视为研究结论。
 - **关联问题/代码**：问题 6；`src/quant_core/research/runner.py::_stage_opencode_runtime`、
   `preflight_agent_container`、`_run_opencode_container`，`src/quant_core/research/loop.py`
 
