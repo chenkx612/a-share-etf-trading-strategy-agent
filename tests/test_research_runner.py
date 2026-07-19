@@ -351,6 +351,111 @@ def test_container_runner_removes_container_after_timeout(
     assert invocations[0][1] == ""
 
 
+def test_container_runner_retries_daemon_missing_bind_source_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    invocations: list[Sequence[str]] = []
+    removed: list[str] = []
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_AUTH_FILE",
+        str(tmp_path / "missing-auth.json"),
+    )
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_CONFIG_FILE",
+        str(tmp_path / "missing-config.jsonc"),
+    )
+
+    def transient_failure(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        invocations.append(command)
+        if len(invocations) == 1:
+            log_path.write_text(
+                "docker: Error response from daemon: invalid mount config for "
+                'type "bind": bind source path does not exist: /host_mnt/workspace',
+                encoding="utf-8",
+            )
+            return 125
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", transient_failure)
+
+    def remove_container(name: str) -> bool:
+        removed.append(name)
+        return True
+
+    monkeypatch.setattr(research_runner, "_remove_agent_container", remove_container)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run"],
+        "prompt",
+        tmp_path,
+        tmp_path / "agent.log",
+        1,
+    )
+
+    assert exit_code == 0
+    assert len(invocations) == 2
+    assert len(removed) == 2
+    first_name = invocations[0][invocations[0].index("--name") + 1]
+    second_name = invocations[1][invocations[1].index("--name") + 1]
+    assert first_name != second_name
+
+
+def test_container_runner_does_not_retry_when_bind_source_is_locally_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    invocations = 0
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_AUTH_FILE",
+        str(tmp_path / "missing-auth.json"),
+    )
+    monkeypatch.setenv(
+        "QUANT_OPENCODE_CONFIG_FILE",
+        str(tmp_path / "missing-config.jsonc"),
+    )
+
+    def local_failure(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        nonlocal invocations
+        invocations += 1
+        candidate.rmdir()
+        log_path.write_text(
+            "docker: Error response from daemon: bind source path does not exist",
+            encoding="utf-8",
+        )
+        return 125
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", local_failure)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run"],
+        "prompt",
+        candidate,
+        tmp_path / "agent.log",
+        1,
+    )
+
+    assert exit_code == 125
+    assert invocations == 1
+
+
 def test_container_cleanup_accepts_an_already_absent_container(monkeypatch) -> None:
     monkeypatch.setattr(
         subprocess,

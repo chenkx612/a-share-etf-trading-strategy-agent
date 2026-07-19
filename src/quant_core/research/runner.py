@@ -387,6 +387,30 @@ def _remove_agent_container(name: str) -> bool:
     )
 
 
+def _bind_sources_exist(command: Sequence[str]) -> bool:
+    sources: list[Path] = []
+    for part in command:
+        if not part.startswith("type=bind,src="):
+            continue
+        source = part.split("src=", 1)[1].split(",dst=", 1)[0]
+        sources.append(Path(source))
+    return bool(sources) and all(source.exists() for source in sources)
+
+
+def _is_retryable_bind_source_failure(
+    exit_code: int,
+    log_path: Path,
+    command: Sequence[str],
+) -> bool:
+    if exit_code == 0 or not _bind_sources_exist(command):
+        return False
+    try:
+        detail = log_path.read_text(encoding="utf-8").casefold()
+    except OSError:
+        return False
+    return "bind source path does not exist" in detail
+
+
 def _run_opencode_container(
     command: Sequence[str],
     prompt: str,
@@ -400,8 +424,13 @@ def _run_opencode_container(
         "external_directory": "deny",
         "question": "deny",
     }
-    container_name = f"quant-agent-{uuid.uuid4().hex}"
     try:
+        if not cwd.is_dir():
+            log_path.write_text(
+                f"Agent candidate workspace does not exist: {cwd}",
+                encoding="utf-8",
+            )
+            return 127
         container_input = prompt
         container_command_parts = list(command)
         if container_command_parts[:2] == ["opencode", "run"]:
@@ -425,30 +454,40 @@ def _run_opencode_container(
                 if hidden.is_dir()
                 else []
             )
-            container_command = _docker_opencode_command(
-                container_command_parts,
-                cwd,
-                permissions,
-                read_only_paths,
-                hidden_mounts,
-                runtime_home,
-                container_name,
-            )
-            try:
-                exit_code = _run_prompt_process(
-                    container_command,
-                    container_input,
+            for attempt in range(2):
+                container_name = f"quant-agent-{uuid.uuid4().hex}"
+                container_command = _docker_opencode_command(
+                    container_command_parts,
                     cwd,
-                    log_path,
-                    timeout,
+                    permissions,
+                    read_only_paths,
+                    hidden_mounts,
+                    runtime_home,
+                    container_name,
                 )
-            finally:
-                removed = _remove_agent_container(container_name)
-            if not removed:
-                with log_path.open("a", encoding="utf-8") as log:
-                    log.write("\nFailed to remove Agent container")
-                return 127
-            return exit_code
+                try:
+                    exit_code = _run_prompt_process(
+                        container_command,
+                        container_input,
+                        cwd,
+                        log_path,
+                        timeout,
+                    )
+                finally:
+                    removed = _remove_agent_container(container_name)
+                if not removed:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write("\nFailed to remove Agent container")
+                    return 127
+                if attempt == 0 and _is_retryable_bind_source_failure(
+                    exit_code,
+                    log_path,
+                    container_command,
+                ):
+                    time.sleep(0.25)
+                    continue
+                return exit_code
+            raise AssertionError("unreachable")
     except (OSError, ValueError) as exc:
         log_path.write_text(str(exc), encoding="utf-8")
         return 127

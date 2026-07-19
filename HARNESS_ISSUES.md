@@ -270,6 +270,42 @@
 
 ### P1：重要可靠性问题
 
+#### 17：晋级后的下一轮候选 worktree 对 Docker bind 不可见
+
+- **状态**：resolved
+- **发现日期**：2026-07-19
+- **解决日期**：2026-07-19
+- **问题与影响**：Run `003` 的 Round `001` 正常评测并晋级；约 6 秒后 Round `002` 在 Agent
+  容器启动时失败。Docker daemon 报告候选 bind source
+  `.../.tmp/worktrees/003/candidates/002` 不存在，Harness 因基础设施熔断提前停止，实际效果会使
+  多轮 Loop 退化为单轮研发。已接受 Champion 和 Gate 证据未受污染。
+- **根因**：每轮 `create_candidate()` 会调用 `initialize()`；已有 Champion 状态下，
+  `initialize()` 对本 Run 的 candidates/evaluators 执行全量清理并删除空父目录。下一步又立即在
+  同一路径重建父目录和候选 worktree。真实失败发生在这个删除/重建窗口后，Docker Desktop daemon
+  未看到新 bind source。Runner 对该特定 daemon 瞬态也没有安全重试。
+- **修正**：
+  - 活动 Run 的 `initialize()` 和 `create_candidate()` 只删除子 worktree，保留
+    candidates/evaluators 父目录；终局 `cleanup_transient()` 仍完整删除 disposable 路径。
+  - Agent 启动前确认候选 workspace 在宿主机存在。
+  - 只有 Docker 明确返回 `bind source path does not exist` 且命令中的全部 bind source 在宿主机
+    仍存在时，等待 0.25 秒、使用新容器名重试一次。真实目录缺失、超时、其他 Docker 错误或第二次
+    失败均不重试；因此不会重复 Agent 输出、测试、回测、Decision 或晋级。
+- **验证**：
+  - 单元测试确认轮次间 candidates 父目录 inode 不变、daemon 瞬态只重试一次、宿主目录真实缺失
+    不重试。
+  - 全量测试通过：`138 passed, 2 skipped`。
+  - 在当前 Docker Desktop 真实运行增强验收：Round `001` 创建、容器挂载并执行 `promote()` 后，
+    Round `002` 至 `005` 连续创建并由真实 Agent 镜像成功挂载；既有容器只读/Research Root
+    隔离边界测试同时通过。
+- **遗留风险**：Docker daemon 持续不可用或 bind source 在宿主机真实消失仍会按
+  `infrastructure_failure` 熔断，这是保守且正确的行为；一次重试只吸收已证明不会启动 Agent 的
+  特定 mount 初始化瞬态。
+- **关联代码/测试/工件**：`src/quant_core/research/workspace.py::_cleanup_worktrees`、
+  `ResearchWorkspace.initialize`、`src/quant_core/research/runner.py::_run_opencode_container`、
+  `tests/test_research_workspace.py::test_consecutive_candidate_worktrees_mount_in_real_agent_container`、
+  `tests/test_research_runner.py::test_container_runner_retries_daemon_missing_bind_source_once`、
+  `.research/sharpe-corr-threshold-optimization/runs/003/rounds/002/result.json`
+
 #### 8：终局报告缺少完整 Decision 语义
 
 - **状态**：resolved

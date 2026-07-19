@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Sequence
 import pandas as pd
 import pytest
 
-from quant_core.research.runner import run_managed_once
+from quant_core.research.runner import _run_opencode_container, run_managed_once
 from quant_core.research.workspace import ResearchWorkspace
 
 
@@ -265,6 +266,85 @@ def test_temporary_worktree_captures_dirty_strategy_without_changing_source(
     assert _git_text(tmp_path, "rev-parse", "HEAD") == head_before
     assert _git_text(tmp_path, "status", "--short") == status_before
     manager.reject(candidate, state, "001/001")
+
+
+def test_candidate_parent_remains_stable_between_rounds(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "stable-parent")
+    manager = base.for_run(1)
+
+    first, _experiment, state = manager.create_candidate(
+        "001",
+        strategy_path="strategy.py",
+    )
+    parent_inode = manager.candidates.stat().st_ino
+    manager.reject(first, state, "001/001")
+
+    assert manager.candidates.is_dir()
+    second, _experiment, state = manager.create_candidate(
+        "002",
+        strategy_path="strategy.py",
+    )
+
+    assert manager.candidates.stat().st_ino == parent_inode
+    assert second.is_dir()
+    manager.reject(second, state, "001/002")
+
+
+@pytest.mark.skipif(
+    os.environ.get("QUANT_TEST_AGENT_CONTAINER") != "1",
+    reason="set QUANT_TEST_AGENT_CONTAINER=1 after building the research Agent image",
+)
+def test_consecutive_candidate_worktrees_mount_in_real_agent_container(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "docker-stable-parent")
+    manager = base.for_run(1)
+    parent_inode: int | None = None
+
+    for round_id in ("001", "002", "003", "004", "005"):
+        candidate, _experiment, state = manager.create_candidate(
+            round_id,
+            strategy_path="strategy.py",
+        )
+        try:
+            current_inode = manager.candidates.stat().st_ino
+            if parent_inode is None:
+                parent_inode = current_inode
+            assert current_inode == parent_inode
+            marker = candidate / f"mounted-{round_id}"
+            exit_code = _run_opencode_container(
+                [
+                    "python3",
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        f"Path('/workspace/{marker.name}').write_text('ok', encoding='utf-8')"
+                    ),
+                ],
+                "",
+                candidate,
+                tmp_path / f"container-{round_id}.log",
+                60,
+            )
+            assert exit_code == 0
+            assert marker.read_text(encoding="utf-8") == "ok"
+        except BaseException:
+            manager.reject(candidate, state, f"001/{round_id}")
+            raise
+        if round_id == "001":
+            manager.promote(
+                candidate,
+                state,
+                "001/001",
+                {"development": {"sortino": 1.0}, "gate": {"sortino": 1.0}},
+                ["strategy.py"],
+            )
+        else:
+            manager.reject(candidate, state, f"001/{round_id}")
 
 
 def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None:

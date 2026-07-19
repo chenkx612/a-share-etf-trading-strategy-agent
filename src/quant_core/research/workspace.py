@@ -371,7 +371,7 @@ class ResearchWorkspace:
                 shutil.rmtree(path)
         _git(self.source, "worktree", "prune")
 
-    def _cleanup_worktrees(self, root: Path) -> None:
+    def _cleanup_worktrees(self, root: Path, *, remove_root: bool = True) -> None:
         if not root.exists():
             return
         for path in list(root.iterdir()):
@@ -379,6 +379,8 @@ class ResearchWorkspace:
                 self._remove_worktree(path)
             else:
                 path.unlink()
+        if not remove_root:
+            return
         try:
             root.rmdir()
         except OSError:
@@ -671,8 +673,8 @@ class ResearchWorkspace:
             if state.get("baseline_exclude", []) != list(baseline_exclude):
                 raise ValueError("task baseline exclusions changed after research workspace initialization")
             if self.run_number is not None:
-                self._cleanup_worktrees(self.candidates)
-                self._cleanup_worktrees(self.evaluators)
+                self._cleanup_worktrees(self.candidates, remove_root=False)
+                self._cleanup_worktrees(self.evaluators, remove_root=False)
             self._prepare_runtime(state, development_end)
             return state
 
@@ -746,7 +748,10 @@ class ResearchWorkspace:
             baseline_exclude,
             strategy_path,
         )
-        self._cleanup_worktrees(self.candidates)
+        # Keep the per-Run parent stable between rounds. Docker Desktop can
+        # briefly lose newly recreated bind paths when this directory is
+        # removed immediately before the next candidate is mounted.
+        self._cleanup_worktrees(self.candidates, remove_root=False)
         candidate = self.candidates / round_id
         experiment = self.rounds / round_id
         if candidate.exists() or experiment.exists():
