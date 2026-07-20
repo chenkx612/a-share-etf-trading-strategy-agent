@@ -201,6 +201,27 @@ python3 -m quant_core.cli recommend today --universe path/to/universe.csv --date
 
 缺少 `pyarrow` 时，本地表会自动降级为 CSV；安装项目依赖后默认使用 Parquet。
 
+### 生成低成本 ETF 轮动池
+
+仓库级建池命令与各技能解耦，默认只生成预览：
+
+```bash
+python3 scripts/build_liquid_etf_universe.py --date YYYY-MM-DD
+```
+
+预览产物写入 `outputs/liquid_etf_universe/`，包括 `shortlist.csv`、
+`selected_universe.csv`、`correlation.csv` 和带完整剔除原因的 `summary.json`。
+显式增加 `--apply` 时，命令会备份旧池并原子更新
+`universes/liquid_etf_rotation.csv`；它不会修改 `universes/sector_rotation.csv`。
+任一入围 ETF 行情刷新失败或最终池为空时，命令保留预览和审计产物但拒绝更新正式池。
+
+默认参数为 `--min-fund-size 10000000000`、`--shortlist-size 30`、
+`--lookback-days 252`、`--min-observations 120` 和
+`--corr-threshold 0.90`。命令只扫描当前 ETF 产品，不主动纳入 LOF，并允许当前
+产品列表带来的幸存者偏差。筛选和排序只使用当前规模及名称分组，不使用历史或当日
+收益排名；共享前复权历史仅用于剔除历史不足和普通 Pearson 相关系数大于阈值的产品，
+负相关不取绝对值。相关性去重后不强制补足 30 只。
+
 ## Project layout
 
 ```text
@@ -209,6 +230,7 @@ src/quant_core/data/      # Market data download, cache, and table IO
 src/quant_core/factors/   # Deterministic factor calculations
 src/quant_core/strategy/  # Candidate and built-in strategy implementations
 src/quant_core/backtest/  # Fixed simulation engine and metrics
+scripts/                  # Repository-level operational and universe-building commands
 tests/                    # Framework and harness tests
 universes/                # Repository-level stock pools shared across skills
 HARNESS_ISSUES.md         # Prioritized Harness issue and resolution history
