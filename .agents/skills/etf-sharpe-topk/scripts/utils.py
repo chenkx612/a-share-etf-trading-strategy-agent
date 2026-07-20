@@ -60,7 +60,7 @@ DEFAULT_CONSTRAINT = "drawdown-lt-return"
 DEFAULT_ROOT = ".agents/skills/etf-sharpe-topk/outputs"
 DEFAULT_DATA_ROOT = "."
 DEFAULT_UNIVERSE_NAME = "sector-rotation"
-DEFAULT_BASE_POOL = SCRIPT_DIR.parent / "references" / "sector_rotation_universe.csv"
+DEFAULT_BASE_POOL = REPO_ROOT / "universes" / "sector_rotation.csv"
 
 
 def add_common_run_args(parser: argparse.ArgumentParser) -> None:
@@ -154,6 +154,23 @@ def parse_candidates(value: str) -> list[str]:
 
 def load_base_pool() -> pd.DataFrame:
     return load_universe(DEFAULT_BASE_POOL)
+
+
+def apply_selected_universe(
+    *,
+    apply: bool,
+    base_universe: pd.DataFrame,
+    selected_universe: pd.DataFrame,
+    run_dir_path: Path,
+    destination: Path = DEFAULT_BASE_POOL,
+) -> Path | None:
+    if not apply:
+        return None
+    backup_path = write_table(base_universe, run_dir_path / "universe_before")
+    selected_universe.to_csv(destination, index=False)
+    print(f"backed up previous universe to {backup_path}")
+    print(f"updated universe to {destination}")
+    return backup_path
 
 
 def csv_bool(value: object) -> bool:
@@ -431,12 +448,12 @@ def run_pool_optimization(args: argparse.Namespace, candidates: str, run_id: str
         encoding="utf-8",
     )
 
-    if args.apply:
-        current_path = write_table(base_universe, run_dir_path / "universe_before")
-        selected_path = DEFAULT_BASE_POOL
-        selected_universe.to_csv(selected_path, index=False)
-        print(f"backed up previous universe to {current_path}")
-        print(f"updated universe to {selected_path}")
+    apply_selected_universe(
+        apply=bool(args.apply),
+        base_universe=base_universe,
+        selected_universe=selected_universe,
+        run_dir_path=run_dir_path,
+    )
     (run_dir_path / "apply_status.json").write_text(
         json.dumps({"apply": bool(args.apply)}, ensure_ascii=False, indent=2),
         encoding="utf-8",

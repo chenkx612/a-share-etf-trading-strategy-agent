@@ -210,12 +210,13 @@ src/quant_core/factors/   # Deterministic factor calculations
 src/quant_core/strategy/  # Candidate and built-in strategy implementations
 src/quant_core/backtest/  # Fixed simulation engine and metrics
 tests/                    # Framework and harness tests
+universes/                # Repository-level stock pools shared across skills
 HARNESS_ISSUES.md         # Prioritized Harness issue and resolution history
-.agents/skills/           # Task knowledge, prompts, scripts, assets, and outputs
+.agents/skills/           # Skill-specific knowledge, prompts, scripts, parameters, and outputs
 .research/<task-id>/      # Champion, numbered Run history, cache, and temp observation
 ```
 
-运行命令默认把本地日线缓存写到当前工作目录下的 `data/etf_daily.*`，把因子、回测和推荐等中间结果写到 `outputs/`。股票池不再保存在 `data/` 下；调用框架 CLI 时通过 `--universe path/to/universe.csv` 显式传入。
+运行命令默认把本地日线缓存写到当前工作目录下的 `data/etf_daily.*`，把因子、回测和推荐等中间结果写到 `outputs/`。跨技能共享的股票池放在 `universes/`，当前 sector-rotation 的 canonical 股票池为 `universes/sector_rotation.csv`；技能目录只保存技能专属输入和产物。股票池不保存在 `data/` 下；调用框架 CLI 时通过 `--universe path/to/universe.csv` 显式传入。
 
 技能应显式把 `--root` 指向自己的 `outputs/` 子目录，避免在项目根目录产生中间结果：
 

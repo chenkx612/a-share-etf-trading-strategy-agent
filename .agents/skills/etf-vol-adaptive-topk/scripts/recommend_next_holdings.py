@@ -34,14 +34,7 @@ from quant_core.strategy.vol_adaptive_residual_sharpe import (  # noqa: E402
 
 
 DEFAULTS = VolAdaptiveResidualSharpeParams()
-DEFAULT_UNIVERSE = (
-    REPO_ROOT
-    / ".agents"
-    / "skills"
-    / "etf-sharpe-topk"
-    / "references"
-    / "sector_rotation_universe.csv"
-)
+DEFAULT_UNIVERSE = REPO_ROOT / "universes" / "sector_rotation.csv"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / ".agents" / "skills" / "etf-vol-adaptive-topk" / "outputs"
 DEFAULT_PARAMS_FILE = (
     REPO_ROOT

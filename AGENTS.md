@@ -46,8 +46,10 @@ is the canonical user-facing command and operations guide. `HARNESS_ISSUES.md`
 is the engineering risk and resolution registry; do not create overview
 documents that repeat this file or the README, and do not put quantitative
 trading business knowledge in framework documentation.
-Skill-specific prompts, knowledge, scripts, templates, stock-pool definitions, and intermediate outputs live under
-`.agents/skills/<skill-name>/`. Managed research keeps the task-level strategy
+Repository-level stock pools shared across skills live under `universes/`.
+Skill-specific prompts, knowledge, scripts, templates, parameters, and intermediate
+outputs live under `.agents/skills/<skill-name>/`; keep stock pools there only
+when they are exclusive to one skill. Managed research keeps the task-level strategy
 at `.research/<task-id>/champion.py`, its metadata at `champion.json`, and immutable Loop history under
 `.research/<task-id>/runs/<run>/rounds/<round>/`. It must remain isolated from
 normal framework outputs.

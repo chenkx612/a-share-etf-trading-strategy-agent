@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,8 @@ from quant_core.strategy.vol_adaptive_residual_sharpe import (
     VolAdaptiveResidualSharpeParams,
     select_vol_adaptive_residual_sharpe,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_skill_script(filename: str):
@@ -29,6 +32,66 @@ def load_skill_script(filename: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_vol_adaptive_scripts_share_repository_universe_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    research = load_skill_script("run_research_cycle.py")
+    recommendation = load_skill_script("recommend_next_holdings.py")
+
+    expected = REPO_ROOT / "universes" / "sector_rotation.csv"
+    assert research.DEFAULT_UNIVERSE == expected
+    assert recommendation.DEFAULT_UNIVERSE == expected
+
+    custom_universe = tmp_path / "custom.csv"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_research_cycle.py", "--universe", str(custom_universe)],
+    )
+    assert research.parse_args().universe == str(custom_universe)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["recommend_next_holdings.py", "--universe", str(custom_universe)],
+    )
+    assert recommendation.parse_args().universe == str(custom_universe)
+
+
+def test_vol_adaptive_apply_updates_universe_and_dry_run_does_not(
+    tmp_path: Path,
+) -> None:
+    research = load_skill_script("run_research_cycle.py")
+    universe_path = tmp_path / "sector_rotation.csv"
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    before = pd.DataFrame([{"symbol": "A", "name": "ETF A", "fund_size": 1.0}])
+    after = pd.DataFrame([{"symbol": "B", "name": "ETF B", "fund_size": 2.0}])
+    before.to_csv(universe_path, index=False)
+
+    assert research.apply_universe_update(
+        apply=False,
+        universe_changed=True,
+        universe_path=universe_path,
+        selected_pool=after,
+        output_dir=output_dir,
+    ) is None
+    pd.testing.assert_frame_equal(pd.read_csv(universe_path), before)
+    assert not (output_dir / "universe_before.csv").exists()
+
+    backup = research.apply_universe_update(
+        apply=True,
+        universe_changed=True,
+        universe_path=universe_path,
+        selected_pool=after,
+        output_dir=output_dir,
+    )
+
+    assert backup == output_dir / "universe_before.csv"
+    pd.testing.assert_frame_equal(pd.read_csv(universe_path), after)
+    pd.testing.assert_frame_equal(pd.read_csv(backup), before)
 
 
 def test_risk_off_cannot_increase_position_count() -> None:

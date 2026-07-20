@@ -33,8 +33,8 @@ python3 .agents/skills/etf-vol-adaptive-topk/scripts/recommend_next_holdings.py 
   --date "$TRADE_DATE"
 ```
 
-The command uses the canonical pool at
-`.agents/skills/etf-sharpe-topk/references/sector_rotation_universe.csv` and the
+The command uses the repository-level canonical pool at
+`universes/sector_rotation.csv` and the
 last accepted parameters at `references/accepted_params.json`; strategy defaults
 apply until the first accepted research cycle.
 
@@ -96,7 +96,8 @@ The research command:
 - accepts changes only when validity constraints and the threshold pass;
 - plots the selected strategy and `510300` CSI 300 ETF baseline over the same
   lookback window, with annualized return and maximum drawdown on the chart;
-- backs up the previous universe/parameters before promotion;
+- writes an accepted universe back to `universes/sector_rotation.csv` and backs
+  up the previous universe/parameters before promotion;
 - stores the accepted evidence snapshot with the parameters and verifies that
   the promoted parameters still match the canonical universe before each daily
   recommendation.

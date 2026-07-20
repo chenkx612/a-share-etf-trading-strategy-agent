@@ -14,9 +14,10 @@ RUN_DIR=".agents/skills/etf-sharpe-topk/outputs"
 
 ## Directory Roles
 
-- `references/`: input prompts, knowledge, and static reference data used by the skill. The fallback base `sector_rotation_universe.csv` belongs here.
+- `references/`: skill-specific input prompts, knowledge, and static reference data.
 - `scripts/`: independently runnable scripts with their own CLI entry points for AI-callable stages. Shared helper code may live in `scripts/utils.py` or a clearly named `utils/` module; do not call helper modules directly as workflow stages.
 - `outputs/`: generated run artifacts only. Treat it as disposable unless `--apply` backs up the previous base pool there.
+- `universes/sector_rotation.csv`: repository-level canonical sector-rotation pool shared by ETF research skills.
 
 ## SOP
 
@@ -27,7 +28,7 @@ RUN_DIR=".agents/skills/etf-sharpe-topk/outputs"
    - Filter ETF fund size >= 10,000,000,000 CNY using `总市值` when available, otherwise `流通市值`.
    - Rank by realtime spot field `涨跌幅`; do not fetch daily bars just to calculate the same-day return.
    - Exclude ETFs already present in the original `sector-rotation` pool. User-supplied candidates must also pass this check.
-   - Treat exact normalized ETF exposure Chinese-name matches with the original `sector-rotation` pool as script-level duplicates. Normalize by removing whitespace and comparing the text before `ETF`; for example `通信ETF华夏` duplicates base `通信ETF`, and `纳指ETF广发` duplicates base `纳指ETF`. Base-pool Chinese names must be stored directly in `references/sector_rotation_universe.csv`; do not import names from another local project.
+   - Treat exact normalized ETF exposure Chinese-name matches with the original `sector-rotation` pool as script-level duplicates. Normalize by removing whitespace and comparing the text before `ETF`; for example `通信ETF华夏` duplicates base `通信ETF`, and `纳指ETF广发` duplicates base `纳指ETF`. Base-pool Chinese names must be stored directly in `universes/sector_rotation.csv`; do not import names from another local project.
    - After removing base-pool symbol/name duplicates, keep only the highest same-day-return ETF for each normalized ETF exposure Chinese name.
    - Keep keyword/theme matches as AI review flags only. The script marks shortlist rows with `theme`, `base_theme_overlap`, and `base_theme_matches`, but these fields must not hard-reject candidates.
 4. Always run candidate discovery with `select_etf_candidates.py` first and stop for AI semantic de-duplication review before the full automation run, unless the user supplied exactly three reviewed candidates.
@@ -45,7 +46,7 @@ RUN_DIR=".agents/skills/etf-sharpe-topk/outputs"
    - If and only if the pruned pool's `sortino` is strictly higher, accept the pruned pool as the final best pool and exclude that ETF from `selected_universe.csv`, recommendations, and `--apply` updates.
    - If the pruned pool does not improve `sortino`, keep the original best pool unchanged.
 7. Dry-run by default; add `--apply` only when requested.
-   - `--apply` accepts the final best pool as the future base pool by updating `references/sector_rotation_universe.csv`; the previous base pool is backed up in `${RUN_DIR}/universe_before.*`.
+   - `--apply` accepts the final best pool as the future base pool by updating `universes/sector_rotation.csv`; the previous base pool is backed up in `${RUN_DIR}/universe_before.*`.
 8. Read durable outputs:
    - `${RUN_DIR}/automation_summary.json`: candidates, compact grid values by pool, evaluations, best row, requested `date`, actual `recommendation_date`, recommendation rows, and key output paths.
    - `${RUN_DIR}/recommendation_<recommendation-date>_sector-rotation.csv`: generated recommendation rows.
@@ -97,13 +98,13 @@ python3 .agents/skills/etf-sharpe-topk/scripts/recommend_etf_pool.py \
 
 If any candidate is still missing after refresh, stop and report no market data.
 
-Data refresh only checks the existing local daily table under `DATA_ROOT`; there is no separate skill cache directory. `DATA_ROOT` defaults to the repository root, so daily bars live in the framework-level `data/etf_daily.*` file rather than under `.agents/skills/...`. The sector-rotation pool itself belongs to `references/sector_rotation_universe.csv`, not `data/`. Daily bars must use qfq adjusted prices. The prepare stage skips current ETFs and refreshes only ETFs missing the latest trading date. A successful refresh replaces all cached rows for each refreshed ETF with the new five-year qfq history, because qfq data can be restated after splits or distributions. The recommendation stage must not fetch market data; it only verifies the local table can provide a complete selected-universe recommendation date on or before `TRADE_DATE`. If a requested symbol is still missing from the local market data result, stop and report no market data for that symbol.
+Data refresh only checks the existing local daily table under `DATA_ROOT`; there is no separate skill cache directory. `DATA_ROOT` defaults to the repository root, so daily bars live in the framework-level `data/etf_daily.*` file rather than under `.agents/skills/...`. The shared sector-rotation pool itself belongs to `universes/sector_rotation.csv`, not `data/` or a skill directory. Daily bars must use qfq adjusted prices. The prepare stage skips current ETFs and refreshes only ETFs missing the latest trading date. A successful refresh replaces all cached rows for each refreshed ETF with the new five-year qfq history, because qfq data can be restated after splits or distributions. The recommendation stage must not fetch market data; it only verifies the local table can provide a complete selected-universe recommendation date on or before `TRADE_DATE`. If a requested symbol is still missing from the local market data result, stop and report no market data for that symbol.
 
 ## Script Responsibilities
 
 - `select_etf_candidates.py`: independently runnable candidate discovery command; fetch ETF spot rows with AKShare first and Tencent quote fallback, filter large ETFs not already in the original pool, rank by `涨跌幅`, skip script-level normalized ETF exposure Chinese-name duplicates, add keyword/theme review flags, create candidate shortlist/selection, and write temporary files needed by later stages.
 - `prepare_etf_pool_run.py`: independently runnable prepare stage; read the Stage 1 shortlist, accept the AI-reviewed candidate list through `--candidates`, rebuild selected candidate artifacts, clear the reusable output directory for the full run, skip ETFs already current, and replace stale ETFs' cached histories with freshly downloaded five-year qfq data. This data window is independent of the default three-year optimization window.
-- `optimize_etf_pool.py`: independently runnable optimization stage; read prepared candidates, optimize candidate pools, challenge the chosen best pool by removing the worst contribution ETF, accept the pruned pool only when optimized Sortino improves, write `selected_universe.csv`, `best.json`, `evaluations.csv`, `all_results.csv`, and update `references/sector_rotation_universe.csv` only when `--apply` is passed.
+- `optimize_etf_pool.py`: independently runnable optimization stage; read prepared candidates, optimize candidate pools, challenge the chosen best pool by removing the worst contribution ETF, accept the pruned pool only when optimized Sortino improves, write `selected_universe.csv`, `best.json`, `evaluations.csv`, `all_results.csv`, and update `universes/sector_rotation.csv` only when `--apply` is passed.
 - `recommend_etf_pool.py`: independently runnable recommendation stage; verify local selected-universe data, generate recommendations for the latest complete selected-universe trading date on or before the requested date, write `automation_summary.json`, and remove runner-only intermediate files after a full run.
 - `utils.py`: helper module for shared stage implementation. Do not call it directly as a workflow stage.
 

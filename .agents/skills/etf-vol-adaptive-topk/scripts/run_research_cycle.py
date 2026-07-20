@@ -41,14 +41,7 @@ SKILL_ROOT = REPO_ROOT / ".agents" / "skills" / "etf-vol-adaptive-topk"
 DEFAULT_OUTPUT_DIR = SKILL_ROOT / "outputs" / "research"
 DEFAULT_PARAMS_FILE = SKILL_ROOT / "references" / "accepted_params.json"
 DEFAULT_BENCHMARK = SKILL_ROOT / "references" / "csi300_benchmark.csv"
-DEFAULT_UNIVERSE = (
-    REPO_ROOT
-    / ".agents"
-    / "skills"
-    / "etf-sharpe-topk"
-    / "references"
-    / "sector_rotation_universe.csv"
-)
+DEFAULT_UNIVERSE = REPO_ROOT / "universes" / "sector_rotation.csv"
 DEFAULTS = VolAdaptiveResidualSharpeParams()
 DISPOSABLE_RESEARCH_FILES = {
     "best_params.json",
@@ -108,6 +101,22 @@ def write_csv_atomic(path: Path, frame: pd.DataFrame) -> None:
         frame.to_csv(handle, index=False)
         temp_path = Path(handle.name)
     os.replace(temp_path, path)
+
+
+def apply_universe_update(
+    *,
+    apply: bool,
+    universe_changed: bool,
+    universe_path: Path,
+    selected_pool: pd.DataFrame,
+    output_dir: Path,
+) -> Path | None:
+    if not apply or not universe_changed:
+        return None
+    backup_path = output_dir / "universe_before.csv"
+    shutil.copy2(universe_path, backup_path)
+    write_csv_atomic(universe_path, selected_pool)
+    return backup_path
 
 
 def remove_disposable_research_files(output_dir: Path) -> None:
@@ -853,12 +862,15 @@ def main() -> None:
 
     if args.apply and proposal_changed:
         previous_universe_hash = file_sha256(universe_path)
-        if universe_changed:
-            shutil.copy2(universe_path, output_dir / "universe_before.csv")
+        apply_universe_update(
+            apply=True,
+            universe_changed=universe_changed,
+            universe_path=universe_path,
+            selected_pool=selected_pool,
+            output_dir=output_dir,
+        )
         if params_path.exists():
             shutil.copy2(params_path, output_dir / "params_before.json")
-        if universe_changed:
-            write_csv_atomic(universe_path, selected_pool)
         promoted_universe_hash = file_sha256(universe_path)
         write_json_atomic(params_path, {
             "strategy": STRATEGY_NAME,

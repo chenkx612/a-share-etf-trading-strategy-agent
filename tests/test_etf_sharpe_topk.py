@@ -88,16 +88,73 @@ def test_normalize_spot_frame_maps_market_columns() -> None:
     assert frame["data_date"].tolist() == [TEST_DATE, TEST_DATE]
 
 
-def test_etf_pool_skill_default_output_root_is_not_strategy_scoped() -> None:
+def test_etf_pool_skill_uses_shared_universe_default() -> None:
     runner = load_skill_script("utils")
     selector = load_skill_script("select_etf_candidates")
 
     assert runner.DEFAULT_ROOT == ".agents/skills/etf-sharpe-topk/outputs"
-    assert selector.DEFAULT_BASE_POOL == REPO_ROOT / ".agents" / "skills" / "etf-sharpe-topk" / "references" / "sector_rotation_universe.csv"
+    assert selector.DEFAULT_BASE_POOL == REPO_ROOT / "universes" / "sector_rotation.csv"
+    assert runner.DEFAULT_BASE_POOL == selector.DEFAULT_BASE_POOL
     assert runner.run_dir(Path(runner.DEFAULT_ROOT), "current") == Path(".agents/skills/etf-sharpe-topk/outputs")
     assert runner.run_dir(Path(runner.DEFAULT_ROOT), "reviewed") == Path(
         ".agents/skills/etf-sharpe-topk/outputs/reviewed"
     )
+
+
+def test_selector_base_universe_can_override_shared_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector = load_skill_script("select_etf_candidates")
+    custom_universe = tmp_path / "custom.csv"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "select_etf_candidates.py",
+            "--base-universe",
+            str(custom_universe),
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert selector.parse_args().base_universe == str(custom_universe)
+
+
+def test_sharpe_apply_updates_destination_and_dry_run_does_not(
+    tmp_path: Path,
+) -> None:
+    runner = load_skill_script("utils")
+    destination = tmp_path / "sector_rotation.csv"
+    run_dir = tmp_path / "outputs"
+    run_dir.mkdir()
+    before = pd.DataFrame([{"symbol": "A", "name": "ETF A", "fund_size": 1.0}])
+    after = pd.DataFrame([{"symbol": "B", "name": "ETF B", "fund_size": 2.0}])
+    before.to_csv(destination, index=False)
+
+    assert runner.apply_selected_universe(
+        apply=False,
+        base_universe=before,
+        selected_universe=after,
+        run_dir_path=run_dir,
+        destination=destination,
+    ) is None
+    pd.testing.assert_frame_equal(pd.read_csv(destination), before)
+    assert not list(run_dir.glob("universe_before.*"))
+
+    backup = runner.apply_selected_universe(
+        apply=True,
+        base_universe=before,
+        selected_universe=after,
+        run_dir_path=run_dir,
+        destination=destination,
+    )
+
+    assert backup is not None
+    pd.testing.assert_frame_equal(pd.read_csv(destination), after)
+    backed_up = pd.read_parquet(backup) if backup.suffix == ".parquet" else pd.read_csv(backup)
+    pd.testing.assert_frame_equal(backed_up, before)
 
 
 def test_etf_pool_uses_five_year_data_window_and_three_year_backtest_window() -> None:
@@ -109,9 +166,9 @@ def test_etf_pool_uses_five_year_data_window_and_three_year_backtest_window() ->
     assert runner.default_start("2024-02-29") == "2021-02-28"
 
 
-def test_selector_loads_base_chinese_names_from_skill_reference_csv(tmp_path: Path) -> None:
+def test_selector_loads_base_chinese_names_from_shared_universe_csv(tmp_path: Path) -> None:
     selector = load_skill_script("select_etf_candidates")
-    base_path = tmp_path / "sector_rotation_universe.csv"
+    base_path = tmp_path / "sector_rotation.csv"
     pd.DataFrame([
         {"symbol": "159915", "name": "创业板", "fund_size": pd.NA},
         {"symbol": "512800", "name": "银行ETF", "fund_size": pd.NA},
@@ -421,7 +478,7 @@ def test_data_update_does_not_create_outputs_directory(
 ) -> None:
     universe_dir = tmp_path / "universes"
     universe_dir.mkdir()
-    universe_path = universe_dir / "sector_rotation_universe.csv"
+    universe_path = universe_dir / "sector_rotation.csv"
     pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}]).to_csv(
         universe_path,
         index=False,

@@ -26,7 +26,7 @@ from quant_core.data.market_data import (  # noqa: E402
 
 
 DEFAULT_MIN_FUND_SIZE_CNY = 10_000_000_000
-DEFAULT_BASE_POOL = Path(__file__).resolve().parents[1] / "references" / "sector_rotation_universe.csv"
+DEFAULT_BASE_POOL = REPO_ROOT / "universes" / "sector_rotation.csv"
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
 QUOTE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
