@@ -25,6 +25,15 @@ _GIT_IDENTITY = {
 }
 
 
+def workspace_python_env(workspace: Path) -> dict[str, str]:
+    """Prefer a disposable worktree's source tree over an editable install."""
+    env = dict(os.environ)
+    source_root = str((workspace / "src").resolve())
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = source_root if not existing else os.pathsep.join((source_root, existing))
+    return env
+
+
 def _git(
     root: Path,
     *args: str,
@@ -79,6 +88,18 @@ def copy_runtime_inputs(source: Path, destination: Path, *, end: date | None = N
     if end is not None:
         _filter_tables(destination / "data", end)
         _filter_tables(destination / "outputs" / "factors", end)
+
+
+def runtime_inputs_manifest(root: Path) -> dict[str, str]:
+    """Return stable hashes for the data and factor files used by an evaluation."""
+    manifest: dict[str, str] = {}
+    for relative_root in (Path("data"), Path("outputs") / "factors"):
+        directory = root / relative_root
+        if not directory.is_dir():
+            continue
+        for path in sorted(item for item in directory.rglob("*") if item.is_file()):
+            manifest[path.relative_to(root).as_posix()] = _file_sha256(path)
+    return manifest
 
 
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -174,6 +195,10 @@ class ResearchWorkspace:
     @property
     def evaluators(self) -> Path:
         return self.root / ".tmp" / "worktrees" / self.run_id / "evaluators"
+
+    @property
+    def test_evaluators(self) -> Path:
+        return self.root / ".tmp" / "worktrees" / "tests"
 
     @property
     def rounds(self) -> Path:
@@ -501,9 +526,12 @@ class ResearchWorkspace:
         self._migrate_transient_layout()
         if self.run_number is None:
             worktrees = self.root / ".tmp" / "worktrees"
+            self._cleanup_worktrees(self.test_evaluators)
             scopes = list(worktrees.iterdir()) if worktrees.exists() else []
             for scope in scopes:
                 if scope.is_dir():
+                    if scope.name == "tests":
+                        continue
                     self._cleanup_worktrees(scope / "candidates")
                     self._cleanup_worktrees(scope / "evaluators")
                     try:
@@ -776,6 +804,21 @@ class ResearchWorkspace:
             raise RuntimeError("research task does not have a champion yet")
         self._cleanup_worktrees(self.evaluators)
         evaluator = self.evaluators / round_id
+        base_commit = self._snapshot_commit(
+            state.get("baseline_exclude", []),
+            strategy_path=str(state["strategy_path"]),
+            champion_path=self.champion_path,
+        )
+        self._add_worktree(evaluator, base_commit)
+        return evaluator
+
+    def create_champion_test_evaluator(self, test_id: str, state: Mapping[str, Any]) -> Path:
+        """Create a task-level evaluator for an immutable Champion test."""
+        if not isinstance(state.get("champion_sha256"), str):
+            raise RuntimeError("research task does not have a champion yet")
+        evaluator = self.test_evaluators / test_id
+        if evaluator.exists():
+            raise FileExistsError(f"Test evaluator already exists: {test_id}")
         base_commit = self._snapshot_commit(
             state.get("baseline_exclude", []),
             strategy_path=str(state["strategy_path"]),

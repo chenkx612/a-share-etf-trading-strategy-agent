@@ -235,8 +235,8 @@ def generate_loop_report(
             "minimum_improvement": (
                 task.raw["evaluation"].get("acceptance", {}).get("minimum_improvement", 0.0)
             ),
-            "development_period": task.raw["evaluation"]["fixed"]["development"],
-            "gate_period": task.raw["evaluation"]["fixed"]["gate"],
+            "development_period": task.development_period,
+            "gate_period": task.gate_period,
         },
         "loop": loop_payload,
         "experiments": experiments,

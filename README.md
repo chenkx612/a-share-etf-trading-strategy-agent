@@ -93,8 +93,12 @@ python3 -m quant_core.cli research loop \
   可配合 `baseline.exclude` 从候选基座排除旧策略实现。
 - 回测命令支持 `{python}`、`{universe}`、`{start}`、`{end}`、`{run_id}`、
   `{strategy_name}` 和 `{strategy_module}` 占位符；指标路径必须包含 `{run_id}`。
-- 当前只支持不重叠的固定 Development/Gate 区间。硬约束运算符为 `>=`、`<=` 和
-  `abs<=`；可选 Test 区间必须位于 Gate 之后，Loop 不会读取或评测它。
+- `evaluation.mode = "fixed"` 保持原有的不重叠 Development/Gate 评测；
+  `"walk_forward"` 用最近训练窗口逐折选参、在后续不重叠验证折评测。首版要求
+  `validation_months = step_months`，参数网格由策略模块的 `parameter_grid()` 声明，
+  固定 evaluator 通过 `select_with_params(...)` 评分并选参。
+- 硬约束运算符为 `>=`、`<=` 和 `abs<=`；可选 Test 区间必须位于 Gate 之后，使用
+  `research test --task task.toml` 对当前 Champion 单独评测，结果不参与晋级。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
 - `budget.round_minutes` 是每轮候选研发的硬时限；未配置时兼容使用

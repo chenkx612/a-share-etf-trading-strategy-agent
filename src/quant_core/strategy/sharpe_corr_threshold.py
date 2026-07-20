@@ -61,6 +61,34 @@ def select(
     )
 
 
+def parameter_grid() -> list[dict[str, object]]:
+    """Small, deterministic grid used by the research walk-forward harness."""
+    return [
+        {"top_n": top_n, "sharpe_window": window, "factor_lower_bound": bound,
+         "corr_window": 100, "corr_threshold": threshold, "stop_loss_pct": stop}
+        for top_n in (3, 5)
+        for window in (20, 25, 60)
+        for bound in (0.0,)
+        for threshold in (0.8, 0.9)
+        for stop in (0.08, 0.10)
+    ]
+
+
+def select_with_params(
+    daily: pd.DataFrame,
+    universe: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    params: dict[str, object],
+) -> pd.DataFrame:
+    strategy_params = SharpeCorrThresholdParams(**params)
+    factors = compute_factors(daily, sharpe_windows=[strategy_params.sharpe_window])
+    return select_sharpe_corr_threshold(
+        factors, strategy_params, start=start, end=end,
+        universe_symbols=set(universe["symbol"].astype(str)),
+    )
+
+
 def select_sharpe_corr_threshold(
     factors: pd.DataFrame,
     params: SharpeCorrThresholdParams,

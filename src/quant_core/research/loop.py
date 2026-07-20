@@ -187,7 +187,7 @@ def run_loop(
     if not managed_root.is_absolute():
         managed_root = source / managed_root
     base_manager = ResearchWorkspace(source, managed_root, task.task_id)
-    development_end = task.raw["evaluation"]["fixed"]["development"]["end"]
+    development_end = task.development_period["end"]
     base_manager.initialize(
         date.fromisoformat(development_end),
         task.baseline_mode,

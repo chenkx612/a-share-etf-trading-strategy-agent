@@ -18,6 +18,7 @@ from quant_core.research.runner import (
     _agent_read_only_paths,
     _docker_opencode_command,
     _metrics_key,
+    _load_research_history,
     _RoundClock,
     _run_opencode_with_permissions,
     _stage_opencode_runtime,
@@ -78,6 +79,157 @@ end = "2024-12-31"
 start = "2025-01-01"
 end = "2025-12-31"
 """
+
+WALK_FORWARD_TASK_TOML = TASK_TOML.replace(
+    'mode = "fixed"',
+    'mode = "walk_forward"',
+).replace(
+    "[evaluation.fixed.development]",
+    """[evaluation.walk_forward]
+train_months = 36
+validation_months = 12
+step_months = 12
+max_parameter_sets = 64
+
+[evaluation.walk_forward.development]""",
+).replace(
+    "[evaluation.fixed.gate]",
+    "[evaluation.walk_forward.gate]",
+)
+
+
+def test_research_history_normalizes_fixed_and_walk_forward_development_metrics(
+    tmp_path: Path,
+) -> None:
+    fixed_round = tmp_path / "001"
+    walk_forward_round = tmp_path / "002"
+    fixed_round.mkdir()
+    walk_forward_round.mkdir()
+    common = {
+        "status": "completed",
+        "hypothesis": "hypothesis",
+        "attempts": "attempts",
+        "development_effect": "effect",
+        "candidate": "candidate",
+        "changes": {"files": ["strategy.py"]},
+    }
+    (fixed_round / "result.json").write_text(json.dumps({
+        **common,
+        "metrics": {
+            "development": {"sortino": 1.1, "max_drawdown": -0.2},
+            "gate": {"sortino": 9.9},
+        },
+    }), encoding="utf-8")
+    (walk_forward_round / "result.json").write_text(json.dumps({
+        **common,
+        "metrics": {
+            "development": {
+                "aggregate": {
+                    "sortino": 1.2,
+                    "max_drawdown": -0.15,
+                    "annual_return": 0.18,
+                    "avg_turnover": 0.3,
+                },
+                "folds": [{"sortino": 99.0}],
+                "no_feasible_parameter_folds": 0,
+            },
+            "gate": {"aggregate": {"sortino": 8.8}},
+        },
+    }), encoding="utf-8")
+    for round_path in (fixed_round, walk_forward_round):
+        (round_path / "decision.json").write_text(
+            json.dumps({"decision": "rejected", "reasons": []}),
+            encoding="utf-8",
+        )
+
+    history = _load_research_history(tmp_path)
+
+    assert history[0]["development_metrics"] == {
+        "sortino": 1.1,
+        "max_drawdown": -0.2,
+    }
+    assert history[1]["development_metrics"] == {
+        "sortino": 1.2,
+        "max_drawdown": -0.15,
+        "annual_return": 0.18,
+        "avg_turnover": 0.3,
+        "no_feasible_parameter_folds": 0,
+    }
+    serialized = json.dumps(history)
+    assert "99.0" not in serialized
+    assert "9.9" not in serialized
+    assert "8.8" not in serialized
+
+
+def test_walk_forward_development_config_excludes_gate_and_test_periods(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(WALK_FORWARD_TASK_TOML, encoding="utf-8")
+    observed_config: dict[str, object] = {}
+    development_commands: list[Sequence[str]] = []
+
+    def fake_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        config_path = cwd / ".quant-research-development.json"
+        observed_config.update(json.loads(config_path.read_text(encoding="utf-8")))
+        assert ".quant-research-development.json" in prompt
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": json.dumps({
+                "status": "completed",
+                "previous_feedback": "",
+                "hypothesis": "Improve selection",
+                "attempts": "Tested one candidate.",
+                "development_effect": "Development improved.",
+                "candidate": "Retain candidate.",
+            })},
+        }) + "\n", encoding="utf-8")
+        (cwd / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
+        return 0
+
+    def fake_command(
+        command: Sequence[str], cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        if "--run-id" not in command:
+            return 0
+        run_id = command[command.index("--run-id") + 1]
+        metrics_path = cwd / "outputs/backtests" / run_id / "metrics.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(json.dumps({
+            "aggregate": {"sortino": 1.2, "max_drawdown": -0.1},
+            "folds": [],
+            "no_feasible_parameter_folds": 0,
+        }), encoding="utf-8")
+        if "--walk-forward-config" in command:
+            development_commands.append(command)
+        return 0
+
+    result_path = run_once(
+        task_path,
+        "experiment-walk-forward",
+        tmp_path / "experiment-walk-forward",
+        workspace=tmp_path,
+        command_runner=fake_command,
+        opencode_runner=fake_opencode,
+    )
+
+    assert json.loads(result_path.read_text(encoding="utf-8"))["status"] == "completed"
+    assert observed_config["period"] == {"start": "2018-01-01", "end": "2021-12-31"}
+    assert observed_config["walk_forward"] == {
+        "train_months": 36,
+        "validation_months": 12,
+        "step_months": 12,
+        "max_parameter_sets": 64,
+    }
+    config_text = json.dumps(observed_config)
+    assert "2022-01-01" not in config_text
+    assert "2024-12-31" not in config_text
+    assert "2025-01-01" not in config_text
+    assert '"gate"' not in config_text
+    assert '"test"' not in config_text
+    assert len(development_commands) == 1
 
 
 def test_workspace_env_prefers_candidate_source_tree(

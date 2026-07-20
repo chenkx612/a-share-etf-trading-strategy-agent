@@ -24,6 +24,7 @@ from quant_core.research.workspace import (
     copy_runtime_inputs,
     remove_runtime_inputs,
     write_json_atomic,
+    workspace_python_env,
 )
 
 
@@ -140,11 +141,7 @@ def _emit(event_sink: EventSink | None, event: str, **details: Any) -> None:
 
 
 def _workspace_env(cwd: Path, extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = {**os.environ, **(extra or {})}
-    source_root = str((cwd / "src").resolve())
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = source_root if not existing else os.pathsep.join((source_root, existing))
-    return env
+    return {**workspace_python_env(cwd), **(extra or {})}
 
 
 def _run_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) -> int:
@@ -711,6 +708,27 @@ def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: 
     return values
 
 
+def _evaluation_command(
+    task: ResearchTask, task_path: str | Path, label: str, values: Mapping[str, str],
+    walk_forward_config: Path | None = None,
+) -> list[str]:
+    if task.evaluation_mode == "fixed":
+        return _format_command(task.raw["commands"]["backtest"], values)
+    command = [
+        sys.executable, "-m", "quant_core.research.evaluator",
+        "--root", values["workspace"], "--universe", values["universe"],
+        "--start", values["start"], "--end", values["end"], "--run-id", values["run_id"],
+        "--candidate-module", str(task.strategy_module),
+    ]
+    metrics_path = str(task.raw["commands"]["metrics_path"]).format_map(values)
+    command.extend(["--metrics-path", metrics_path])
+    if walk_forward_config is not None:
+        command.extend(["--walk-forward-config", str(walk_forward_config)])
+    else:
+        command.extend(["--task", str(Path(task_path).resolve()), "--stage", label])
+    return command
+
+
 def _constraint_rule(constraint: Mapping[str, Any]) -> tuple[str, float]:
     return str(constraint["operator"]), float(constraint["threshold"])
 
@@ -839,6 +857,19 @@ def _scalar_metrics(value: object) -> dict[str, Any]:
     }
 
 
+def _normalize_development_metrics(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    aggregate = value.get("aggregate")
+    if not isinstance(aggregate, Mapping):
+        return _scalar_metrics(value)
+    metrics = _scalar_metrics(aggregate)
+    no_feasible_folds = value.get("no_feasible_parameter_folds")
+    if isinstance(no_feasible_folds, int) and not isinstance(no_feasible_folds, bool):
+        metrics["no_feasible_parameter_folds"] = no_feasible_folds
+    return metrics
+
+
 def _load_research_history(
     experiments: Path,
     *,
@@ -876,7 +907,9 @@ def _load_research_history(
                 "development_effect": result.get("development_effect"),
                 "candidate": result.get("candidate"),
                 "changed_files": result.get("changes", {}).get("files", []),
-                "development_metrics": _scalar_metrics(result.get("metrics", {}).get("development")),
+                "development_metrics": _normalize_development_metrics(
+                    result.get("metrics", {}).get("development")
+                ),
             })
         else:
             entry["error"] = result.get("error")
@@ -1033,9 +1066,25 @@ def run_once(
     out.mkdir(parents=True, exist_ok=True)
 
     raw = task.raw
-    fixed = raw["evaluation"]["fixed"]
+    fixed = task.evaluation_periods
     development_values = _values(task, fixed["development"], f"{experiment_id}-development", root)
-    development_command = _format_command(raw["commands"]["backtest"], development_values)
+    development_config: Path | None = None
+    if task.evaluation_mode == "walk_forward":
+        development_config = root / ".quant-research-development.json"
+        write_json_atomic(development_config, {
+            "period": dict(task.development_period),
+            "walk_forward": {
+                key: task.evaluation_periods[key]
+                for key in (
+                    "train_months",
+                    "validation_months",
+                    "step_months",
+                    "max_parameter_sets",
+                )
+            },
+            "constraints": task.raw["evaluation"]["constraints"], "objective": task.raw["evaluation"]["objective"],
+        })
+    development_command = _evaluation_command(task, task_path, "development", development_values, development_config)
     development_metrics_path = str(raw["commands"]["metrics_path"]).format_map(development_values)
     test_command = _format_command(raw["commands"]["test"], development_values)
     opencode = raw["opencode"]
@@ -1208,7 +1257,11 @@ def run_once(
                 remove_runtime_inputs(root)
                 copy_runtime_inputs(Path(gate_runtime), root)
         values = _values(task, fixed[label], f"{experiment_id}-{label}", evaluation_root)
-        command = _format_command(raw["commands"]["backtest"], values)
+        command = (
+            development_command
+            if label == "development"
+            else _evaluation_command(task, task_path, label, values)
+        )
         _emit(
             event_sink,
             f"{label}_started",
@@ -1281,6 +1334,7 @@ def run_once(
 
 def _evaluate_existing(
     task: ResearchTask,
+    task_path: str | Path,
     workspace: Path,
     runtime_source: Path,
     experiment_id: str,
@@ -1294,11 +1348,11 @@ def _evaluate_existing(
     for label in ("development", "gate"):
         values = _values(
             task,
-            raw["evaluation"]["fixed"][label],
+            task.evaluation_periods[label],
             f"{experiment_id}-champion-{label}",
             workspace,
         )
-        command = _format_command(raw["commands"]["backtest"], values)
+        command = _evaluation_command(task, task_path, label, values)
         if _run_with_failure_log(
             command_runner,
             command,
@@ -1334,11 +1388,34 @@ def _is_finite_number(value: Any) -> bool:
     )
 
 
+def _walk_forward_gate_is_feasible(
+    task: ResearchTask,
+    metrics: Mapping[str, Any] | None,
+) -> bool:
+    if task.evaluation_mode != "walk_forward":
+        return True
+    if not isinstance(metrics, Mapping):
+        return False
+    gate = metrics.get("gate")
+    if not isinstance(gate, Mapping):
+        return False
+    no_feasible_folds = gate.get("no_feasible_parameter_folds")
+    return (
+        isinstance(no_feasible_folds, int)
+        and not isinstance(no_feasible_folds, bool)
+        and no_feasible_folds == 0
+    )
+
+
 def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> bool:
     target = task.raw["evaluation"].get("target")
     if not isinstance(target, dict) or not isinstance(metrics, Mapping):
         return False
+    if not _walk_forward_gate_is_feasible(task, metrics):
+        return False
     gate = metrics.get("gate")
+    if task.evaluation_mode == "walk_forward" and isinstance(gate, Mapping):
+        gate = gate.get("aggregate")
     if not isinstance(gate, Mapping):
         return False
     evaluation = task.raw["evaluation"]
@@ -1359,12 +1436,23 @@ def _decide(
 ) -> dict[str, Any]:
     evaluation = task.raw["evaluation"]
     objective = str(evaluation["objective"])
-    champion_value = champion.get("gate", {}).get(objective) if champion is not None else None
-    candidate_value = candidate.get("gate", {}).get(objective)
+    def gate_metrics(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        gate = value.get("gate", {})
+        if task.evaluation_mode == "walk_forward" and isinstance(gate, Mapping):
+            gate = gate.get("aggregate", {})
+        return gate if isinstance(gate, Mapping) else {}
+    champion_gate, candidate_gate = gate_metrics(champion), gate_metrics(candidate)
+    champion_gate_is_feasible = _walk_forward_gate_is_feasible(task, champion)
+    candidate_gate_is_feasible = _walk_forward_gate_is_feasible(task, candidate)
+    champion_value = champion_gate.get(objective) if champion is not None else None
+    candidate_value = candidate_gate.get(objective)
     champion_constraints_passed = (
         champion is not None
+        and champion_gate_is_feasible
         and all(
-            _constraint_passes(champion.get("gate", {}).get(name), constraint)
+            _constraint_passes(champion_gate.get(name), constraint)
             for name, constraint in evaluation["constraints"].items()
         )
     )
@@ -1374,7 +1462,7 @@ def _decide(
     constraints: dict[str, Any] = {}
     constraints_passed = True
     for name, constraint in evaluation["constraints"].items():
-        actual = candidate.get("gate", {}).get(name)
+        actual = candidate_gate.get(name)
         operator, threshold = _constraint_rule(constraint)
         passed = _constraint_passes(actual, constraint)
         constraints[name] = {
@@ -1395,8 +1483,10 @@ def _decide(
         and float(candidate_value) >= float(champion_value) + minimum_improvement
         and (minimum_improvement > 0 or float(candidate_value) > float(champion_value))
     )
-    accepted = constraints_passed and objective_passed
+    accepted = candidate_gate_is_feasible and constraints_passed and objective_passed
     reasons: list[str] = []
+    if not candidate_gate_is_feasible:
+        reasons.append("gate has folds with no feasible parameters")
     if not constraints_passed:
         reasons.append("gate constraints failed")
     if not objective_passed and not relative_improvement_required:
@@ -1425,7 +1515,7 @@ def _metrics_key(task: ResearchTask) -> str:
         "strategy": task.raw.get("strategy"),
         "data": task.raw["data"],
         "commands": task.raw["commands"],
-        "periods": task.raw["evaluation"]["fixed"],
+        "periods": task.evaluation_periods,
     }
     encoded = json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -1449,7 +1539,7 @@ def run_managed_once(
     managed_root = Path(research_root)
     if not managed_root.is_absolute():
         managed_root = source / managed_root
-    development_end = task.raw["evaluation"]["fixed"]["development"]["end"]
+    development_end = task.development_period["end"]
     if (
         not round_id.isdigit()
         or int(round_id) < 1
@@ -1528,6 +1618,7 @@ def run_managed_once(
         try:
             champion_metrics = _evaluate_existing(
                 task,
+                task_file,
                 evaluator,
                 manager.evaluation_runtime,
                 round_id,

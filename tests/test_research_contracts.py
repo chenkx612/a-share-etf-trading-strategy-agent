@@ -40,6 +40,25 @@ def fixed_task() -> dict:
     }
 
 
+def walk_forward_task() -> dict:
+    payload = fixed_task()
+    payload["strategy"] = {
+        "name": "etf-momentum",
+        "module": "quant_core.strategy.etf_momentum",
+    }
+    payload["commands"]["backtest"].append("{strategy_module}")
+    fixed = payload["evaluation"].pop("fixed")
+    payload["evaluation"]["mode"] = "walk_forward"
+    payload["evaluation"]["walk_forward"] = {
+        "train_months": 36,
+        "validation_months": 12,
+        "step_months": 12,
+        "max_parameter_sets": 256,
+        **fixed,
+    }
+    return payload
+
+
 def completed_result() -> dict:
     return {
         "experiment_id": "experiment-001",
@@ -219,26 +238,20 @@ def test_task_rejects_exclusions_for_workspace_baseline() -> None:
         ResearchTask.from_mapping(payload)
 
 
-def test_walk_forward_task_is_rejected_until_implemented() -> None:
-    payload = fixed_task()
-    payload["evaluation"] = {
-        "mode": "walk_forward",
-        "objective": "sortino",
-        "constraints": {
-            "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
-        },
-        "walk_forward": {
-            "start": "2018-01-01",
-            "end": "2024-12-31",
-            "train_months": 36,
-            "validation_months": 12,
-            "step_months": 12,
-        },
-        "test": {"start": "2025-01-01", "end": "2025-12-31"},
-    }
+def test_walk_forward_task_is_accepted() -> None:
+    payload = walk_forward_task()
 
-    with pytest.raises(ValueError, match="must be 'fixed'"):
-        ResearchTask.from_mapping(payload)
+    task = ResearchTask.from_mapping(payload)
+    assert task.evaluation_mode == "walk_forward"
+
+
+def test_walk_forward_task_does_not_require_unused_backtest_template() -> None:
+    payload = walk_forward_task()
+    del payload["commands"]["backtest"]
+
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.evaluation_mode == "walk_forward"
 
 
 def test_test_period_must_follow_research_period() -> None:
@@ -351,6 +364,88 @@ def test_target_supports_lower_bound_constraints() -> None:
     assert not target_reached(task, {
         "gate": {"sortino": 1.6, "annual_return": 0.08, "max_drawdown": -0.15},
     })
+
+
+def test_walk_forward_target_requires_all_gate_folds_to_be_feasible() -> None:
+    payload = walk_forward_task()
+    payload["evaluation"]["target"] = {"objective_at_least": 1.5}
+    task = ResearchTask.from_mapping(payload)
+    gate = {
+        "aggregate": {"sortino": 1.6, "max_drawdown": 0.0},
+        "no_feasible_parameter_folds": 1,
+    }
+
+    assert not target_reached(task, {"gate": gate})
+    gate["no_feasible_parameter_folds"] = 0
+    assert target_reached(task, {"gate": gate})
+
+
+@pytest.mark.parametrize("no_feasible_folds", [1, 3])
+def test_walk_forward_candidate_with_infeasible_gate_folds_is_rejected(
+    no_feasible_folds: int,
+) -> None:
+    task = ResearchTask.from_mapping(walk_forward_task())
+    candidate = {
+        "gate": {
+            "aggregate": {"sortino": 2.0, "max_drawdown": 0.0},
+            "no_feasible_parameter_folds": no_feasible_folds,
+        },
+    }
+
+    decision = _decide(task, None, candidate)
+
+    assert decision["decision"] == "rejected"
+    assert decision["reasons"] == ["gate has folds with no feasible parameters"]
+
+
+@pytest.mark.parametrize("no_feasible_folds", [None, "0", 0.0, False])
+def test_walk_forward_gate_feasibility_requires_an_integer_zero(
+    no_feasible_folds: object,
+) -> None:
+    task = ResearchTask.from_mapping(walk_forward_task())
+    candidate = {
+        "gate": {
+            "aggregate": {"sortino": 2.0, "max_drawdown": 0.0},
+            "no_feasible_parameter_folds": no_feasible_folds,
+        },
+    }
+
+    assert _decide(task, None, candidate)["decision"] == "rejected"
+
+
+def test_walk_forward_feasible_candidate_compares_normally() -> None:
+    task = ResearchTask.from_mapping(walk_forward_task())
+    champion = {
+        "gate": {
+            "aggregate": {"sortino": 1.0, "max_drawdown": -0.10},
+            "no_feasible_parameter_folds": 0,
+        },
+    }
+    candidate = {
+        "gate": {
+            "aggregate": {"sortino": 1.2, "max_drawdown": -0.10},
+            "no_feasible_parameter_folds": 0,
+        },
+    }
+
+    assert _decide(task, champion, candidate)["decision"] == "accepted"
+
+
+def test_walk_forward_feasible_candidate_replaces_unverifiable_champion() -> None:
+    task = ResearchTask.from_mapping(walk_forward_task())
+    champion = {"gate": {"aggregate": {"sortino": 5.0, "max_drawdown": -0.10}}}
+    candidate = {
+        "gate": {
+            "aggregate": {"sortino": 1.0, "max_drawdown": -0.10},
+            "no_feasible_parameter_folds": 0,
+        },
+    }
+
+    decision = _decide(task, champion, candidate)
+
+    assert decision["decision"] == "accepted"
+    assert decision["objective"]["champion_constraints_passed"] is False
+    assert decision["objective"]["relative_improvement_required"] is False
 
 
 def test_decision_enforces_lower_bound_constraints() -> None:

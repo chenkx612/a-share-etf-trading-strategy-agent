@@ -107,35 +107,39 @@ class ResearchTask:
             if baseline.get("exclude") and baseline.get("mode") != "none":
                 raise ValueError("task.baseline.exclude requires mode = 'none'")
 
+        evaluation = _required(data, "evaluation", dict, "task")
+        mode = _required(evaluation, "mode", str, "task.evaluation")
+        if mode not in {"fixed", "walk_forward"}:
+            raise ValueError("task.evaluation.mode must be 'fixed' or 'walk_forward'")
+        if mode == "walk_forward" and strategy is None:
+            raise ValueError("task.strategy is required for walk_forward evaluation")
+
         commands = _required(data, "commands", dict, "task")
         cls._string_list(commands, "test", required=True)
-        cls._string_list(commands, "backtest", required=True)
+        cls._string_list(commands, "backtest", required=mode == "fixed")
         metrics_path = _required(commands, "metrics_path", str, "task.commands")
-        backtest_template = " ".join(commands["backtest"])
-        for placeholder in ("{start}", "{end}", "{run_id}"):
-            if placeholder not in backtest_template:
-                raise ValueError(f"task.commands.backtest must contain {placeholder}")
-        strategy_placeholders = ("{strategy_name}", "{strategy_module}")
-        if strategy is None and any(
-            placeholder in backtest_template for placeholder in strategy_placeholders
-        ):
-            raise ValueError(
-                "task.strategy is required when task.commands.backtest uses a strategy placeholder"
-            )
-        if strategy is not None and not any(
-            placeholder in backtest_template for placeholder in strategy_placeholders
-        ):
-            raise ValueError(
-                "task.commands.backtest must reference {strategy_name} or {strategy_module} "
-                "when task.strategy is configured"
-            )
+        if mode == "fixed":
+            backtest_template = " ".join(commands["backtest"])
+            for placeholder in ("{start}", "{end}", "{run_id}"):
+                if placeholder not in backtest_template:
+                    raise ValueError(f"task.commands.backtest must contain {placeholder}")
+            strategy_placeholders = ("{strategy_name}", "{strategy_module}")
+            if strategy is None and any(
+                placeholder in backtest_template for placeholder in strategy_placeholders
+            ):
+                raise ValueError(
+                    "task.strategy is required when task.commands.backtest uses a strategy placeholder"
+                )
+            if strategy is not None and not any(
+                placeholder in backtest_template for placeholder in strategy_placeholders
+            ):
+                raise ValueError(
+                    "task.commands.backtest must reference {strategy_name} or {strategy_module} "
+                    "when task.strategy is configured"
+                )
         if "{run_id}" not in metrics_path:
             raise ValueError("task.commands.metrics_path must contain {run_id}")
 
-        evaluation = _required(data, "evaluation", dict, "task")
-        mode = _required(evaluation, "mode", str, "task.evaluation")
-        if mode != "fixed":
-            raise ValueError("task.evaluation.mode must be 'fixed'")
         _required(evaluation, "objective", str, "task.evaluation")
         constraints = _required(evaluation, "constraints", dict, "task.evaluation")
         if not constraints:
@@ -192,14 +196,22 @@ class ResearchTask:
                 raise ValueError(
                     "task.evaluation.target.objective_at_least must be numeric and finite"
                 )
-        fixed = _required(evaluation, "fixed", dict, "task.evaluation")
+        periods_key = "fixed" if mode == "fixed" else "walk_forward"
+        periods = _required(evaluation, periods_key, dict, "task.evaluation")
+        if mode == "walk_forward":
+            for key in ("train_months", "validation_months", "step_months", "max_parameter_sets"):
+                value = periods.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ValueError(f"task.evaluation.walk_forward.{key} must be a positive integer")
+            if periods["validation_months"] != periods["step_months"]:
+                raise ValueError("walk_forward.step_months must equal validation_months")
         development = _period(
-            _required(fixed, "development", dict, "task.evaluation.fixed"),
-            "task.evaluation.fixed.development",
+            _required(periods, "development", dict, f"task.evaluation.{periods_key}"),
+            f"task.evaluation.{periods_key}.development",
         )
         gate = _period(
-            _required(fixed, "gate", dict, "task.evaluation.fixed"),
-            "task.evaluation.fixed.gate",
+            _required(periods, "gate", dict, f"task.evaluation.{periods_key}"),
+            f"task.evaluation.{periods_key}.gate",
         )
         if development[1] >= gate[0]:
             raise ValueError("fixed development and gate periods must not overlap")
@@ -229,6 +241,24 @@ class ResearchTask:
     @property
     def evaluation_mode(self) -> str:
         return str(self.raw["evaluation"]["mode"])
+
+    @property
+    def evaluation_periods(self) -> Mapping[str, Any]:
+        evaluation = self.raw["evaluation"]
+        return evaluation["fixed" if self.evaluation_mode == "fixed" else "walk_forward"]
+
+    @property
+    def development_period(self) -> Mapping[str, Any]:
+        return self.evaluation_periods["development"]
+
+    @property
+    def gate_period(self) -> Mapping[str, Any]:
+        return self.evaluation_periods["gate"]
+
+    @property
+    def test_period(self) -> Mapping[str, Any] | None:
+        value = self.raw["evaluation"].get("test")
+        return value if isinstance(value, Mapping) else None
 
     @property
     def baseline_mode(self) -> str:
