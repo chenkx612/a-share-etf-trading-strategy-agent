@@ -18,15 +18,15 @@ goal = """
 """
 
 [budget]
-max_rounds = 8
-max_hours = 6
+max_rounds = 3
+max_hours = 3
 max_consecutive_failures = 3
-round_minutes = 35
+round_minutes = 30
 
 [opencode]
 model = "xai/grok-4.5"
 variant = "high"
-timeout_minutes = 35
+timeout_minutes = 30
 
 [strategy]
 name = "liquid-etf-rerank-topk"
@@ -80,9 +80,9 @@ step_months = 1
 max_parameter_sets = 128
 
 [evaluation.walk_forward.development]
-start = "2023-01-01"
-end = "2025-07-17"
+start = "2023-01-22"
+end = "2025-07-21"
 
 [evaluation.walk_forward.gate]
-start = "2025-07-18"
-end = "2026-07-17"
+start = "2025-07-22"
+end = "2026-07-21"
