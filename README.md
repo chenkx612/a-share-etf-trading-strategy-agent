@@ -215,12 +215,13 @@ python3 scripts/build_liquid_etf_universe.py --date YYYY-MM-DD
 `universes/liquid_etf_rotation.csv`；它不会修改 `universes/sector_rotation.csv`。
 任一入围 ETF 行情刷新失败或最终池为空时，命令保留预览和审计产物但拒绝更新正式池。
 
-默认参数为 `--min-fund-size 10000000000`、`--shortlist-size 30`、
+默认参数为 `--min-fund-size 10000000000`、`--shortlist-size 100`、
 `--lookback-days 252`、`--min-observations 120` 和
 `--corr-threshold 0.90`。命令只扫描当前 ETF 产品，不主动纳入 LOF，并允许当前
 产品列表带来的幸存者偏差。筛选和排序只使用当前规模及名称分组，不使用历史或当日
 收益排名；共享前复权历史仅用于剔除历史不足和普通 Pearson 相关系数大于阈值的产品，
-负相关不取绝对值。相关性去重后不强制补足 30 只。
+负相关不取绝对值。`--shortlist-size` 是为避免单次拉取过多行情设置的上限；
+相关性去重后不强制补足至该上限。
 
 ## Project layout
 

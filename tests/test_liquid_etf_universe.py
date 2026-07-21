@@ -34,7 +34,7 @@ def make_args(output_dir: Path, *, apply: bool = False) -> argparse.Namespace:
     return argparse.Namespace(
         date="2026-06-12",
         min_fund_size=10_000_000_000,
-        shortlist_size=30,
+        shortlist_size=100,
         lookback_days=252,
         min_observations=120,
         corr_threshold=0.90,
@@ -95,6 +95,12 @@ def test_normalized_etf_group_key_removes_spaces_and_ignores_etf_case() -> None:
     assert builder.normalized_etf_group_key(" 通 信 eTf 华夏 ") == "通信"
     assert builder.normalized_etf_group_key("Gold EtF Sponsor") == "gold"
     assert builder.normalized_etf_group_key("创业板") == "创业板"
+
+
+def test_default_shortlist_size_bounds_refresh_workload_at_one_hundred() -> None:
+    builder = load_builder()
+
+    assert builder.DEFAULT_SHORTLIST_SIZE == 100
 
 
 def test_shortlist_filters_size_deduplicates_by_largest_and_uses_symbol_tie_break() -> None:

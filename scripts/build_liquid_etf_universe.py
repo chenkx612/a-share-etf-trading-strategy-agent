@@ -33,7 +33,9 @@ from quant_core.data.market_data import (  # noqa: E402
 
 
 DEFAULT_MIN_FUND_SIZE = 10_000_000_000
-DEFAULT_SHORTLIST_SIZE = 30
+# Bound the market-data refresh workload without excluding the normal set of
+# large, name-deduplicated ETF themes from correlation selection.
+DEFAULT_SHORTLIST_SIZE = 100
 DEFAULT_LOOKBACK_DAYS = 252
 DEFAULT_MIN_OBSERVATIONS = 120
 DEFAULT_CORR_THRESHOLD = 0.90
