@@ -29,10 +29,12 @@
 
 ## 当前结论
 
-当前没有待解决的 P0，允许启动新的 Loop Run；仍需明确评估以下 P1/P2 遗留问题：
+当前存在开放 P0，修复并验证前不得启动新的 Loop Run。仍需同时评估以下 P1/P2 遗留问题：
 
 | 优先级 | 问题 |
 | --- | --- |
+| P0 | Provider 刷新令牌失效未按基础设施错误熔断 |
+| P1 | Round 硬时限会丢弃截止前已经可运行的候选 |
 | P1 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
 | P1 | 临时 Development runtime 缺失会清空耐久 Champion 指标 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
@@ -42,9 +44,56 @@
 
 ### P0：新 Loop 前必须解决
 
-当前无开放 P0。
+#### Provider 刷新令牌失效未按基础设施错误熔断
+
+- **问题**：`liquid-etf-rerank-topk` Run `001` 的首轮候选达到 30 分钟硬时限后，Round `002`、
+  Round `003` 和终局报告分别在约 2 秒内失败，OpenCode 事件均报告
+  `xAI token refresh failed (400): invalid_grant`，并明确指出 refresh token 已被撤销。候选容器使用
+  一次性 runtime home；长会话中的令牌轮换是否只写入临时副本、宿主认证快照因而继续携带旧 refresh
+  token，仍需验证。无论认证失效来源为何，`_container_infrastructure_error` 没有识别该错误，两个后续
+  Round 被记为普通 `OpenCode session failed` 并耗尽剩余预算，报告会话也重复使用失效认证而失败。
+- **方案**：
+  - 将 provider 认证、令牌刷新和明确的 `invalid_grant` 归类为基础设施错误；候选会话首次遇到后立即
+    以 `infrastructure_failure` 熔断，不再启动后续 Round。
+  - 在每个候选和报告会话启动前做轻量认证可用性检查，或提供不会消耗研究轮次的认证预检；预检不得
+    输出 token 内容。
+  - 明确轮换型 refresh token 在一次性 runtime home 与宿主认证文件之间的所有权和持久化策略。
+    若需回写，只能原子更新经过严格限定的认证文件，并验证不会把候选容器中的其他状态带回宿主；若不
+    回写，则应使用不会因单次刷新立即使后续隔离会话失效的 provider 会话机制。
+  - 终局报告遇到同类错误时保留确定性报告输入，并给出可重试的认证失败状态，避免丢失 Run 复盘入口。
+- **验证**：使用会轮换 refresh token 的假 provider 连续启动两个候选会话和一个报告会话，确认有效
+  轮换后三者均成功；再注入 revoked token，确认首次失败即标记 `infrastructure`、停止 Run、只消耗当前
+  Round，且重新认证后可单独重试报告。不得在事件、结果或测试输出中泄露认证内容。
+- **风险**：当前宿主 xAI refresh token 已被服务端判定撤销；在重新认证及完成上述熔断修复前，新
+  Loop 会重复快速失败并消耗预算，现有 Run `001` 也无法依赖模型生成终局报告。
 
 ### P1：推荐解决，可带风险继续
+
+#### Round 硬时限会丢弃截止前已经可运行的候选
+
+- **问题**：当前 `budget.round_minutes` 到期后会终止候选 Agent 及其进程组，并直接把该 Round 记为
+  `Candidate research deadline exceeded`。即使 Agent 在截止前已经写出并验证过一个可运行策略，只要
+  尚未返回最终 JSON，该候选也不会进入 Harness-owned 测试、Development 复核或 Gate，效果等同于把
+  已完成但尚未正式提交的答卷判零。`liquid-etf-rerank-topk` Run `001` Round `001` 已出现这一情况：
+  Agent 在时限内形成过多个可运行版本并执行 Development 诊断，但最后仍因继续收敛而整轮归零。
+- **方案**：
+  - 提供显式、低成本的 checkpoint 命令；Agent 每得到一个语法完整、接口可加载的候选就应提交一次，
+    后续研究不得覆盖已保存的 checkpoint。Prompt 应鼓励尽早提交和多次提交，而不是只在结束前交付。
+  - checkpoint 至少冻结策略文件、内容哈希、提交时间、父 Champion 和简短的假设/变更说明；Harness
+    校验它只包含 `scope.editable` 中的文件，并将 checkpoint 保存在候选不可回写或只能追加的边界内。
+  - 正常完成时仍评测 Agent 明确提交的最终版本；达到硬时限时立即停止继续搜索，但恢复并评测截止前
+    最后一个完整有效的 checkpoint。结果显式标记 `submitted_by_timeout` 和 checkpoint 标识，不得把
+    超时后的文件内容混入评测。
+  - 若最后一个 checkpoint 文件不完整、哈希不符、无法导入、越过修改范围或不存在，才把 Round 记为
+    failed；否则照常运行固定测试、Development 和 Gate，并由原有晋级规则决定 accepted/rejected。
+  - checkpoint 只保存候选代码与必要元数据，不保存或暴露 Gate 输入、精确 Gate 指标及 disposable
+    runtime；Harness-owned 正式评测仍发生在冻结之后且不计入 Agent 的研发时限。
+- **验证**：覆盖至少以下确定性场景：Agent 提交多个 checkpoint 后超时，只有最后一个有效版本被评测；
+  最后一次写入损坏时回退到前一个有效 checkpoint；无 checkpoint 时仍按超时失败；正常最终提交优先于
+  checkpoint；截止后产生的 checkpoint 被拒绝；恢复版本通过测试和 Gate 时可以晋级，并在 result、
+  decision、candidate patch 和事件日志中保留 checkpoint 来源及 `submitted_by_timeout` 证据。
+- **风险**：修复前应缩小单轮搜索空间并要求 Agent 尽早结束，但 Prompt 提醒无法提供耐久保证；任何
+  接近时限的长回测或模型停顿仍可能使已经可运行的候选随临时 worktree 一起被清理，并消耗一个 Round。
 
 #### 单一 Development 汇总指标缺少稳健性和行为诊断
 
