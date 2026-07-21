@@ -302,6 +302,15 @@ class ExperimentResult:
             raise ValueError("result.failure_kind must be 'infrastructure' when present")
         if status == "completed" and failure_kind is not None:
             raise ValueError("completed result must not declare failure_kind")
+        failure_code = data.get("failure_code")
+        if failure_code is not None and (
+            failure_kind != "infrastructure"
+            or not isinstance(failure_code, str)
+            or not failure_code.strip()
+        ):
+            raise ValueError(
+                "result.failure_code must be a non-empty string for infrastructure failures"
+            )
         feedback = data.get("feedback")
         if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
             raise ValueError("result.feedback must be a non-empty str when present")

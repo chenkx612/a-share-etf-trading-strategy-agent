@@ -136,10 +136,14 @@ OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Ro
 `QUANT_OPENCODE_MODELS_FILE` 覆盖路径。Harness 将存在的文件复制到一次性 runtime home，
 再只挂载该 home；容器结束后删除临时副本，避免 Docker 不兼容的嵌套 bind mount。
 这些输入只用于 OpenCode 认证、配置和模型目录，不应指向包含其他用户数据的文件。
+对轮换型 Provider 凭据，Harness 会按认证文件加跨进程锁。固定提示、`--pure` 且全部工具禁用的
+宿主 OpenCode 认证预检负责刷新自己的认证文件；Harness 不解析或回写预检产生的凭据。候选和报告
+会话只使用移除 refresh 字段的一次性副本且永不回写，因此 Agent 无法把临时认证状态带回宿主。
 
 新 Loop 分配 Run 编号前会用真实研究镜像执行容器预检，验证候选目录可写、固定输入只读、
 Research Root 被遮蔽、OpenCode runtime 文件可见且任务配置的模型存在。预检失败不会创建
-Run 或消耗 Round；运行中识别出的容器基础设施故障会立即停止 Run，不会连续重试至耗尽预算。
+Run 或消耗 Round。Harness 还会在 Run 和后续 Round 分配前发起无工具的轻量 Provider 认证请求；
+明确的认证或 refresh token 故障会标记为 `infrastructure` 并立即停止，不会连续重试至耗尽预算。
 
 镜像只包含 OpenCode、基础工具和 `pyproject.toml` 声明的 Python 依赖，不包含项目源码。
 候选代码始终来自当前 worktree 挂载；因此普通源码修改和每轮 Loop 都不需要重新构建镜像，
@@ -174,7 +178,9 @@ python3 -m quant_core.cli research clean --task-id <task-id>
 
 任务级 Champion 保存在 `.research/<task-id>/champion.py` 和 `champion.json`；每轮的
 `result.json`、`decision.json` 和候选 patch 保存在 `runs/<run>/rounds/<round>/`，终局复盘
-保存在 `runs/<run>/report.md`。活动 Loop 的阶段事件会同时输出到终端和
+保存在 `runs/<run>/report.md`，冻结的报告输入保存在 `runs/<run>/report-input.json`。报告认证失败
+不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop
+的阶段事件会同时输出到终端和
 `.research/<task-id>/.tmp/runs/<run>/events.jsonl`，正常结束后清理临时事件与 worktree。
 
 Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止；`rejected` 是正常研究结果，

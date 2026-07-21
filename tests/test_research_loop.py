@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from quant_core.research import run_loop
+from quant_core.research.runner import AgentContainerInfrastructureError
 from quant_core.research.workspace import ResearchWorkspace
 
 
@@ -200,6 +201,49 @@ def test_container_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> 
         )
 
     assert not (tmp_path / ".research/loop-test/runs").exists()
+
+
+def test_provider_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+
+    def fail_authentication(task, research_root: Path) -> None:
+        raise AgentContainerInfrastructureError("Provider authentication failed")
+
+    with pytest.raises(AgentContainerInfrastructureError, match="authentication failed"):
+        run_loop(
+            task,
+            workspace=tmp_path,
+            managed_runner=_runner(["rejected"]),
+            reporter=_reporter,
+            provider_preflight=fail_authentication,
+        )
+
+    assert not (tmp_path / ".research/loop-test/runs").exists()
+
+
+def test_provider_preflight_stops_before_allocating_next_round(tmp_path: Path) -> None:
+    task = _task(tmp_path, max_rounds=3)
+    preflight_calls = 0
+
+    def authentication_preflight(task, research_root: Path) -> None:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        if preflight_calls == 2:
+            raise AgentContainerInfrastructureError("Provider authentication failed")
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected", "accepted"]),
+        reporter=_reporter,
+        provider_preflight=authentication_preflight,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["rounds_completed"] == 1
+    assert state["round_ids"] == ["001"]
+    assert not (state_path.parent / "rounds/002").exists()
 
 
 def test_infrastructure_failure_stops_after_one_round(tmp_path: Path) -> None:
@@ -410,6 +454,44 @@ def test_loop_materializes_missing_interrupted_round_before_allocating_next(
         "decision"
     ] == "failed"
     assert next_round.is_dir()
+
+
+def test_resumed_loop_materializes_current_round_before_authentication_fuse(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, max_rounds=3, max_failures=2)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        run_number=1,
+    )
+    manager.rounds.mkdir(parents=True)
+    manager.loop_state_path.write_text(
+        json.dumps(_running_state(task)),
+        encoding="utf-8",
+    )
+
+    def fail_authentication(task, research_root: Path) -> None:
+        raise AgentContainerInfrastructureError("Provider authentication failed")
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+        provider_preflight=fail_authentication,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    interrupted = manager.rounds / "001"
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["rounds_completed"] == 1
+    assert state["failed"] == 1
+    assert state["round_ids"] == ["001"]
+    assert (interrupted / "result.json").is_file()
+    assert (interrupted / "decision.json").is_file()
+    assert not (manager.rounds / "002").exists()
 
 
 def test_round_allocator_does_not_reuse_recorded_id_without_directory(

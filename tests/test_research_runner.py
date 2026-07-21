@@ -24,6 +24,7 @@ from quant_core.research.runner import (
     _stage_opencode_runtime,
     _workspace_env,
     preflight_agent_container,
+    preflight_provider_authentication,
 )
 
 
@@ -435,6 +436,69 @@ def test_agent_container_preflight_reports_mount_failure(
     assert list(preflight_root.iterdir()) == []
 
 
+def test_provider_preflight_uses_trusted_host_opencode_refresh(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({
+        "xai": {"type": "oauth", "access": "access-a", "refresh": "refresh-a"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+    task = ResearchTask.from_mapping(tomllib.loads(TASK_TOML))
+
+    def trusted_refresh(command, prompt, cwd, log_path, timeout, permissions) -> int:
+        assert command[:3] == ["opencode", "run", "--pure"]
+        assert set(permissions.values()) == {"deny"}
+        payload = json.loads(auth.read_text(encoding="utf-8"))
+        payload["xai"] = {
+            "type": "oauth",
+            "access": "access-b",
+            "refresh": "refresh-b",
+        }
+        auth.write_text(json.dumps(payload), encoding="utf-8")
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(
+        research_runner,
+        "_run_opencode_with_permissions",
+        trusted_refresh,
+    )
+
+    preflight_provider_authentication(task, tmp_path / ".research")
+
+    saved = json.loads(auth.read_text(encoding="utf-8"))
+    assert saved["xai"]["refresh"] == "refresh-b"
+
+
+def test_provider_preflight_allows_environment_authenticated_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {"deepseek": {"type": "api", "key": "unchanged"}}
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+    payload = tomllib.loads(TASK_TOML)
+    payload["opencode"]["model"] = "environment/test"
+    task = ResearchTask.from_mapping(payload)
+
+    def succeed(command, prompt, cwd, log_path, timeout, permissions) -> int:
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(
+        research_runner,
+        "_run_opencode_with_permissions",
+        succeed,
+    )
+
+    preflight_provider_authentication(task, tmp_path / ".research")
+
+    assert json.loads(auth.read_text(encoding="utf-8")) == original
+
+
 def test_agent_read_only_paths_preserve_generated_output_directory(tmp_path: Path) -> None:
     for relative in ("data", "outputs/factors", "outputs/backtests", "tests", ".research"):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
@@ -706,6 +770,99 @@ def test_container_runner_deletes_staged_runtime_files(
     assert exit_code == 0
     assert len(runtime_homes) == 1
     assert not runtime_homes[0].exists()
+
+
+def test_candidate_session_cannot_persist_staged_credentials(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {
+        "xai": {
+            "type": "oauth",
+            "access": "trusted-access",
+            "refresh": "trusted-refresh",
+        },
+    }
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def tamper(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        home_mount = next(
+            part
+            for part in command
+            if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+        )
+        runtime_home = Path(home_mount.split("src=", 1)[1].split(",dst=", 1)[0])
+        runtime_auth = runtime_home / ".local/share/opencode/auth.json"
+        payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+        assert "refresh" not in payload["xai"]
+        payload["xai"] = {"type": "oauth", "refresh": "agent-controlled"}
+        runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", tamper)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "candidate",
+        tmp_path,
+        tmp_path / "candidate.log",
+        1,
+    )
+
+    assert exit_code == 0
+    assert json.loads(auth.read_text(encoding="utf-8")) == original
+
+
+def test_provider_authentication_error_precedes_round_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({
+        "xai": {"type": "oauth", "refresh": "secret-refresh"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def revoked_token(*args, **kwargs) -> int:
+        log_path = args[3]
+        log_path.write_text(
+            'xAI token refresh failed (400): {"error":"invalid_grant",'
+            '"error_description":"Refresh token has been revoked: secret-refresh"}',
+            encoding="utf-8",
+        )
+        return 124
+
+    monkeypatch.setattr(research_runner, "_run_opencode_container", revoked_token)
+    result_path = run_once(
+        task_path,
+        "experiment-authentication",
+        tmp_path / "experiment-authentication",
+        workspace=tmp_path,
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["failure_kind"] == "infrastructure"
+    assert result["failure_code"] == "provider_authentication"
+    assert result["error"] == (
+        "Agent infrastructure failure: Provider authentication failed; "
+        "re-authenticate before retrying"
+    )
+    assert "invalid_grant" not in result["error"]
+    events = result_path.parent / "opencode-events.jsonl"
+    assert "secret-refresh" not in events.read_text(encoding="utf-8")
+    assert "[REDACTED]" in events.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(

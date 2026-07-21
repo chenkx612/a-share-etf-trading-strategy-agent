@@ -9,12 +9,25 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quant_core.research.contracts import ResearchTask
-from quant_core.research.runner import _run_opencode_read_only
+from quant_core.research.runner import (
+    AgentContainerInfrastructureError,
+    _infrastructure_failure,
+    _redact_authentication_log,
+    _run_opencode_read_only,
+    preflight_provider_authentication,
+)
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 
 ReportAgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 _ROUND_ID = re.compile(r"^\d+$")
+
+
+class ReportInfrastructureError(RuntimeError):
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.failure_kind = "infrastructure"
+        self.failure_code = code
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -82,6 +95,7 @@ def _experiment_records(
             "metrics": result.get("metrics"),
             "error": result.get("error"),
             "failure_kind": result.get("failure_kind"),
+            "failure_code": result.get("failure_code"),
         })
     return records
 
@@ -258,6 +272,14 @@ def generate_loop_report(
             ),
         },
     }
+    report_input_path = manager.run_root / "report-input.json"
+    frozen_payload = _read_json(report_input_path)
+    if report_input_path.exists() and frozen_payload is None:
+        raise RuntimeError("Frozen report input is missing or invalid")
+    if frozen_payload is None:
+        write_json_atomic(report_input_path, payload)
+    else:
+        payload = frozen_payload
     opencode = task.raw["opencode"]
     command = [
         "opencode", "run", "--auto", "--format", "json",
@@ -268,6 +290,11 @@ def generate_loop_report(
     timeout = min(int(opencode["timeout_minutes"]) * 60, 600)
     events_path = manager.run_temp / "report-events.jsonl"
     events_path.parent.mkdir(parents=True, exist_ok=True)
+    if agent_runner is _run_opencode_read_only:
+        try:
+            preflight_provider_authentication(task, manager.research_root)
+        except AgentContainerInfrastructureError as exc:
+            raise ReportInfrastructureError(str(exc), "provider_authentication") from exc
     exit_code = agent_runner(
         command,
         _report_prompt(payload),
@@ -279,6 +306,11 @@ def generate_loop_report(
         failed_events = manager.run_root / "report-events.jsonl"
         if events_path.exists():
             events_path.replace(failed_events)
+        failure = _infrastructure_failure(failed_events)
+        if failure is not None:
+            if failure.code == "provider_authentication":
+                _redact_authentication_log(failed_events)
+            raise ReportInfrastructureError(failure.message, failure.code)
         reason = "timed out" if exit_code == 124 else f"exited with code {exit_code}"
         raise RuntimeError(f"OpenCode report session {reason}")
     report = _last_text_event(events_path)
@@ -326,6 +358,8 @@ def regenerate_loop_report(
     loop_state["report_status"] = "running"
     loop_state["report_path"] = None
     loop_state["report_error"] = None
+    loop_state["report_failure_kind"] = None
+    loop_state["report_failure_code"] = None
     _write_loop_state(loop_state_path, loop_state)
     try:
         report_path = generate_loop_report(
@@ -342,6 +376,8 @@ def regenerate_loop_report(
     except Exception as exc:
         loop_state["report_status"] = "failed"
         loop_state["report_error"] = str(exc)
+        loop_state["report_failure_kind"] = getattr(exc, "failure_kind", None)
+        loop_state["report_failure_code"] = getattr(exc, "failure_code", None)
         _write_loop_state(loop_state_path, loop_state)
         raise
     loop_state["report_status"] = "completed"

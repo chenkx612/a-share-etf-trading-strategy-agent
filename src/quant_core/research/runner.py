@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -13,6 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,10 +37,27 @@ _RESEARCH_HISTORY_LIMIT = 12
 _ROUND_CLOCK_FILE = ".quant-research-round.json"
 _AGENT_CONTAINER_IMAGE = "quant-agent-research:latest"
 _CONTAINER_WORKSPACE = "/workspace"
+_NO_TOOL_PERMISSIONS = {
+    "external_directory": "deny",
+    "question": "deny",
+    "bash": "deny",
+    "edit": "deny",
+    "task": "deny",
+    "skill": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "todowrite": "deny",
+}
 
 
 class AgentContainerInfrastructureError(RuntimeError):
     """Raised when the isolated Agent container cannot be started safely."""
+
+
+@dataclass(frozen=True)
+class InfrastructureFailure:
+    code: str
+    message: str
 
 
 @dataclass
@@ -300,7 +319,11 @@ def _opencode_runtime_sources() -> tuple[tuple[Path, Path], ...]:
     )
 
 
-def _stage_opencode_runtime(runtime_home: Path) -> None:
+def _stage_opencode_runtime(
+    runtime_home: Path,
+    *,
+    strip_refresh_for: str | None = None,
+) -> None:
     for source, relative in _opencode_runtime_sources():
         if not source.is_file():
             continue
@@ -308,6 +331,61 @@ def _stage_opencode_runtime(runtime_home: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
         destination.chmod(0o600)
+    if strip_refresh_for is None:
+        return
+    runtime_auth = runtime_home / ".local/share/opencode/auth.json"
+    try:
+        payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    provider_auth = payload.get(strip_refresh_for) if isinstance(payload, dict) else None
+    if not isinstance(provider_auth, dict):
+        return
+    changed = False
+    for field in ("refresh", "refresh_token"):
+        if field in provider_auth:
+            del provider_auth[field]
+            changed = True
+    if changed:
+        runtime_auth.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        runtime_auth.chmod(0o600)
+
+
+def _configured_provider(command: Sequence[str]) -> str | None:
+    try:
+        model = command[command.index("--model") + 1]
+    except (ValueError, IndexError):
+        return None
+    provider, separator, _ = model.partition("/")
+    return provider if separator and provider else None
+
+
+@contextmanager
+def _opencode_auth_lock(provider: str | None, timeout: float):
+    auth_path = _opencode_runtime_sources()[0][0]
+    if provider is None or not auth_path.is_file():
+        yield None
+        return
+    lock_path = auth_path.with_name(f"{auth_path.name}.quant-research.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        lock_path.chmod(0o600)
+        started = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() - started >= timeout:
+                    raise ValueError("OpenCode credential lock timed out")
+                time.sleep(0.1)
+        try:
+            yield auth_path
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _docker_opencode_command(
@@ -416,11 +494,14 @@ def _run_opencode_container(
     timeout: int,
     *,
     read_only_paths: Sequence[Path] = (),
+    provider: str | None = None,
+    permissions: Mapping[str, str] | None = None,
 ) -> int:
-    permissions = {
-        "external_directory": "deny",
-        "question": "deny",
-    }
+    effective_permissions = (
+        permissions
+        if permissions is not None
+        else {"external_directory": "deny", "question": "deny"}
+    )
     try:
         if not cwd.is_dir():
             log_path.write_text(
@@ -434,68 +515,117 @@ def _run_opencode_container(
             # Current OpenCode requires the message as a positional argument.
             container_command_parts.append(prompt)
             container_input = ""
+        credential_provider = provider or _configured_provider(container_command_parts)
         hidden = cwd / ".research"
-        with tempfile.TemporaryDirectory(
-            prefix=".agent-hidden-",
-            dir=log_path.parent,
-        ) as temporary:
-            temporary_root = Path(temporary)
-            runtime_home = temporary_root / "home"
-            (runtime_home / ".local" / "share" / "opencode").mkdir(parents=True)
-            (runtime_home / ".config" / "opencode").mkdir(parents=True)
-            _stage_opencode_runtime(runtime_home)
-            mask = temporary_root / "mask"
-            mask.mkdir()
-            hidden_mounts = (
-                [(mask, hidden)]
-                if hidden.is_dir()
-                else []
-            )
-            for attempt in range(2):
-                container_name = f"quant-agent-{uuid.uuid4().hex}"
-                container_command = _docker_opencode_command(
-                    container_command_parts,
-                    cwd,
-                    permissions,
-                    read_only_paths,
-                    hidden_mounts,
+        session_started = time.monotonic()
+        with _opencode_auth_lock(credential_provider, float(timeout)) as host_auth:
+            original_auth = host_auth.read_bytes() if host_auth is not None else None
+            with tempfile.TemporaryDirectory(
+                prefix=".agent-hidden-",
+                dir=log_path.parent,
+            ) as temporary:
+                temporary_root = Path(temporary)
+                runtime_home = temporary_root / "home"
+                (runtime_home / ".local" / "share" / "opencode").mkdir(parents=True)
+                (runtime_home / ".config" / "opencode").mkdir(parents=True)
+                _stage_opencode_runtime(
                     runtime_home,
-                    container_name,
+                    strip_refresh_for=credential_provider,
                 )
-                try:
-                    exit_code = _run_prompt_process(
-                        container_command,
-                        container_input,
+                mask = temporary_root / "mask"
+                mask.mkdir()
+                hidden_mounts = (
+                    [(mask, hidden)]
+                    if hidden.is_dir()
+                    else []
+                )
+                for attempt in range(2):
+                    container_name = f"quant-agent-{uuid.uuid4().hex}"
+                    container_command = _docker_opencode_command(
+                        container_command_parts,
                         cwd,
-                        log_path,
-                        timeout,
+                        effective_permissions,
+                        read_only_paths,
+                        hidden_mounts,
+                        runtime_home,
+                        container_name,
                     )
-                finally:
-                    removed = _remove_agent_container(container_name)
-                if not removed:
-                    with log_path.open("a", encoding="utf-8") as log:
-                        log.write("\nFailed to remove Agent container")
-                    return 127
-                if attempt == 0 and _is_retryable_bind_source_failure(
-                    exit_code,
-                    log_path,
-                    container_command,
+                    try:
+                        exit_code = _run_prompt_process(
+                            container_command,
+                            container_input,
+                            cwd,
+                            log_path,
+                            max(0.1, float(timeout) - (time.monotonic() - session_started)),
+                        )
+                    finally:
+                        removed = _remove_agent_container(container_name)
+                    if not removed:
+                        with log_path.open("a", encoding="utf-8") as log:
+                            log.write("\nFailed to remove Agent container")
+                        exit_code = 127
+                        break
+                    if attempt == 0 and _is_retryable_bind_source_failure(
+                        exit_code,
+                        log_path,
+                        container_command,
+                    ):
+                        time.sleep(0.25)
+                        continue
+                    break
+                session_failure = _infrastructure_failure(log_path)
+                if (
+                    session_failure is not None
+                    and session_failure.code == "provider_authentication"
                 ):
-                    time.sleep(0.25)
-                    continue
+                    authentication_snapshots: list[Any] = []
+                    encoded_snapshots = [original_auth]
+                    if host_auth is not None:
+                        try:
+                            encoded_snapshots.append(
+                                (runtime_home / ".local/share/opencode/auth.json").read_bytes()
+                            )
+                        except OSError:
+                            pass
+                    for encoded in encoded_snapshots:
+                        if encoded is None:
+                            continue
+                        try:
+                            authentication_snapshots.append(json.loads(encoded))
+                        except json.JSONDecodeError:
+                            continue
+                    _redact_authentication_log(log_path, authentication_snapshots)
                 return exit_code
-            raise AssertionError("unreachable")
     except (OSError, ValueError) as exc:
         log_path.write_text(str(exc), encoding="utf-8")
         return 127
 
 
-def _container_infrastructure_error(log_path: Path) -> str | None:
+def _infrastructure_failure(log_path: Path) -> InfrastructureFailure | None:
     try:
         detail = log_path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    markers = (
+    folded = detail.casefold()
+    authentication_markers = (
+        "invalid_grant",
+        "token refresh failed",
+        "refresh token has been revoked",
+        "refresh token is revoked",
+        "refresh token has expired",
+        "provider authentication failed",
+    )
+    if any(marker in folded for marker in authentication_markers):
+        return InfrastructureFailure(
+            "provider_authentication",
+            "Provider authentication failed; re-authenticate before retrying",
+        )
+    if "opencode credential lock timed out" in folded:
+        return InfrastructureFailure(
+            "provider_authentication_state",
+            "Provider authentication state is busy in another session",
+        )
+    container_markers = (
         "docker: Error response from daemon",
         "Cannot connect to the Docker daemon",
         "failed to connect to the docker API",
@@ -506,11 +636,56 @@ def _container_infrastructure_error(log_path: Path) -> str | None:
         "No such image",
         "Failed to remove Agent container",
     )
-    folded = detail.casefold()
-    if not any(marker.casefold() in folded for marker in markers):
+    if not any(marker.casefold() in folded for marker in container_markers):
         return None
     compact = " ".join(detail.split())
-    return compact[:2000]
+    return InfrastructureFailure("container_runtime", compact[:2000])
+
+
+def _container_infrastructure_error(log_path: Path) -> str | None:
+    failure = _infrastructure_failure(log_path)
+    return failure.message if failure is not None else None
+
+
+def _redact_authentication_log(
+    log_path: Path,
+    additional_payloads: Sequence[Any] = (),
+) -> None:
+    auth_path = _opencode_runtime_sources()[0][0]
+    try:
+        detail = log_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    payloads = list(additional_payloads)
+    try:
+        payloads.append(json.loads(auth_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        pass
+    secrets: set[str] = set()
+    secret_fields = {
+        "access", "access_token", "apikey", "api_key", "key",
+        "refresh", "refresh_token", "secret", "token",
+    }
+
+    def collect(value: Any, field: str | None = None) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                collect(child, str(key).casefold())
+        elif isinstance(value, list):
+            for child in value:
+                collect(child, field)
+        elif field in secret_fields and isinstance(value, str) and value:
+            secrets.add(value)
+
+    for payload in payloads:
+        collect(payload)
+    redacted = detail
+    for secret in sorted(secrets, key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
+    if redacted != detail:
+        temporary = log_path.with_suffix(log_path.suffix + ".tmp")
+        temporary.write_text(redacted, encoding="utf-8")
+        os.replace(temporary, log_path)
 
 
 def preflight_agent_container(
@@ -591,6 +766,49 @@ def preflight_agent_container(
             )
 
 
+def preflight_provider_authentication(
+    task: ResearchTask,
+    research_root: Path,
+) -> None:
+    """Verify configured Provider authentication without allocating a research Round."""
+    preflight_root = research_root / task.task_id / ".tmp" / "provider-preflight"
+    preflight_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="probe-", dir=preflight_root) as temporary:
+        root = Path(temporary)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        events_path = root / "events.jsonl"
+        opencode = task.raw["opencode"]
+        command = [
+            "opencode", "run", "--pure", "--format", "json",
+            "--model", str(opencode["model"]), "--dir", str(workspace),
+        ]
+        if variant := opencode.get("variant"):
+            command.extend(["--variant", str(variant)])
+        provider = str(opencode["model"]).partition("/")[0]
+        try:
+            with _opencode_auth_lock(provider, 60):
+                exit_code = _run_opencode_with_permissions(
+                    command,
+                    "Reply exactly OK. Do not use tools.",
+                    workspace,
+                    events_path,
+                    60,
+                    _NO_TOOL_PERMISSIONS,
+                )
+        except ValueError as exc:
+            events_path.write_text(str(exc), encoding="utf-8")
+            exit_code = 127
+        if exit_code == 0:
+            return
+        failure = _infrastructure_failure(events_path)
+        if failure is not None:
+            raise AgentContainerInfrastructureError(failure.message)
+        raise AgentContainerInfrastructureError(
+            f"Provider authentication preflight exited with code {exit_code}"
+        )
+
+
 def _run_opencode_read_only(
     command: Sequence[str],
     prompt: str,
@@ -598,23 +816,13 @@ def _run_opencode_read_only(
     log_path: Path,
     timeout: int,
 ) -> int:
-    return _run_opencode_with_permissions(
+    return _run_opencode_container(
         command,
         prompt,
         cwd,
         log_path,
         timeout,
-        {
-            "external_directory": "deny",
-            "question": "deny",
-            "bash": "deny",
-            "edit": "deny",
-            "task": "deny",
-            "skill": "deny",
-            "webfetch": "deny",
-            "websearch": "deny",
-            "todowrite": "deny",
-        },
+        permissions=_NO_TOOL_PERMISSIONS,
     )
 
 
@@ -1020,6 +1228,7 @@ def _write_failed(
     agent_output: Mapping[str, Any] | None = None,
     round_timing: Mapping[str, Any] | None = None,
     failure_kind: str | None = None,
+    failure_code: str | None = None,
 ) -> Path:
     result_path = output_dir / "result.json"
     payload = {"experiment_id": experiment_id, "status": "failed", "error": error}
@@ -1027,6 +1236,8 @@ def _write_failed(
         payload["round_timing"] = dict(round_timing)
     if failure_kind is not None:
         payload["failure_kind"] = failure_kind
+    if failure_code is not None:
+        payload["failure_code"] = failure_code
     if agent_output is not None:
         for key in (
             "previous_feedback",
@@ -1160,7 +1371,19 @@ def run_once(
         or float(round_timing["duration_seconds"]) >= round_timeout
     )
     if exit_code != 0 or deadline_exceeded:
-        if deadline_exceeded:
+        infrastructure_failure = (
+            _infrastructure_failure(events_path)
+            if opencode_runner is None
+            else None
+        )
+        if infrastructure_failure is not None:
+            if infrastructure_failure.code == "provider_authentication":
+                _redact_authentication_log(events_path)
+            _emit(event_sink, "agent_failed", message="agent infrastructure failure", **event_details)
+            reason = f"Agent infrastructure failure: {infrastructure_failure.message}"
+            failure_kind = "infrastructure"
+            failure_code = infrastructure_failure.code
+        elif deadline_exceeded:
             _emit(
                 event_sink,
                 "round_deadline_exceeded",
@@ -1169,25 +1392,19 @@ def run_once(
             )
             reason = "Candidate research deadline exceeded"
             failure_kind = None
+            failure_code = None
         else:
             _emit(event_sink, "agent_failed", message="agent failed", **event_details)
-            infrastructure_error = (
-                _container_infrastructure_error(events_path)
-                if opencode_runner is None
-                else None
-            )
-            if infrastructure_error is None:
-                reason = "OpenCode session failed"
-                failure_kind = None
-            else:
-                reason = f"Agent container infrastructure failure: {infrastructure_error}"
-                failure_kind = "infrastructure"
+            reason = "OpenCode session failed"
+            failure_kind = None
+            failure_code = None
         return _write_failed(
             out,
             experiment_id,
             reason,
             round_timing=round_timing,
             failure_kind=failure_kind,
+            failure_code=failure_code,
         )
     agent_output = _parse_opencode_output(events_path)
     if agent_output is None:
@@ -1597,6 +1814,8 @@ def run_managed_once(
         }
         if result.get("failure_kind") == "infrastructure":
             decision["failure_kind"] = "infrastructure"
+            if isinstance(result.get("failure_code"), str):
+                decision["failure_code"] = result["failure_code"]
         write_json_atomic(decision_path, decision)
         manager.reject(candidate, state, record_id)
         return result_path

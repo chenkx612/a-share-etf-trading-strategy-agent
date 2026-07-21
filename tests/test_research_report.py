@@ -176,6 +176,8 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert captured["timeout"] == 600
     assert report_path.read_text(encoding="utf-8").startswith("# Research Loop 总结")
     assert not (manager.run_root / "report-events.jsonl").exists()
+    report_input = manager.run_root / "report-input.json"
+    frozen_input = report_input.read_bytes()
 
     loop_state_path = manager.loop_state_path
     write_json_atomic(loop_state_path, {
@@ -199,6 +201,9 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert saved_state["report_status"] == "completed"
     assert saved_state["report_path"] == "report.md"
     assert saved_state["report_error"] is None
+    assert saved_state["report_failure_kind"] is None
+    assert saved_state["report_failure_code"] is None
+    assert report_input.read_bytes() == frozen_input
     assert "updated_at" in saved_state
     assert not base.runtime.exists()
 
@@ -235,6 +240,86 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
             {"rounds_completed": 0, "round_ids": []},
             agent_runner=fake_agent,
         )
+
+
+def test_report_authentication_failure_is_retryable_with_frozen_input(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK, encoding="utf-8")
+    _repo(tmp_path)
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
+    write_json_atomic(manager.loop_state_path, {
+        "status": "stopped",
+        "stop_reason": "infrastructure_failure",
+        "rounds_completed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "failed": 0,
+        "elapsed_seconds": 1.0,
+        "round_ids": [],
+    })
+
+    def revoked(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        log_path.write_text(
+            'xAI token refresh failed (400): {"error":"invalid_grant",'
+            '"error_description":"Refresh token has been revoked"}',
+            encoding="utf-8",
+        )
+        return 1
+
+    with pytest.raises(RuntimeError, match="re-authenticate"):
+        regenerate_loop_report(
+            task_path,
+            workspace=tmp_path,
+            run_number=1,
+            agent_runner=revoked,
+        )
+
+    failed_state = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
+    report_input = manager.run_root / "report-input.json"
+    frozen_input = report_input.read_bytes()
+    assert failed_state["report_status"] == "failed"
+    assert failed_state["report_failure_kind"] == "infrastructure"
+    assert failed_state["report_failure_code"] == "provider_authentication"
+    assert "invalid_grant" not in str(failed_state["report_error"])
+
+    def succeed(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": "# Research Loop 总结\n\n认证恢复后生成。"},
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    regenerate_loop_report(
+        task_path,
+        workspace=tmp_path,
+        run_number=1,
+        agent_runner=succeed,
+    )
+    recovered_state = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
+    assert report_input.read_bytes() == frozen_input
+    assert recovered_state["report_status"] == "completed"
+    assert recovered_state["report_failure_kind"] is None
+    assert recovered_state["report_failure_code"] is None
 
 
 def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -> None:

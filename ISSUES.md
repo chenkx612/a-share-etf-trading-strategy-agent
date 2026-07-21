@@ -29,11 +29,10 @@
 
 ## 当前结论
 
-当前存在开放 P0，修复并验证前不得启动新的 Loop Run。仍需同时评估以下 P1/P2 遗留问题：
+当前没有开放 P0。启动新 Loop Run 前仍需评估以下 P1/P2 遗留问题：
 
 | 优先级 | 问题 |
 | --- | --- |
-| P0 | Provider 刷新令牌失效未按基础设施错误熔断 |
 | P1 | Round 硬时限会丢弃截止前已经可运行的候选 |
 | P1 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
 | P1 | 临时 Development runtime 缺失会清空耐久 Champion 指标 |
@@ -41,31 +40,6 @@
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 
 ## 一、待解决问题
-
-### P0：新 Loop 前必须解决
-
-#### Provider 刷新令牌失效未按基础设施错误熔断
-
-- **问题**：`liquid-etf-rerank-topk` Run `001` 的首轮候选达到 30 分钟硬时限后，Round `002`、
-  Round `003` 和终局报告分别在约 2 秒内失败，OpenCode 事件均报告
-  `xAI token refresh failed (400): invalid_grant`，并明确指出 refresh token 已被撤销。候选容器使用
-  一次性 runtime home；长会话中的令牌轮换是否只写入临时副本、宿主认证快照因而继续携带旧 refresh
-  token，仍需验证。无论认证失效来源为何，`_container_infrastructure_error` 没有识别该错误，两个后续
-  Round 被记为普通 `OpenCode session failed` 并耗尽剩余预算，报告会话也重复使用失效认证而失败。
-- **方案**：
-  - 将 provider 认证、令牌刷新和明确的 `invalid_grant` 归类为基础设施错误；候选会话首次遇到后立即
-    以 `infrastructure_failure` 熔断，不再启动后续 Round。
-  - 在每个候选和报告会话启动前做轻量认证可用性检查，或提供不会消耗研究轮次的认证预检；预检不得
-    输出 token 内容。
-  - 明确轮换型 refresh token 在一次性 runtime home 与宿主认证文件之间的所有权和持久化策略。
-    若需回写，只能原子更新经过严格限定的认证文件，并验证不会把候选容器中的其他状态带回宿主；若不
-    回写，则应使用不会因单次刷新立即使后续隔离会话失效的 provider 会话机制。
-  - 终局报告遇到同类错误时保留确定性报告输入，并给出可重试的认证失败状态，避免丢失 Run 复盘入口。
-- **验证**：使用会轮换 refresh token 的假 provider 连续启动两个候选会话和一个报告会话，确认有效
-  轮换后三者均成功；再注入 revoked token，确认首次失败即标记 `infrastructure`、停止 Run、只消耗当前
-  Round，且重新认证后可单独重试报告。不得在事件、结果或测试输出中泄露认证内容。
-- **风险**：当前宿主 xAI refresh token 已被服务端判定撤销；在重新认证及完成上述熔断修复前，新
-  Loop 会重复快速失败并消耗预算，现有 Run `001` 也无法依赖模型生成终局报告。
 
 ### P1：推荐解决，可带风险继续
 
@@ -156,6 +130,21 @@
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
 
 ### P0：曾阻断可信研发
+
+#### Provider 刷新令牌失效必须持久化并按基础设施错误熔断
+
+- **问题**：隔离会话只复制宿主认证快照，轮换后的 refresh token 随一次性 runtime home 删除；后续
+  Round 和报告继续使用已撤销 token。认证错误又未被基础设施分类器识别，导致无效重试耗尽预算。
+- **解决**：按认证文件串行化 OpenCode 会话；固定提示、`--pure` 且全部工具禁用的宿主 OpenCode
+  预检负责刷新自己的认证文件，Harness 不解析或回写刷新结果。候选和报告仅使用移除 refresh 字段的
+  临时副本且永不回写。Run、后续 Round 和报告前执行真实轻量认证预检；`invalid_grant` 和 refresh 失败
+  统一写入结构化 `infrastructure` 故障并立即熔断。报告输入单独冻结，认证恢复后可重试。
+- **验证**：假 Provider 完成可信宿主预检轮换，并确认候选和报告无法回写认证；测试覆盖
+  revoked token 优先于超时、预检不分配 Run/下一 Round、无 auth-file Provider、Provider 范围回写、
+  权限及并发保护、错误脱敏和报告冻结输入重试。
+- **风险**：同一认证文件上的 Harness 会话会串行，锁等待计入会话硬时限；外部 OpenCode 进程不遵守
+  Harness 锁时，凭据文件的并发更新语义仍由 OpenCode 自身负责。无 refresh 副本的 Agent 若运行到
+  access token 过期会按认证基础设施故障停止，而不会在不可信会话中刷新。
 
 #### 容器运行时故障必须在 Run 前预检并按基础设施错误熔断
 
