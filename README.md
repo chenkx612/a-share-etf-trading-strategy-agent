@@ -84,8 +84,8 @@ python3 -m quant_core.cli research loop \
 
 研究任务在 `task.toml` 中声明目标、数据、Development/Gate 区间、允许修改的范围、
 固定评测命令、硬约束、Champion 改善要求、模型配置和运行预算。每次调用自动分配新的
-编号 Run；重复研发时继续使用默认 `.research`，无需显式传入 `--research-root`。当前
-`task.toml` 同时是可直接运行的任务配置示例，字段由
+编号 Run；重复研发时继续使用默认 `.research`，无需显式传入 `--research-root`。`tasks/`
+目录中的 TOML 文件是可直接运行的任务配置示例，字段由
 `src/quant_core/research/contracts.py` 验证。
 
 - `scope.editable` 当前只能声明一个仓库相对策略文件。
@@ -98,7 +98,7 @@ python3 -m quant_core.cli research loop \
   `validation_months = step_months`，参数网格由策略模块的 `parameter_grid()` 声明，
   固定 evaluator 通过 `select_with_params(...)` 评分并选参。
 - 硬约束运算符为 `>=`、`<=` 和 `abs<=`；可选 Test 区间必须位于 Gate 之后，使用
-  `research test --task task.toml` 对当前 Champion 单独评测，结果不参与晋级。
+  `research test --task path/to/task.toml` 对当前 Champion 单独评测，结果不参与晋级。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
 - `budget.round_minutes` 是每轮候选研发的硬时限；未配置时兼容使用
@@ -159,16 +159,16 @@ QUANT_TEST_AGENT_CONTAINER=1 pytest -q \
 ```bash
 # 运行一次候选研发，不管理 Champion
 python3 -m quant_core.cli research run-once \
-  --task task.toml \
+  --task tasks/sharpe_corr_threshold_optimization.toml \
   --experiment-id experiment-001 \
   --output path/to/experiment
 
 # 重新生成最近或指定 Run 的终局报告
-python3 -m quant_core.cli research report --task task.toml
-python3 -m quant_core.cli research report --task task.toml --run 2
+python3 -m quant_core.cli research report --task tasks/sharpe_corr_threshold_optimization.toml
+python3 -m quant_core.cli research report --task tasks/sharpe_corr_threshold_optimization.toml --run 2
 
 # 清理临时 worktree、派生缓存和冗余成功日志
-python3 -m quant_core.cli research clean --task task.toml
+python3 -m quant_core.cli research clean --task tasks/sharpe_corr_threshold_optimization.toml
 python3 -m quant_core.cli research clean --task-id <task-id>
 ```
 

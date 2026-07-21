@@ -1,0 +1,88 @@
+id = "liquid-etf-rerank-topk"
+goal = """
+从零研发一个面向 universes/liquid_etf_rotation.csv 的纯多头 ETF 横截面精排策略。类比搜广推系统，将每日收盘后的决策拆成“候选准入 -> 特征构造 -> 横截面精排 -> Top-K 组合”四层：在交易日 t 收盘后，只用 t 及此前已经可获得的 OHLCV/amount/turnover 历史为每只合格 ETF 生成可比较分数，在 t+1 开盘按分数从高到低持有 Top-K，并由固定回测器按下一开盘成交、整手和费率规则评估。不得使用 t+1 数据、未来收益、全样本统计量、向后填充、Gate 信息或任何形式的标签泄漏。
+
+候选池仅由配置的 universe 决定，但必须按每只 ETF 在信号日的真实可用历史动态准入；新上市或历史不足的 ETF 不得借用上市前数据。universe 文件中的 fund_size 是当前建池快照，只可用于固定池成员身份审计，不得作为历史打分特征、权重或过滤阈值。缺失行情不得用未来值补齐；当日无有效收盘数据或必要窗口不足的资产必须排除。当前池带有幸存者偏差，本任务不声称消除该偏差。
+
+精排应是可解释、可复现、适合小样本的横截面排序器，而不是引入不可审计的大模型或黑盒训练流程。优先研究有经济含义且彼此不过度重复的特征族：多尺度趋势/动量、风险调整后收益、下行风险与回撤、趋势稳定性、历史流动性，以及候选间相关性或集中度。所有尺度处理必须在每个信号日独立完成，例如横截面分位数、秩、截尾或仅基于过去窗口的标准化；严禁用完整 Development 或 Gate 区间拟合归一化参数。基础方案宜采用少量特征的线性秩融合、分层打分或其他透明精排结构，并明确分数方向、缺失值规则和确定性并列排序规则。
+
+首轮应先实现一个最小但完整、能被证伪的精排基线；后续每轮相对当前 Champion 只验证一个主要机制，说明它对应的排序错误或风险路径，以及它预期改变哪些入选 ETF。不得把大量同义动量窗口堆叠成伪多因子，不得进行无边界参数搜索，也不得通过长期空仓或普遍低仓位机械抬高风险指标。参数必须少、有经济含义并通过 parameter_grid() 给出不超过 Harness 上限的确定性小网格；合理邻近参数应产生相近行为，不追逐尖点最优。
+
+组合层必须首先忠实表达精排结果：每个有效信号日从合格资产中确定性选取 Top-K，默认等权且总权重不超过 1；合格资产少于 K 时只持有实际合格资产并保留剩余现金。允许研究简单的正分门槛、入选/保留缓冲、分散约束或因果明确的风险开关，但它们必须直接服务于排序质量、换手或尾部风险，并且风险改善不能主要来自持续降低总暴露。禁止做空、杠杆、未来成分回填，以及依赖盘中不可得信息的成交假设。
+
+策略模块必须实现 select(daily, universe, start, end)、parameter_grid() 和 select_with_params(daily, universe, start, end, params)。select() 使用明确的生产默认参数；两个选择入口必须返回 pandas DataFrame，至少包含 date、symbol、target_weight。输出 date 表示收盘后信号日而不是成交日；Harness 会自动将目标权重滞后一日并在次日开盘交易。建议额外保留 score、rank 和必要诊断列，但不得修改固定 evaluator。即使某个信号日无持仓，也要通过 DataFrame attrs 中的 signal_dates 和 universe_symbols 表达完整信号日与资产集合，使回测不会错误延续旧仓位。
+
+提交候选前，在 Development 内检查：无未来函数和边界窗口、每日权重和纯多头约束、信号日到次日开盘的时序、不同上市日期、缺失值、确定性并列排序、参数网格唯一性与大小、平均换手率，以及候选相对 Champion 的不同持仓日和 Top-K 变化。改善应来自多个预先存在的滚动折而非单一行情阶段。不得修改 universe、市场数据、回测器、评测区间、指标、约束、晋级逻辑或测试来配合候选。
+
+固定评测使用滚动训练窗口选择当折参数，再只在后续月度验证折计算样本外表现；Development 和 Gate 完全不重叠。候选必须让所有 Gate 折都能选出满足训练期硬约束的参数，并在 Gate 汇总层满足最低年化收益、最大回撤和平均换手率约束；在此基础上以 Sortino 为唯一晋级目标。首个可行候选成为 Champion，此后只有达到最小 Sortino 改善的候选才晋级。优先保留结构简单、跨折稳定、行为差异充分且便于每日复算的方案。
+"""
+
+[budget]
+max_rounds = 8
+max_hours = 6
+max_consecutive_failures = 3
+round_minutes = 35
+
+[opencode]
+model = "xai/grok-4.5"
+variant = "high"
+timeout_minutes = 35
+
+[strategy]
+name = "liquid-etf-rerank-topk"
+module = "quant_core.strategy.etf_rerank_topk"
+
+[baseline]
+mode = "none"
+
+[data]
+universe = "universes/liquid_etf_rotation.csv"
+
+[scope]
+editable = [
+  "src/quant_core/strategy/etf_rerank_topk.py",
+]
+forbidden = [
+  "src/quant_core/backtest/",
+  "src/quant_core/data/",
+  "src/quant_core/factors/",
+  "src/quant_core/research/",
+  "src/quant_core/cli.py",
+  "src/quant_core/config.py",
+  "tests/",
+  "universes/",
+  "data/",
+  "outputs/",
+  ".agents/",
+  ".research/",
+]
+
+[commands]
+test = ["{python}", "-m", "pytest", "-q", "tests/test_research_evaluator.py"]
+metrics_path = "outputs/backtests/{run_id}/metrics.json"
+
+[evaluation]
+mode = "walk_forward"
+objective = "sortino"
+
+[evaluation.constraints]
+annual_return = { operator = ">=", threshold = 0.03 }
+max_drawdown = { operator = "abs<=", threshold = 0.20 }
+avg_turnover = { operator = "<=", threshold = 0.35 }
+
+[evaluation.acceptance]
+minimum_improvement = 0.03
+
+[evaluation.walk_forward]
+train_months = 18
+validation_months = 1
+step_months = 1
+max_parameter_sets = 128
+
+[evaluation.walk_forward.development]
+start = "2023-01-01"
+end = "2025-07-17"
+
+[evaluation.walk_forward.gate]
+start = "2025-07-18"
+end = "2026-07-17"
