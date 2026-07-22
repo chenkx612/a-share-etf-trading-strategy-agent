@@ -33,7 +33,7 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 临时 Development runtime 缺失会清空耐久 Champion 指标 |
+| P1 | 正常 Run 清理会导致下次初始化清空耐久 Champion 指标 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -42,24 +42,36 @@
 
 ### P1：推荐解决，可带风险继续
 
-#### 临时 Development runtime 缺失会清空耐久 Champion 指标
+#### 正常 Run 清理会导致下次初始化清空耐久 Champion 指标
 
-- **问题**：disposable Development runtime 缺失时，`champion.json` 中完整的 Development/Gate
-  指标和 `champion_metrics_key` 会被清空；如果 Agent 随后在评测前失败，终局报告便无法展示当前
-  Champion 指标。`ResearchWorkspace._prepare_runtime` 把“需要重建 Development 派生缓存”和“已记录
-  Champion 指标失效”绑定处理。仅仅缺少可重建的 Development runtime，也会无条件清空
-  `champion_metrics`；而 Agent 失败路径不会重跑 Champion evaluator。
+- **问题**：Run 正常结束或报告失败后会主动删除 disposable Development runtime，因此它在下一次
+  Run 初始化时缺失并非偶发异常，而是标准生命周期路径。`ResearchWorkspace._prepare_runtime` 把“需要
+  重建 Development 派生缓存”和“已记录 Champion 指标失效”绑定处理：仅仅缺少可重建的 runtime，
+  也会把 `champion.json` 中完整的 Development/Gate 指标和 `champion_metrics_key` 写成 `null`。
+  该清空发生在容器和认证预检之前；预检失败可能在新 Run 尚未分配时就破坏耐久状态。如果 Run 已启动，
+  但 Agent 在候选评测前失败，失败路径不会重跑 Champion evaluator，终局报告便无法展示当前 Champion
+  指标。配置了 `evaluation.target` 时，空指标还会使已达目标的 Champion 无法触发 `target_reached`，
+  从而启动本不需要的研发轮次。当前 `champion_metrics_key` 只覆盖部分任务配置，不足以表达数据内容、
+  evaluator 实现契约和 Champion 策略版本等完整适用性。
 - **方案**：
-  - 把指标的适用性元数据与指标值分开保存。临时 runtime 缺失只触发缓存重建，不应删除已经冻结的
-    Development/Gate 证据。
-  - 只有数据内容指纹、固定区间、evaluator 契约或策略哈希变化时才标记指标需要重算；保留旧值并明确
-    标注 `stale`，直到新评测原子替换，而不是先写 `null`。
-  - 终局报告在本 Run 无候选评测时仍应读取最近有效 Champion 指标，并注明其来源 Run 和适用指纹。
-- **验证**：删除 Development runtime 后启动一个在 Agent 阶段失败的 Run，确认缓存可重建、
-  `champion.json` 的最近有效指标不丢失，报告能正确引用来源 Run；再改变固定评测输入，确认旧指标只被
-  标记失效且不能用于晋级比较。
-- **风险**：在修复前可从历史接受 Round 的 `result.json`/`decision.json` 或 Run 报告恢复解释，
-  但不得手工回填 `champion.json`，以免绕过原子状态语义。
+  - 把指标的适用性元数据与指标值分开保存。正常清理或临时 runtime 缺失只触发缓存重建，不应删除已经
+    冻结的 Development/Gate 证据。
+  - 为指标记录来源 Run/Round、Champion 策略哈希、固定区间、数据内容指纹和 evaluator 契约指纹。
+    只有这些适用性输入变化时才标记指标需要重算；保留旧值并明确标注 `stale`，直到新评测原子替换，
+    而不是先写 `null`。
+  - 晋级比较和 `target_reached` 只能使用适用性完整且匹配的指标；终局报告在本 Run 无候选评测时仍应
+    展示最近有效 Champion 指标，并明确其来源和适用指纹。过期指标可用于历史解释，但不得用于晋级或
+    停止决策。
+- **验证**：先完成一个保存有效 Champion 指标的 Run，再让正常清理删除 Development runtime。分别
+  启动一个预检失败的 Run 和一个在 Agent 阶段失败的 Run，确认缓存可重建、`champion.json` 的最近有效
+  指标不丢失，报告能正确引用来源 Run/Round；配置 `evaluation.target` 并确认匹配的既有指标仍能在分配
+  新 Round 前停止。随后分别改变固定评测数据、区间、evaluator 契约和 Champion 策略哈希，确认旧指标
+  只被标记为 `stale`，且不能用于晋级比较或 `target_reached`，新评测成功后再原子替换指标及适用性元数据。
+- **风险**：当前未配置绝对 `evaluation.target` 且完成候选会在晋级比较前重评 Champion 时，问题通常
+  不会造成错误晋级，因此维持 P1；但它会稳定破坏 `champion.json` 的耐久完整性，并在失败 Run 中造成
+  报告缺失。修复前可从历史接受 Round 的 `result.json`/`decision.json` 或既有 Run 报告恢复解释，但
+  不得手工回填 `champion.json`，以免绕过原子状态语义。若任务启用 `evaluation.target`，或运行流程要求
+  `champion.json` 始终作为完整的权威审计契约，应在继续新 Loop 研发前将该问题提升为 P0。
 
 ### P2：有时间时优化
 
