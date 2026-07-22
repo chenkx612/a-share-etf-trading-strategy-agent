@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Round 硬时限会丢弃截止前已经可运行的候选 |
 | P1 | 单一 Development 汇总指标缺少稳健性和行为诊断 |
 | P1 | 临时 Development runtime 缺失会清空耐久 Champion 指标 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
@@ -42,32 +41,6 @@
 ## 一、待解决问题
 
 ### P1：推荐解决，可带风险继续
-
-#### Round 硬时限会丢弃截止前已经可运行的候选
-
-- **问题**：当前 `budget.round_minutes` 到期后会终止候选 Agent 及其进程组，并直接把该 Round 记为
-  `Candidate research deadline exceeded`。即使 Agent 在截止前已经写出并验证过一个可运行策略，只要
-  尚未返回最终 JSON，该候选也不会进入 Harness-owned 测试、Development 复核或 Gate，效果等同于把
-  已完成但尚未正式提交的答卷判零。`liquid-etf-rerank-topk` Run `001` Round `001` 已出现这一情况：
-  Agent 在时限内形成过多个可运行版本并执行 Development 诊断，但最后仍因继续收敛而整轮归零。
-- **方案**：
-  - 提供显式、低成本的 checkpoint 命令；Agent 每得到一个语法完整、接口可加载的候选就应提交一次，
-    后续研究不得覆盖已保存的 checkpoint。Prompt 应鼓励尽早提交和多次提交，而不是只在结束前交付。
-  - checkpoint 至少冻结策略文件、内容哈希、提交时间、父 Champion 和简短的假设/变更说明；Harness
-    校验它只包含 `scope.editable` 中的文件，并将 checkpoint 保存在候选不可回写或只能追加的边界内。
-  - 正常完成时仍评测 Agent 明确提交的最终版本；达到硬时限时立即停止继续搜索，但恢复并评测截止前
-    最后一个完整有效的 checkpoint。结果显式标记 `submitted_by_timeout` 和 checkpoint 标识，不得把
-    超时后的文件内容混入评测。
-  - 若最后一个 checkpoint 文件不完整、哈希不符、无法导入、越过修改范围或不存在，才把 Round 记为
-    failed；否则照常运行固定测试、Development 和 Gate，并由原有晋级规则决定 accepted/rejected。
-  - checkpoint 只保存候选代码与必要元数据，不保存或暴露 Gate 输入、精确 Gate 指标及 disposable
-    runtime；Harness-owned 正式评测仍发生在冻结之后且不计入 Agent 的研发时限。
-- **验证**：覆盖至少以下确定性场景：Agent 提交多个 checkpoint 后超时，只有最后一个有效版本被评测；
-  最后一次写入损坏时回退到前一个有效 checkpoint；无 checkpoint 时仍按超时失败；正常最终提交优先于
-  checkpoint；截止后产生的 checkpoint 被拒绝；恢复版本通过测试和 Gate 时可以晋级，并在 result、
-  decision、candidate patch 和事件日志中保留 checkpoint 来源及 `submitted_by_timeout` 证据。
-- **风险**：修复前应缩小单轮搜索空间并要求 Agent 尽早结束，但 Prompt 提醒无法提供耐久保证；任何
-  接近时限的长回测或模型停顿仍可能使已经可运行的候选随临时 worktree 一起被清理，并消耗一个 Round。
 
 #### 单一 Development 汇总指标缺少稳健性和行为诊断
 
@@ -199,6 +172,20 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
+
+#### Round 硬时限不能丢弃截止前已冻结的候选
+
+- **问题**：`budget.round_minutes` 到期会终止 Agent；过去即使候选已可运行，只要尚未返回最终 JSON，
+  Harness 也会直接判超时并删除临时 worktree。
+- **解决**：增加 Harness-owned checkpoint 协议。Agent 用显式命令提交策略和完整候选说明，Harness 在
+  截止前校验范围、哈希、编码和语法，并冻结到 Agent 不可写的 Round 目录。正常完成仍以最终 JSON 为准；
+  超时则恢复最近的有效 checkpoint 后运行固定测试、Development 和 Gate。结果和 Decision 记录
+  `submission`、checkpoint ID、策略哈希、`submitted_by_timeout` 及 candidate patch 哈希；基础设施失败
+  不触发恢复，正式测试失败也不得回退到更早版本。
+- **验证**：确定性测试覆盖多次提交后超时、冻结副本损坏回退、无 checkpoint、最终提交优先、截止后
+  拒绝、非法源码、恢复后测试失败不回退，以及恢复候选通过 Gate 后晋级；完整测试通过。
+- **风险**：checkpoint 接收使用协作型 Agent 信任模型；冻结边界防止确认后的版本被回写，但不防御
+  主动攻击 Harness 控制协议的恶意候选。正式评测仍不计入 Agent 研发时限，并受原有命令超时约束。
 
 #### 晋级后的下一轮候选 worktree 对 Docker bind 不可见
 

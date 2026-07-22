@@ -80,6 +80,10 @@ class _RoundClock:
     def deadline_text(self) -> str:
         return self.deadline.isoformat()
 
+    @property
+    def deadline_monotonic(self) -> float:
+        return self._started_monotonic + self.timeout_seconds
+
     def _remaining_seconds(self) -> int:
         elapsed = max(0.0, self.monotonic() - self._started_monotonic)
         return max(0, int(math.ceil(self.timeout_seconds - elapsed)))
@@ -1211,6 +1215,14 @@ def _prompt(
         "When the clock phase becomes converge, stop expanding the search. In finalize, preserve "
         "the best candidate, run focused tests, and prepare the required JSON. In submit_now, "
         "return immediately. Harness-owned validation after submission is outside this deadline.",
+        "As soon as a candidate is importable and has passed a focused test, write "
+        ".quant-research-checkpoint/metadata.json with string fields previous_feedback, hypothesis, attempts, "
+        "development_effect, and candidate, then run `python3 -m "
+        "quant_core.research.checkpoint submit .quant-research-checkpoint/metadata.json`. Repeat this whenever the best "
+        "candidate improves. A checkpoint is confirmed only when the command returns an accepted "
+        "checkpoint ID. In converge and finalize, checkpoint the best retained candidate early; "
+        "in submit_now, prefer an immediate final response if ready, otherwise submit the best "
+        "checkpoint immediately.",
         "After a rejected round, prefer a materially different risk mechanism. Reuse the prior "
         "mechanism only when the history supports one specific, pre-declared corrective change; "
         "do not perform local threshold mining around the rejected candidate.",
@@ -1458,6 +1470,9 @@ def _write_failed(
             value = agent_output.get(key)
             if isinstance(value, str):
                 payload[key] = value
+        submission = agent_output.get("submission")
+        if isinstance(submission, Mapping):
+            payload["submission"] = dict(submission)
     ExperimentResult.from_mapping(payload)
     write_json_atomic(result_path, payload)
     return result_path
@@ -1472,17 +1487,24 @@ def run_once(
     gate_runtime: str | Path | None = None,
     research_history: Sequence[Mapping[str, Any]] = (),
     has_champion: bool | None = None,
+    parent_champion_sha256: str | None = None,
     command_runner: CommandRunner = _run_command,
     opencode_runner: AgentRunner | None = None,
     event_sink: EventSink | None = None,
     round_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> Path:
+    from quant_core.research.checkpoint import CheckpointReceiver
+
     task = ResearchTask.load(task_path)
     root = Path(workspace).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Workspace does not exist: {root}")
     out = Path(output_dir).resolve()
+    if out == root:
+        raise ValueError(
+            "Research output directory must differ from the candidate workspace"
+        )
     out.mkdir(parents=True, exist_ok=True)
 
     raw = task.raw
@@ -1519,6 +1541,16 @@ def run_once(
         event_details,
         monotonic,
     )
+    checkpoint_receiver = CheckpointReceiver(
+        root,
+        out,
+        task.strategy_path,
+        parent_champion_sha256,
+        round_clock.deadline_monotonic,
+        monotonic=monotonic,
+        event_sink=event_sink,
+        event_details=event_details,
+    )
     agent_development_command = _containerize_prompt_command(development_command, root)
     agent_metrics_path = _containerize_prompt_command([development_metrics_path], root)[0]
     agent_test_command = _containerize_prompt_command(test_command, root)
@@ -1550,19 +1582,23 @@ def run_once(
     )
     round_clock.start()
     try:
+        checkpoint_receiver.start()
         if opencode_runner is None:
             generated_dir = Path(development_metrics_path).parent.as_posix()
+            agent_read_only_paths = _agent_read_only_paths(
+                root,
+                raw["scope"].get("forbidden", []),
+                generated_dir,
+            )
+            if out != root and root in out.parents:
+                agent_read_only_paths.append(out)
             exit_code = _run_opencode_container(
                 opencode_command,
                 prompt,
                 root,
                 events_path,
                 round_timeout,
-                read_only_paths=_agent_read_only_paths(
-                    root,
-                    raw["scope"].get("forbidden", []),
-                    generated_dir,
-                ),
+                read_only_paths=agent_read_only_paths,
             )
         else:
             exit_code = opencode_runner(
@@ -1575,64 +1611,109 @@ def run_once(
     finally:
         finished_monotonic = monotonic()
         round_timing = round_clock.stop(finished_monotonic)
+        checkpoint_receiver.stop()
     deadline_exceeded = (
         exit_code == 124
         or float(round_timing["duration_seconds"]) >= round_timeout
     )
-    if exit_code != 0 or deadline_exceeded:
-        infrastructure_failure = (
-            _infrastructure_failure(events_path)
-            if opencode_runner is None
-            else None
-        )
-        if infrastructure_failure is not None:
-            if infrastructure_failure.code == "provider_authentication":
-                _redact_authentication_log(events_path)
-            _emit(event_sink, "agent_failed", message="agent infrastructure failure", **event_details)
-            reason = f"Agent infrastructure failure: {infrastructure_failure.message}"
-            failure_kind = "infrastructure"
-            failure_code = infrastructure_failure.code
-        elif deadline_exceeded:
-            _emit(
-                event_sink,
-                "round_deadline_exceeded",
-                message="candidate research deadline exceeded",
-                **event_details,
-            )
-            reason = "Candidate research deadline exceeded"
-            failure_kind = None
-            failure_code = None
-        else:
-            _emit(event_sink, "agent_failed", message="agent failed", **event_details)
-            reason = "OpenCode session failed"
-            failure_kind = None
-            failure_code = None
+    infrastructure_failure = (
+        _infrastructure_failure(events_path)
+        if opencode_runner is None and exit_code != 0
+        else None
+    )
+    agent_output: dict[str, Any] | None = None
+    if infrastructure_failure is not None:
+        if infrastructure_failure.code == "provider_authentication":
+            _redact_authentication_log(events_path)
+        _emit(event_sink, "agent_failed", message="agent infrastructure failure", **event_details)
+        reason = f"Agent infrastructure failure: {infrastructure_failure.message}"
         return _write_failed(
             out,
             experiment_id,
             reason,
             round_timing=round_timing,
-            failure_kind=failure_kind,
-            failure_code=failure_code,
+            failure_kind="infrastructure",
+            failure_code=infrastructure_failure.code,
         )
-    agent_output = _parse_opencode_output(events_path)
-    if agent_output is None:
-        _emit(event_sink, "agent_failed", message="invalid agent output", **event_details)
+    if deadline_exceeded:
+        _emit(
+            event_sink,
+            "round_deadline_exceeded",
+            message="candidate research deadline exceeded",
+            **event_details,
+        )
+        checkpoint = checkpoint_receiver.latest_valid()
+        if checkpoint is None:
+            return _write_failed(
+                out,
+                experiment_id,
+                "Candidate research deadline exceeded",
+                round_timing=round_timing,
+            )
+        strategy_path = root / checkpoint.strategy_path
+        strategy_path.parent.mkdir(parents=True, exist_ok=True)
+        strategy_path.write_bytes(checkpoint.strategy_content)
+        agent_output = {
+            "status": "completed",
+            **dict(checkpoint.metadata),
+            "submission": {
+                "mode": "checkpoint",
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "submitted_at": checkpoint.submitted_at,
+                "submitted_by_timeout": True,
+                "strategy_sha256": checkpoint.strategy_sha256,
+            },
+        }
+        _emit(
+            event_sink,
+            "checkpoint_restored",
+            checkpoint_id=checkpoint.checkpoint_id,
+            strategy_sha256=checkpoint.strategy_sha256,
+            message="restored candidate checkpoint after Round deadline",
+            **event_details,
+        )
+        events_path.unlink(missing_ok=True)
+    elif exit_code != 0:
+        _emit(event_sink, "agent_failed", message="agent failed", **event_details)
         return _write_failed(
             out,
             experiment_id,
-            "OpenCode produced invalid agent output",
+            "OpenCode session failed",
             round_timing=round_timing,
         )
-    events_path.unlink(missing_ok=True)
-    _emit(event_sink, "agent_completed", message="agent completed", **event_details)
-    if agent_output["status"] == "blocked":
-        return _write_failed(
-            out,
-            experiment_id,
-            f"OpenCode was blocked: {agent_output['error']}",
-            round_timing=round_timing,
+    else:
+        agent_output = _parse_opencode_output(events_path)
+        if agent_output is None:
+            _emit(event_sink, "agent_failed", message="invalid agent output", **event_details)
+            return _write_failed(
+                out,
+                experiment_id,
+                "OpenCode produced invalid agent output",
+                round_timing=round_timing,
+            )
+        events_path.unlink(missing_ok=True)
+        _emit(event_sink, "agent_completed", message="agent completed", **event_details)
+        if agent_output["status"] == "blocked":
+            return _write_failed(
+                out,
+                experiment_id,
+                f"OpenCode was blocked: {agent_output['error']}",
+                round_timing=round_timing,
+            )
+        strategy_file = root / task.strategy_path
+        strategy_sha256 = (
+            hashlib.sha256(strategy_file.read_bytes()).hexdigest()
+            if strategy_file.is_file()
+            else hashlib.sha256(b"").hexdigest()
         )
+        agent_output["submission"] = {
+            "mode": "final",
+            "submitted_at": str(round_timing["finished_at"]),
+            "submitted_by_timeout": False,
+            "strategy_sha256": strategy_sha256,
+        }
+
+    assert agent_output is not None
 
     after = _snapshot(root, out)
     changed = _changed_files(before, after)
@@ -1751,6 +1832,7 @@ def run_once(
         "changes": {"files": changed},
         "metrics": metrics,
         "round_timing": round_timing,
+        "submission": agent_output["submission"],
     }
     ExperimentResult.from_mapping(payload)
     result_path = out / "result.json"
@@ -1957,6 +2039,7 @@ def run_managed_once(
     command_runner: CommandRunner = _run_command,
     opencode_runner: AgentRunner | None = None,
     event_sink: EventSink | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Path:
     """Run one isolated candidate and promote it only when it beats the champion."""
     task_file = Path(task_path).resolve()
@@ -1999,10 +2082,16 @@ def run_managed_once(
         gate_runtime=manager.evaluation_runtime,
         research_history=research_history,
         has_champion=has_champion,
+        parent_champion_sha256=(
+            str(state["champion_sha256"])
+            if isinstance(state.get("champion_sha256"), str)
+            else None
+        ),
         command_runner=command_runner,
         opencode_runner=opencode_runner,
         event_sink=event_sink,
         round_id=round_id,
+        monotonic=monotonic,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["experiment_id"] = f"{manager.run_id}/{round_id}"
@@ -2021,6 +2110,8 @@ def run_managed_once(
             "decision": "failed",
             "reasons": [result.get("error")],
         }
+        if isinstance(result.get("submission"), dict):
+            decision["submission"] = dict(result["submission"])
         if result.get("failure_kind") == "infrastructure":
             decision["failure_kind"] = "infrastructure"
             if isinstance(result.get("failure_code"), str):
@@ -2029,12 +2120,14 @@ def run_managed_once(
         manager.reject(candidate, state, record_id)
         return result_path
 
+    candidate_patch = experiment / "candidate.patch"
     manager.write_candidate_patch(
         candidate,
         state,
         task.raw["scope"]["editable"],
-        experiment / "candidate.patch",
+        candidate_patch,
     )
+    candidate_patch_sha256 = hashlib.sha256(candidate_patch.read_bytes()).hexdigest()
     metrics_key = _metrics_key(task)
     champion_metrics = (
         state.get("champion_metrics")
@@ -2058,15 +2151,22 @@ def run_managed_once(
                 "experiment_id": result["experiment_id"],
                 "decision": "failed",
                 "reasons": [str(exc)],
+                "submission": dict(result["submission"]),
+                "candidate_patch_sha256": candidate_patch_sha256,
             }
             write_json_atomic(decision_path, decision)
             manager.reject(candidate, state, record_id)
-            failed_path = _write_failed(experiment, record_id, str(exc))
+            failed_path = _write_failed(experiment, record_id, str(exc), result)
             return failed_path
         finally:
             manager.remove_evaluator(evaluator)
 
-    decision = {"experiment_id": result["experiment_id"], **_decide(task, champion_metrics, result["metrics"])}
+    decision = {
+        "experiment_id": result["experiment_id"],
+        **_decide(task, champion_metrics, result["metrics"]),
+        "submission": dict(result["submission"]),
+        "candidate_patch_sha256": candidate_patch_sha256,
+    }
     write_json_atomic(decision_path, decision)
     if decision["decision"] == "accepted":
         state["champion_metrics_key"] = metrics_key

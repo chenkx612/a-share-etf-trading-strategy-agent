@@ -314,6 +314,36 @@ class ExperimentResult:
         feedback = data.get("feedback")
         if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
             raise ValueError("result.feedback must be a non-empty str when present")
+        submission = data.get("submission")
+        if submission is not None:
+            if not isinstance(submission, dict):
+                raise ValueError("result.submission must be an object")
+            mode = submission.get("mode")
+            expected = {
+                "mode", "submitted_at", "submitted_by_timeout", "strategy_sha256",
+            }
+            if mode == "checkpoint":
+                expected.add("checkpoint_id")
+            if mode not in {"final", "checkpoint"} or set(submission) != expected:
+                raise ValueError("result.submission has invalid fields")
+            if not isinstance(submission.get("submitted_at"), str) or not submission["submitted_at"].strip():
+                raise ValueError("result.submission.submitted_at must be a non-empty string")
+            submitted_by_timeout = submission.get("submitted_by_timeout")
+            if not isinstance(submitted_by_timeout, bool) or submitted_by_timeout != (mode == "checkpoint"):
+                raise ValueError("result.submission timeout marker does not match its mode")
+            strategy_sha256 = submission.get("strategy_sha256")
+            if (
+                not isinstance(strategy_sha256, str)
+                or len(strategy_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in strategy_sha256)
+            ):
+                raise ValueError("result.submission.strategy_sha256 must be a SHA-256 digest")
+            if mode == "checkpoint" and (
+                not isinstance(submission.get("checkpoint_id"), str)
+                or not submission["checkpoint_id"].isdigit()
+                or int(submission["checkpoint_id"]) < 1
+            ):
+                raise ValueError("result.submission.checkpoint_id must be a positive numeric ID")
         round_timing = data.get("round_timing")
         if round_timing is not None:
             if not isinstance(round_timing, dict) or set(round_timing) != {

@@ -109,6 +109,23 @@ def test_result_validates_round_timing_when_present() -> None:
         ExperimentResult.from_mapping(payload)
 
 
+def test_result_validates_submission_provenance_when_present() -> None:
+    payload = completed_result()
+    payload["submission"] = {
+        "mode": "checkpoint",
+        "checkpoint_id": "002",
+        "submitted_at": "2026-07-18T01:20:00+00:00",
+        "submitted_by_timeout": True,
+        "strategy_sha256": "a" * 64,
+    }
+
+    ExperimentResult.from_mapping(payload)
+
+    payload["submission"]["submitted_by_timeout"] = False
+    with pytest.raises(ValueError, match="timeout marker"):
+        ExperimentResult.from_mapping(payload)
+
+
 def test_task_requires_exactly_one_editable_strategy_script() -> None:
     payload = fixed_task()
     payload["scope"]["editable"] = ["strategy_a.py", "strategy_b.py"]

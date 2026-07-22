@@ -11,6 +11,7 @@ from typing import Sequence
 import pandas as pd
 import pytest
 
+from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.runner import _run_opencode_container, run_managed_once
 from quant_core.research.workspace import ResearchWorkspace
 
@@ -367,6 +368,10 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     first_decision = json.loads((first_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/champion.json").read_text(encoding="utf-8"))
     assert first_decision["decision"] == "rejected"
+    assert first_decision["submission"]["mode"] == "final"
+    assert first_decision["candidate_patch_sha256"] == hashlib.sha256(
+        (first_result.parent / "candidate.patch").read_bytes()
+    ).hexdigest()
     baseline_sha256 = hashlib.sha256(b"1.0\n").hexdigest()
     assert state["champion_sha256"] == baseline_sha256
     assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.0\n"
@@ -390,6 +395,7 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     second_decision = json.loads((second_result.parent / "decision.json").read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".research/managed-test/champion.json").read_text(encoding="utf-8"))
     assert second_decision["decision"] == "accepted"
+    assert second_decision["submission"]["submitted_by_timeout"] is False
     assert state["champion_sha256"] == hashlib.sha256(b"1.2\n").hexdigest()
     assert state["champion_round_id"] == "002/001"
     assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.2\n"
@@ -403,6 +409,58 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert "feedback" not in second_record
     assert not (tmp_path / ".research/managed-test/research-memory.json").exists()
     assert _git_text(tmp_path, "for-each-ref", "refs/quant-research") == ""
+
+
+def test_managed_run_can_promote_checkpoint_restored_after_timeout(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task = _task(tmp_path)
+    task.write_text(
+        task.read_text(encoding="utf-8").replace(
+            "max_hours = 4", "max_hours = 4\nround_minutes = 7",
+        ),
+        encoding="utf-8",
+    )
+    current_time = [0.0]
+    events: list[str] = []
+
+    def checkpointing_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        (cwd / "strategy.py").write_text("1.2\n", encoding="utf-8")
+        metadata = cwd / RUNTIME_DIR / "metadata.json"
+        metadata.write_text(json.dumps({
+            "previous_feedback": "",
+            "hypothesis": "A higher signal improves Sortino",
+            "attempts": "Tested signal value 1.2.",
+            "development_effect": "Development Sortino increased to 1.2.",
+            "candidate": "Set signal to 1.2",
+        }), encoding="utf-8")
+        assert submit(metadata, workspace=cwd)["checkpoint_id"] == "001"
+        (cwd / "strategy.py").write_text("9.9\n", encoding="utf-8")
+        current_time[0] = 421.0
+        return 124
+
+    result_path = run_managed_once(
+        task,
+        "001",
+        run_number=1,
+        workspace=tmp_path,
+        command_runner=_command,
+        opencode_runner=checkpointing_opencode,
+        event_sink=lambda event, **details: events.append(event),
+        monotonic=lambda: current_time[0],
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    decision = json.loads((result_path.parent / "decision.json").read_text(encoding="utf-8"))
+    patch = result_path.parent / "candidate.patch"
+    assert result["submission"]["checkpoint_id"] == "001"
+    assert decision["decision"] == "accepted"
+    assert decision["submission"] == result["submission"]
+    assert decision["candidate_patch_sha256"] == hashlib.sha256(patch.read_bytes()).hexdigest()
+    assert "+1.2" in patch.read_text(encoding="utf-8")
+    assert (tmp_path / ".research/managed-test/champion.py").read_text(encoding="utf-8") == "1.2\n"
+    assert "checkpoint_restored" in events
 
 
 def test_no_baseline_rejects_until_first_candidate_passes_constraints(tmp_path: Path) -> None:

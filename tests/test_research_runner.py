@@ -13,6 +13,7 @@ import pytest
 
 import quant_core.research.runner as research_runner
 from quant_core.research import ResearchTask, run_once
+from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     _agent_read_only_paths,
@@ -1705,3 +1706,179 @@ def test_run_once_rejects_late_success_before_tests_or_gate(tmp_path: Path) -> N
     assert result["error"] == "Candidate research deadline exceeded"
     assert result["round_timing"]["duration_seconds"] == 421.0
     assert commands == []
+
+
+def test_run_once_rejects_output_equal_to_workspace(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must differ"):
+        run_once(task_path, "experiment-output-root", tmp_path, workspace=tmp_path)
+
+
+def _checkpoint_metadata(label: str) -> dict[str, str]:
+    return {
+        "previous_feedback": "",
+        "hypothesis": f"Hypothesis {label}",
+        "attempts": f"Attempts {label}",
+        "development_effect": f"Development effect {label}",
+        "candidate": f"Candidate {label}",
+    }
+
+
+def test_run_once_restores_latest_checkpoint_after_deadline(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(
+        TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
+        encoding="utf-8",
+    )
+    (tmp_path / "strategy.py").write_text("VALUE = 0\n", encoding="utf-8")
+    current_time = [0.0]
+    events: list[tuple[str, dict[str, object]]] = []
+    commands: list[Sequence[str]] = []
+
+    def checkpointing_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        assert "quant_core.research.checkpoint submit" in prompt
+        for value in (1, 2):
+            (cwd / "strategy.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
+            metadata_path = cwd / RUNTIME_DIR / "metadata.json"
+            metadata_path.write_text(
+                json.dumps(_checkpoint_metadata(str(value))), encoding="utf-8",
+            )
+            acknowledgement = submit(metadata_path, workspace=cwd)
+            assert acknowledgement["checkpoint_id"] == f"{value:03d}"
+        (cwd / "strategy.py").write_text("VALUE = 999\n", encoding="utf-8")
+        current_time[0] = 421.0
+        return 124
+
+    def successful_command(
+        command: Sequence[str], cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        commands.append(command)
+        if "--run-id" in command:
+            run_id = command[command.index("--run-id") + 1]
+            metrics = cwd / "outputs/backtests" / run_id / "metrics.json"
+            metrics.parent.mkdir(parents=True, exist_ok=True)
+            metrics.write_text(
+                json.dumps({"sortino": 1.2, "max_drawdown": -0.1}),
+                encoding="utf-8",
+            )
+        return 0
+
+    result_path = run_once(
+        task_path,
+        "experiment-checkpoint-timeout",
+        tmp_path / "experiment-checkpoint-timeout",
+        workspace=tmp_path,
+        command_runner=successful_command,
+        opencode_runner=checkpointing_opencode,
+        event_sink=lambda event, **details: events.append((event, details)),
+        round_id="001",
+        monotonic=lambda: current_time[0],
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "completed"
+    assert result["candidate"] == "Candidate 2"
+    assert result["submission"]["mode"] == "checkpoint"
+    assert result["submission"]["checkpoint_id"] == "002"
+    assert result["submission"]["submitted_by_timeout"] is True
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert len(commands) == 3
+    assert [event for event, _ in events].count("checkpoint_accepted") == 2
+    assert "checkpoint_restored" in [event for event, _ in events]
+
+
+def test_run_once_prefers_final_submission_over_checkpoint(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+    (tmp_path / "strategy.py").write_text("VALUE = 0\n", encoding="utf-8")
+
+    def completed_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        (cwd / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
+        metadata_path = cwd / RUNTIME_DIR / "metadata.json"
+        metadata_path.write_text(json.dumps(_checkpoint_metadata("checkpoint")), encoding="utf-8")
+        submit(metadata_path, workspace=cwd)
+        (cwd / "strategy.py").write_text("VALUE = 2\n", encoding="utf-8")
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": json.dumps({
+                "status": "completed",
+                **_checkpoint_metadata("final"),
+            })},
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    def successful_command(
+        command: Sequence[str], cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        if "--run-id" in command:
+            run_id = command[command.index("--run-id") + 1]
+            metrics = cwd / "outputs/backtests" / run_id / "metrics.json"
+            metrics.parent.mkdir(parents=True, exist_ok=True)
+            metrics.write_text(json.dumps({"sortino": 1.0, "max_drawdown": -0.1}), encoding="utf-8")
+        return 0
+
+    result_path = run_once(
+        task_path,
+        "experiment-final",
+        tmp_path / "experiment-final",
+        workspace=tmp_path,
+        command_runner=successful_command,
+        opencode_runner=completed_opencode,
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["submission"]["mode"] == "final"
+    assert result["submission"]["submitted_by_timeout"] is False
+    assert result["candidate"] == "Candidate final"
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+
+
+def test_timeout_checkpoint_test_failure_does_not_fall_back(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(
+        TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
+        encoding="utf-8",
+    )
+    (tmp_path / "strategy.py").write_text("VALUE = 0\n", encoding="utf-8")
+    current_time = [0.0]
+    commands: list[Sequence[str]] = []
+
+    def checkpointing_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        for value in (1, 2):
+            (cwd / "strategy.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
+            metadata = cwd / RUNTIME_DIR / "metadata.json"
+            metadata.write_text(json.dumps(_checkpoint_metadata(str(value))), encoding="utf-8")
+            submit(metadata, workspace=cwd)
+        current_time[0] = 421.0
+        return 124
+
+    def failing_test(
+        command: Sequence[str], cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        commands.append(command)
+        assert (cwd / "strategy.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+        return 1
+
+    result_path = run_once(
+        task_path,
+        "experiment-checkpoint-test-failure",
+        tmp_path / "experiment-checkpoint-test-failure",
+        workspace=tmp_path,
+        command_runner=failing_test,
+        opencode_runner=checkpointing_opencode,
+        monotonic=lambda: current_time[0],
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    assert result["error"] == "Tests failed"
+    assert result["submission"]["checkpoint_id"] == "002"
+    assert len(commands) == 1
