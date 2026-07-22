@@ -133,12 +133,14 @@ OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Ro
 ```
 
 可分别使用 `QUANT_OPENCODE_AUTH_FILE`、`QUANT_OPENCODE_CONFIG_FILE` 和
-`QUANT_OPENCODE_MODELS_FILE` 覆盖路径。Harness 将存在的文件复制到一次性 runtime home，
+`QUANT_OPENCODE_MODELS_FILE` 覆盖路径。Harness 将存在的文件复制到权限受限的一次性 runtime home，
 再只挂载该 home；容器结束后删除临时副本，避免 Docker 不兼容的嵌套 bind mount。
 这些输入只用于 OpenCode 认证、配置和模型目录，不应指向包含其他用户数据的文件。
-对轮换型 Provider 凭据，Harness 会按认证文件加跨进程锁。固定提示、`--pure` 且全部工具禁用的
-宿主 OpenCode 认证预检负责刷新自己的认证文件；Harness 不解析或回写预检产生的凭据。候选和报告
-会话只使用移除 refresh 字段的一次性副本且永不回写，因此 Agent 无法把临时认证状态带回宿主。
+对轮换型 OAuth Provider 凭据，Harness 会按认证文件加跨进程锁。固定提示、`--pure` 且全部工具
+禁用的宿主 OpenCode 认证预检负责在分配 Run 或 Round 前验证认证。候选和报告使用包含完整 OAuth
+状态的一次性副本；会话结束后，Harness 只接受结构合法的目标 Provider 变化，再用可信宿主探针验证，
+最后将该 Provider 原子合并回宿主认证文件。其他 Provider、临时配置修改和未经验证的状态不会回写。
+即使候选超时、失败或被中断，Harness 仍会在释放认证锁前尝试回收已经轮换的凭据。
 
 新 Loop 分配 Run 编号前会用真实研究镜像执行容器预检，验证候选目录可写、固定输入只读、
 Research Root 被遮蔽、OpenCode runtime 文件可见且任务配置的模型存在。预检失败不会创建

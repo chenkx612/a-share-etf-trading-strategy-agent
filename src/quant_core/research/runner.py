@@ -319,11 +319,7 @@ def _opencode_runtime_sources() -> tuple[tuple[Path, Path], ...]:
     )
 
 
-def _stage_opencode_runtime(
-    runtime_home: Path,
-    *,
-    strip_refresh_for: str | None = None,
-) -> None:
+def _stage_opencode_runtime(runtime_home: Path) -> None:
     for source, relative in _opencode_runtime_sources():
         if not source.is_file():
             continue
@@ -331,27 +327,229 @@ def _stage_opencode_runtime(
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
         destination.chmod(0o600)
-    if strip_refresh_for is None:
-        return
+
+
+_OAUTH_ACCESS_FIELDS = ("access", "access_token")
+_OAUTH_REFRESH_FIELDS = ("refresh", "refresh_token")
+_OAUTH_EXPIRY_FIELDS = ("expires", "expiry", "expires_at")
+_OAUTH_MUTABLE_FIELDS = frozenset(
+    (*_OAUTH_ACCESS_FIELDS, *_OAUTH_REFRESH_FIELDS, *_OAUTH_EXPIRY_FIELDS)
+)
+_AUTH_RECOVERY_TIMEOUT = 60
+
+
+def _read_auth_payload(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("OpenCode authentication file must contain a JSON object")
+    return payload
+
+
+def _oauth_provider_auth(
+    payload: Mapping[str, Any],
+    provider: str | None,
+) -> dict[str, Any] | None:
+    if provider is None:
+        return None
+    value = payload.get(provider)
+    if not isinstance(value, dict) or value.get("type") != "oauth":
+        return None
+    if not any(field in value for field in _OAUTH_REFRESH_FIELDS):
+        return None
+    return dict(value)
+
+
+def _validated_rotated_provider_auth(
+    original: Mapping[str, Any],
+    candidate: Any,
+) -> dict[str, Any]:
+    if not isinstance(candidate, dict) or candidate.get("type") != original.get("type"):
+        raise ValueError("OpenCode OAuth credential type changed")
+    unexpected = set(candidate) - set(original) - _OAUTH_MUTABLE_FIELDS
+    if unexpected:
+        raise ValueError("OpenCode OAuth credential contains unexpected fields")
+    for key, value in original.items():
+        if key not in _OAUTH_MUTABLE_FIELDS and candidate.get(key) != value:
+            raise ValueError("OpenCode OAuth credential identity fields changed")
+    for fields, label in (
+        (_OAUTH_ACCESS_FIELDS, "access token"),
+        (_OAUTH_REFRESH_FIELDS, "refresh token"),
+    ):
+        present = [field for field in fields if field in original or field in candidate]
+        if not present or not any(
+            isinstance(candidate.get(field), str) and bool(candidate[field])
+            for field in present
+        ):
+            raise ValueError(f"OpenCode OAuth credential is missing its {label}")
+    for field in _OAUTH_EXPIRY_FIELDS:
+        if field not in candidate:
+            continue
+        value = candidate[field]
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise ValueError("OpenCode OAuth credential has an invalid expiry")
+    return dict(candidate)
+
+
+def _write_auth_payload_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _authentication_probe_command(
+    command: Sequence[str],
+    workspace: Path,
+) -> list[str]:
+    try:
+        model = command[command.index("--model") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("OpenCode OAuth session is missing its configured model") from exc
+    probe = [
+        "opencode", "run", "--pure", "--format", "json",
+        "--model", model, "--dir", str(workspace),
+    ]
+    try:
+        variant = command[command.index("--variant") + 1]
+    except (ValueError, IndexError):
+        pass
+    else:
+        probe.extend(["--variant", variant])
+    return probe
+
+
+def _recover_rotated_oauth(
+    host_auth: Path | None,
+    original_auth: bytes | None,
+    runtime_home: Path,
+    provider: str | None,
+    command: Sequence[str],
+    temporary_root: Path,
+) -> tuple[InfrastructureFailure | None, list[Any]]:
+    snapshots: list[Any] = []
+    if host_auth is None or original_auth is None or provider is None:
+        return None, snapshots
+    try:
+        original_payload = json.loads(original_auth)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, snapshots
+    if not isinstance(original_payload, dict):
+        return None, snapshots
+    snapshots.append(original_payload)
+    original_provider = _oauth_provider_auth(original_payload, provider)
+    if original_provider is None:
+        return None, snapshots
     runtime_auth = runtime_home / ".local/share/opencode/auth.json"
     try:
-        payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    provider_auth = payload.get(strip_refresh_for) if isinstance(payload, dict) else None
-    if not isinstance(provider_auth, dict):
-        return
-    changed = False
-    for field in ("refresh", "refresh_token"):
-        if field in provider_auth:
-            del provider_auth[field]
-            changed = True
-    if changed:
-        runtime_auth.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        runtime_payload = _read_auth_payload(runtime_auth)
+        snapshots.append(runtime_payload)
+        rotated_provider = _validated_rotated_provider_auth(
+            original_provider,
+            runtime_payload.get(provider),
         )
-        runtime_auth.chmod(0o600)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return InfrastructureFailure(
+            "provider_authentication_state",
+            "Provider authentication state produced by OpenCode is invalid; re-authenticate before retrying",
+        ), snapshots
+    if rotated_provider == original_provider:
+        return None, snapshots
+
+    validation_home = temporary_root / "validation-home"
+    validation_workspace = temporary_root / "validation-workspace"
+    validation_home.mkdir(mode=0o700)
+    validation_workspace.mkdir()
+    _stage_opencode_runtime(validation_home)
+    validation_auth = validation_home / ".local/share/opencode/auth.json"
+    try:
+        validation_payload = _read_auth_payload(validation_auth)
+    except (OSError, ValueError, json.JSONDecodeError):
+        validation_payload = dict(original_payload)
+    validation_payload[provider] = rotated_provider
+    _write_auth_payload_atomic(validation_auth, validation_payload)
+    validation_log = temporary_root / "credential-validation.jsonl"
+    probe_command = _authentication_probe_command(command, validation_workspace)
+    probe_exit = _run_prompt_process(
+        probe_command,
+        "Reply exactly OK. Do not use tools.",
+        validation_workspace,
+        validation_log,
+        _AUTH_RECOVERY_TIMEOUT,
+        {
+            "HOME": str(validation_home),
+            "OPENCODE_PERMISSION": json.dumps(dict(_NO_TOOL_PERMISSIONS)),
+        },
+    )
+    try:
+        verified_payload = _read_auth_payload(validation_auth)
+        snapshots.append(verified_payload)
+        verified_provider = _validated_rotated_provider_auth(
+            original_provider,
+            verified_payload.get(provider),
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return InfrastructureFailure(
+            "provider_authentication_state",
+            "Provider authentication validation produced invalid state; re-authenticate before retrying",
+        ), snapshots
+    probe_failure = (
+        InfrastructureFailure(
+            "provider_authentication",
+            "Provider authentication failed during rotated credential validation; re-authenticate before retrying",
+        )
+        if probe_exit != 0
+        else None
+    )
+    if probe_failure is not None and verified_provider == rotated_provider:
+        return probe_failure, snapshots
+
+    try:
+        current_payload = _read_auth_payload(host_auth)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return InfrastructureFailure(
+            "provider_authentication_state",
+            "Provider authentication file changed or became invalid during the session",
+        ), snapshots
+    if current_payload.get(provider) != original_payload.get(provider):
+        return InfrastructureFailure(
+            "provider_authentication_state",
+            "Provider authentication state changed concurrently; refusing to overwrite it",
+        ), snapshots
+    current_payload[provider] = verified_provider
+    try:
+        _write_auth_payload_atomic(host_auth, current_payload)
+    except OSError:
+        return InfrastructureFailure(
+            "provider_authentication_state",
+            "Provider authentication state could not be persisted safely",
+        ), snapshots
+    snapshots.append(current_payload)
+    return probe_failure, snapshots
 
 
 def _configured_provider(command: Sequence[str]) -> str | None:
@@ -528,10 +726,7 @@ def _run_opencode_container(
                 runtime_home = temporary_root / "home"
                 (runtime_home / ".local" / "share" / "opencode").mkdir(parents=True)
                 (runtime_home / ".config" / "opencode").mkdir(parents=True)
-                _stage_opencode_runtime(
-                    runtime_home,
-                    strip_refresh_for=credential_provider,
-                )
+                _stage_opencode_runtime(runtime_home)
                 mask = temporary_root / "mask"
                 mask.mkdir()
                 hidden_mounts = (
@@ -539,62 +734,73 @@ def _run_opencode_container(
                     if hidden.is_dir()
                     else []
                 )
-                for attempt in range(2):
-                    container_name = f"quant-agent-{uuid.uuid4().hex}"
-                    container_command = _docker_opencode_command(
-                        container_command_parts,
-                        cwd,
-                        effective_permissions,
-                        read_only_paths,
-                        hidden_mounts,
-                        runtime_home,
-                        container_name,
-                    )
-                    try:
-                        exit_code = _run_prompt_process(
-                            container_command,
-                            container_input,
+                interrupted = False
+                container_stopped = True
+                exit_code = 127
+                try:
+                    for attempt in range(2):
+                        container_name = f"quant-agent-{uuid.uuid4().hex}"
+                        container_command = _docker_opencode_command(
+                            container_command_parts,
                             cwd,
-                            log_path,
-                            max(0.1, float(timeout) - (time.monotonic() - session_started)),
+                            effective_permissions,
+                            read_only_paths,
+                            hidden_mounts,
+                            runtime_home,
+                            container_name,
                         )
-                    finally:
-                        removed = _remove_agent_container(container_name)
-                    if not removed:
-                        with log_path.open("a", encoding="utf-8") as log:
-                            log.write("\nFailed to remove Agent container")
-                        exit_code = 127
-                        break
-                    if attempt == 0 and _is_retryable_bind_source_failure(
-                        exit_code,
-                        log_path,
-                        container_command,
-                    ):
-                        time.sleep(0.25)
-                        continue
-                    break
-                session_failure = _infrastructure_failure(log_path)
-                if (
-                    session_failure is not None
-                    and session_failure.code == "provider_authentication"
-                ):
-                    authentication_snapshots: list[Any] = []
-                    encoded_snapshots = [original_auth]
-                    if host_auth is not None:
+                        container_stopped = False
                         try:
-                            encoded_snapshots.append(
-                                (runtime_home / ".local/share/opencode/auth.json").read_bytes()
+                            exit_code = _run_prompt_process(
+                                container_command,
+                                container_input,
+                                cwd,
+                                log_path,
+                                max(
+                                    0.1,
+                                    float(timeout) - (time.monotonic() - session_started),
+                                ),
                             )
-                        except OSError:
-                            pass
-                    for encoded in encoded_snapshots:
-                        if encoded is None:
+                        finally:
+                            removed = _remove_agent_container(container_name)
+                            container_stopped = removed
+                        if not removed:
+                            with log_path.open("a", encoding="utf-8") as log:
+                                log.write("\nFailed to remove Agent container")
+                            exit_code = 127
+                            break
+                        if attempt == 0 and _is_retryable_bind_source_failure(
+                            exit_code,
+                            log_path,
+                            container_command,
+                        ):
+                            time.sleep(0.25)
                             continue
-                        try:
-                            authentication_snapshots.append(json.loads(encoded))
-                        except json.JSONDecodeError:
-                            continue
-                    _redact_authentication_log(log_path, authentication_snapshots)
+                        break
+                except KeyboardInterrupt:
+                    interrupted = True
+                if container_stopped:
+                    recovery_failure, authentication_snapshots = _recover_rotated_oauth(
+                        host_auth,
+                        original_auth,
+                        runtime_home,
+                        credential_provider,
+                        container_command_parts,
+                        temporary_root,
+                    )
+                else:
+                    recovery_failure = None
+                    try:
+                        authentication_snapshots = [json.loads(original_auth or b"null")]
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        authentication_snapshots = []
+                _redact_authentication_log(log_path, authentication_snapshots)
+                if recovery_failure is not None:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(f"\n{recovery_failure.message}")
+                    exit_code = 127
+                if interrupted:
+                    raise KeyboardInterrupt
                 return exit_code
     except (OSError, ValueError) as exc:
         log_path.write_text(str(exc), encoding="utf-8")
@@ -620,10 +826,13 @@ def _infrastructure_failure(log_path: Path) -> InfrastructureFailure | None:
             "provider_authentication",
             "Provider authentication failed; re-authenticate before retrying",
         )
-    if "opencode credential lock timed out" in folded:
+    if (
+        "opencode credential lock timed out" in folded
+        or "provider authentication state" in folded
+    ):
         return InfrastructureFailure(
             "provider_authentication_state",
-            "Provider authentication state is busy in another session",
+            "Provider authentication state could not be updated safely",
         )
     container_markers = (
         "docker: Error response from daemon",

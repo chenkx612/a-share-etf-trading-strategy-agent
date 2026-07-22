@@ -722,6 +722,71 @@ def test_container_runner_fails_when_container_cleanup_is_unconfirmed(
     assert "Failed to remove Agent container" in log_path.read_text(encoding="utf-8")
 
 
+def test_container_runner_does_not_recover_oauth_until_cleanup_is_confirmed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {
+        "xai": {
+            "type": "oauth",
+            "access": "access-a",
+            "refresh": "refresh-a",
+            "expires": 100,
+        },
+    }
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+    validation_called = False
+
+    def rotate(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        nonlocal validation_called
+        if command[0] != "docker":
+            validation_called = True
+            return 0
+        mount = next(
+            part for part in command
+            if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+        )
+        runtime_auth = (
+            Path(mount.split("src=", 1)[1].split(",dst=", 1)[0])
+            / ".local/share/opencode/auth.json"
+        )
+        payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+        payload["xai"].update({
+            "access": "access-b",
+            "refresh": "refresh-b",
+            "expires": 200,
+        })
+        runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", rotate)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: False)
+    log_path = tmp_path / "agent.log"
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "prompt",
+        tmp_path,
+        log_path,
+        1,
+    )
+
+    assert exit_code == 127
+    assert not validation_called
+    assert json.loads(auth.read_text(encoding="utf-8")) == original
+    assert "Failed to remove Agent container" in log_path.read_text(encoding="utf-8")
+
+
 def test_container_runner_deletes_staged_runtime_files(
     tmp_path: Path,
     monkeypatch,
@@ -772,43 +837,64 @@ def test_container_runner_deletes_staged_runtime_files(
     assert not runtime_homes[0].exists()
 
 
-def test_candidate_session_cannot_persist_staged_credentials(
+def test_candidate_session_persists_validated_rotated_oauth_credentials(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     auth = tmp_path / "auth.json"
     original = {
+        "deepseek": {"type": "api", "key": "unchanged"},
         "xai": {
             "type": "oauth",
             "access": "trusted-access",
             "refresh": "trusted-refresh",
+            "expires": 100,
         },
     }
     auth.write_text(json.dumps(original), encoding="utf-8")
     monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
 
-    def tamper(
+    def rotate_and_validate(
         command: Sequence[str],
         prompt: str,
         cwd: Path,
         log_path: Path,
         timeout: int,
+        env: dict[str, str] | None = None,
     ) -> int:
-        home_mount = next(
-            part
-            for part in command
-            if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
-        )
-        runtime_home = Path(home_mount.split("src=", 1)[1].split(",dst=", 1)[0])
-        runtime_auth = runtime_home / ".local/share/opencode/auth.json"
-        payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
-        assert "refresh" not in payload["xai"]
-        payload["xai"] = {"type": "oauth", "refresh": "agent-controlled"}
-        runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+        if command[0] == "docker":
+            home_mount = next(
+                part
+                for part in command
+                if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+            )
+            runtime_home = Path(home_mount.split("src=", 1)[1].split(",dst=", 1)[0])
+            runtime_auth = runtime_home / ".local/share/opencode/auth.json"
+            payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+            assert payload["xai"]["refresh"] == "trusted-refresh"
+            payload["xai"].update({
+                "access": "rotated-access",
+                "refresh": "rotated-refresh",
+                "expires": 200,
+            })
+            runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+            log_path.write_text("trusted-refresh rotated-refresh", encoding="utf-8")
+            return 0
+        assert command[:3] == ["opencode", "run", "--pure"]
+        assert env is not None
+        validation_auth = Path(env["HOME"]) / ".local/share/opencode/auth.json"
+        payload = json.loads(validation_auth.read_text(encoding="utf-8"))
+        assert payload["xai"]["refresh"] == "rotated-refresh"
+        payload["xai"].update({
+            "access": "verified-access",
+            "refresh": "verified-refresh",
+            "expires": 300,
+        })
+        validation_auth.write_text(json.dumps(payload), encoding="utf-8")
         log_path.write_text("", encoding="utf-8")
         return 0
 
-    monkeypatch.setattr(research_runner, "_run_prompt_process", tamper)
+    monkeypatch.setattr(research_runner, "_run_prompt_process", rotate_and_validate)
     monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
 
     exit_code = research_runner._run_opencode_container(
@@ -820,7 +906,408 @@ def test_candidate_session_cannot_persist_staged_credentials(
     )
 
     assert exit_code == 0
+    saved = json.loads(auth.read_text(encoding="utf-8"))
+    assert saved["deepseek"] == original["deepseek"]
+    assert saved["xai"] == {
+        "type": "oauth",
+        "access": "verified-access",
+        "refresh": "verified-refresh",
+        "expires": 300,
+    }
+    assert auth.stat().st_mode & 0o777 == 0o600
+    assert "trusted-refresh" not in (tmp_path / "candidate.log").read_text(encoding="utf-8")
+    assert "rotated-refresh" not in (tmp_path / "candidate.log").read_text(encoding="utf-8")
+
+
+def test_invalid_rotated_oauth_state_does_not_overwrite_host(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {
+        "xai": {
+            "type": "oauth",
+            "access": "trusted-access",
+            "refresh": "trusted-refresh",
+            "expires": 100,
+        },
+    }
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def corrupt(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        assert command[0] == "docker"
+        home_mount = next(
+            part
+            for part in command
+            if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+        )
+        runtime_home = Path(home_mount.split("src=", 1)[1].split(",dst=", 1)[0])
+        (runtime_home / ".local/share/opencode/auth.json").write_text(
+            '{"xai":{"type":"oauth","access":"new","refresh":',
+            encoding="utf-8",
+        )
+        log_path.write_text("failed with trusted-refresh", encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", corrupt)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+    log_path = tmp_path / "candidate.log"
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "candidate",
+        tmp_path,
+        log_path,
+        1,
+    )
+
+    assert exit_code == 127
     assert json.loads(auth.read_text(encoding="utf-8")) == original
+    assert "trusted-refresh" not in log_path.read_text(encoding="utf-8")
+    failure = research_runner._infrastructure_failure(log_path)
+    assert failure is not None
+    assert failure.code == "provider_authentication_state"
+
+
+def test_timeout_still_recovers_rotated_oauth_credentials(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({
+        "xai": {
+            "type": "oauth",
+            "access": "access-a",
+            "refresh": "refresh-a",
+            "expires": 100,
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def time_out_after_rotation(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        if command[0] == "docker":
+            mount = next(
+                part for part in command
+                if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+            )
+            runtime_auth = (
+                Path(mount.split("src=", 1)[1].split(",dst=", 1)[0])
+                / ".local/share/opencode/auth.json"
+            )
+            payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+            payload["xai"].update({
+                "access": "access-b",
+                "refresh": "refresh-b",
+                "expires": 200,
+            })
+            runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+            log_path.write_text("timed out", encoding="utf-8")
+            return 124
+        assert env is not None
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", time_out_after_rotation)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "candidate",
+        tmp_path,
+        tmp_path / "candidate.log",
+        1,
+    )
+
+    assert exit_code == 124
+    saved = json.loads(auth.read_text(encoding="utf-8"))
+    assert saved["xai"]["refresh"] == "refresh-b"
+
+
+def test_concurrent_provider_change_prevents_oauth_overwrite(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {
+        "xai": {
+            "type": "oauth",
+            "access": "access-a",
+            "refresh": "refresh-a",
+            "expires": 100,
+        },
+    }
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def rotate_with_external_change(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        if command[0] == "docker":
+            mount = next(
+                part for part in command
+                if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+            )
+            runtime_auth = (
+                Path(mount.split("src=", 1)[1].split(",dst=", 1)[0])
+                / ".local/share/opencode/auth.json"
+            )
+            payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+            payload["xai"].update({
+                "access": "container-access",
+                "refresh": "container-refresh",
+                "expires": 200,
+            })
+            runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+            external = json.loads(json.dumps(original))
+            external["xai"].update({
+                "access": "external-access",
+                "refresh": "external-refresh",
+                "expires": 300,
+            })
+            auth.write_text(json.dumps(external), encoding="utf-8")
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", rotate_with_external_change)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "candidate",
+        tmp_path,
+        tmp_path / "candidate.log",
+        1,
+    )
+
+    assert exit_code == 127
+    saved = json.loads(auth.read_text(encoding="utf-8"))
+    assert saved["xai"]["refresh"] == "external-refresh"
+    failure = research_runner._infrastructure_failure(tmp_path / "candidate.log")
+    assert failure is not None
+    assert failure.code == "provider_authentication_state"
+
+
+def test_interrupt_still_recovers_rotated_oauth_credentials(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({
+        "xai": {
+            "type": "oauth",
+            "access": "access-a",
+            "refresh": "refresh-a",
+            "expires": 100,
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def interrupt_after_rotation(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        if command[0] == "docker":
+            mount = next(
+                part for part in command
+                if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+            )
+            runtime_auth = (
+                Path(mount.split("src=", 1)[1].split(",dst=", 1)[0])
+                / ".local/share/opencode/auth.json"
+            )
+            payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+            payload["xai"].update({
+                "access": "access-b",
+                "refresh": "refresh-b",
+                "expires": 200,
+            })
+            runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+            log_path.write_text("interrupted", encoding="utf-8")
+            raise KeyboardInterrupt
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", interrupt_after_rotation)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+
+    with pytest.raises(KeyboardInterrupt):
+        research_runner._run_opencode_container(
+            ["opencode", "run", "--model", "xai/test"],
+            "candidate",
+            tmp_path,
+            tmp_path / "candidate.log",
+            1,
+        )
+
+    saved = json.loads(auth.read_text(encoding="utf-8"))
+    assert saved["xai"]["refresh"] == "refresh-b"
+
+
+def test_failed_rotated_oauth_validation_is_an_authentication_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {
+        "xai": {
+            "type": "oauth",
+            "access": "access-a",
+            "refresh": "refresh-a",
+            "expires": 100,
+        },
+    }
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def rotate_then_fail_validation(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        if command[0] == "docker":
+            mount = next(
+                part for part in command
+                if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+            )
+            runtime_auth = (
+                Path(mount.split("src=", 1)[1].split(",dst=", 1)[0])
+                / ".local/share/opencode/auth.json"
+            )
+            payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+            payload["xai"].update({
+                "access": "access-b",
+                "refresh": "refresh-b",
+                "expires": 200,
+            })
+            runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+            log_path.write_text("", encoding="utf-8")
+            return 0
+        log_path.write_text("invalid_grant refresh-b", encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", rotate_then_fail_validation)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+    log_path = tmp_path / "candidate.log"
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "candidate",
+        tmp_path,
+        log_path,
+        1,
+    )
+
+    assert exit_code == 127
+    assert json.loads(auth.read_text(encoding="utf-8")) == original
+    failure = research_runner._infrastructure_failure(log_path)
+    assert failure is not None
+    assert failure.code == "provider_authentication"
+
+
+def test_failed_probe_persists_credentials_rotated_by_trusted_validation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    original = {
+        "xai": {
+            "type": "oauth",
+            "access": "access-a",
+            "refresh": "refresh-a",
+            "expires": 100,
+        },
+    }
+    auth.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setenv("QUANT_OPENCODE_AUTH_FILE", str(auth))
+
+    def rotate_twice_then_fail(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        if command[0] == "docker":
+            mount = next(
+                part for part in command
+                if part.startswith("type=bind,src=") and ",dst=/home/agent" in part
+            )
+            runtime_auth = (
+                Path(mount.split("src=", 1)[1].split(",dst=", 1)[0])
+                / ".local/share/opencode/auth.json"
+            )
+            payload = json.loads(runtime_auth.read_text(encoding="utf-8"))
+            payload["xai"].update({
+                "access": "access-b",
+                "refresh": "refresh-b",
+                "expires": 200,
+            })
+            runtime_auth.write_text(json.dumps(payload), encoding="utf-8")
+            log_path.write_text("", encoding="utf-8")
+            return 0
+        assert env is not None
+        validation_auth = Path(env["HOME"]) / ".local/share/opencode/auth.json"
+        payload = json.loads(validation_auth.read_text(encoding="utf-8"))
+        payload["xai"].update({
+            "access": "access-c",
+            "refresh": "refresh-c",
+            "expires": 300,
+        })
+        validation_auth.write_text(json.dumps(payload), encoding="utf-8")
+        log_path.write_text("unrelated inference failure", encoding="utf-8")
+        return 1
+
+    monkeypatch.setattr(research_runner, "_run_prompt_process", rotate_twice_then_fail)
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+    log_path = tmp_path / "candidate.log"
+
+    exit_code = research_runner._run_opencode_container(
+        ["opencode", "run", "--model", "xai/test"],
+        "candidate",
+        tmp_path,
+        log_path,
+        1,
+    )
+
+    assert exit_code == 127
+    saved = json.loads(auth.read_text(encoding="utf-8"))
+    assert saved["xai"] == {
+        "type": "oauth",
+        "access": "access-c",
+        "refresh": "refresh-c",
+        "expires": 300,
+    }
+    failure = research_runner._infrastructure_failure(log_path)
+    assert failure is not None
+    assert failure.code == "provider_authentication"
 
 
 def test_provider_authentication_error_precedes_round_timeout(
