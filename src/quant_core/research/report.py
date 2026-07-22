@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
+    _metrics_key,
     _infrastructure_failure,
     _redact_authentication_log,
     _run_opencode_read_only,
@@ -181,6 +183,8 @@ def _report_prompt(payload: Mapping[str, Any]) -> str:
         "不得为缺失的轮次或工件虚构研究内容。",
         "接受或拒绝原因必须以 decision_objective、decision_constraints 和 decision_reasons "
         "为准；特别要准确说明当时 champion 是否可行、是否要求相对目标改善。",
+        "如果 champion.metrics_status 是 stale，仍可展示历史指标，但必须明确其适用性已过期，"
+        "且这些指标未用于当前晋级或停止决策。",
         "报告固定包含以下结构：",
         "# Research Loop 总结",
         "## 总览",
@@ -213,6 +217,7 @@ def generate_loop_report(
 ) -> Path:
     task = ResearchTask.load(task_path)
     task_state = manager.load_state(task.strategy_path)
+    manager.refresh_champion_metrics_status(task_state, _metrics_key(task))
     round_ids = _loop_round_ids(manager.rounds, loop_state)
     experiments = _experiment_records(manager.rounds, round_ids)
     integrity_warnings = _loop_integrity_warnings(manager.rounds, loop_state, round_ids)
@@ -231,6 +236,9 @@ def generate_loop_report(
         ),
         None,
     )
+    metrics_record = task_state.get("champion_metrics_record")
+    if not isinstance(metrics_record, dict):
+        metrics_record = {}
     loop_payload = {
         key: loop_state.get(key)
         for key in (
@@ -264,8 +272,14 @@ def generate_loop_report(
             "champion_number": task_state.get("champion_number"),
             "sha256": task_state.get("champion_sha256"),
             "source_round": champion_round_id,
+            "strategy_source_round": champion_round_id,
             "strategy_path": task_state.get("strategy_path"),
-            "metrics": task_state.get("champion_metrics"),
+            "metrics": metrics_record.get("metrics"),
+            "metrics_status": metrics_record.get("status"),
+            "metrics_source_round": metrics_record.get("evaluated_in_round"),
+            "metrics_evaluated_at": metrics_record.get("evaluated_at"),
+            "metrics_applicability": metrics_record.get("applicability"),
+            "metrics_stale_reasons": metrics_record.get("stale_reasons", []),
             "strategy_source": _strategy_source(
                 manager,
                 task_state.get("champion_sha256"),
@@ -279,6 +293,19 @@ def generate_loop_report(
     if frozen_payload is None:
         write_json_atomic(report_input_path, payload)
     else:
+        frozen_champion = frozen_payload.get("champion")
+        current_champion = payload.get("champion")
+        if (
+            isinstance(frozen_champion, dict)
+            and isinstance(current_champion, dict)
+            and frozen_champion.get("sha256") == current_champion.get("sha256")
+        ):
+            for key in (
+                "metrics_status",
+                "metrics_applicability",
+                "metrics_stale_reasons",
+            ):
+                frozen_champion[key] = current_champion.get(key)
         payload = frozen_payload
     opencode = task.raw["opencode"]
     command = [
@@ -355,6 +382,21 @@ def regenerate_loop_report(
         raise FileNotFoundError(f"Loop state does not exist: {loop_state_path}")
     if loop_state.get("status") != "stopped":
         raise ValueError("Loop report can only be generated after the loop has stopped")
+    runtime_existed = base_manager.runtime.exists()
+    development_runtime_existed = base_manager.development_runtime.exists()
+    base_manager.initialize(
+        date.fromisoformat(task.development_period["end"]),
+        task.baseline_mode,
+        task.baseline_exclude,
+        task.strategy_path,
+    )
+
+    def restore_runtime_layout() -> None:
+        if not runtime_existed:
+            shutil.rmtree(base_manager.runtime, ignore_errors=True)
+        elif not development_runtime_existed:
+            shutil.rmtree(base_manager.development_runtime, ignore_errors=True)
+
     loop_state["report_status"] = "running"
     loop_state["report_path"] = None
     loop_state["report_error"] = None
@@ -372,6 +414,7 @@ def regenerate_loop_report(
         loop_state["report_status"] = "interrupted"
         loop_state["report_error"] = "Report generation was interrupted"
         _write_loop_state(loop_state_path, loop_state)
+        restore_runtime_layout()
         raise
     except Exception as exc:
         loop_state["report_status"] = "failed"
@@ -379,8 +422,10 @@ def regenerate_loop_report(
         loop_state["report_failure_kind"] = getattr(exc, "failure_kind", None)
         loop_state["report_failure_code"] = getattr(exc, "failure_code", None)
         _write_loop_state(loop_state_path, loop_state)
+        restore_runtime_layout()
         raise
     loop_state["report_status"] = "completed"
     loop_state["report_path"] = report_path.relative_to(manager.run_root).as_posix()
     _write_loop_state(loop_state_path, loop_state)
+    restore_runtime_layout()
     return report_path

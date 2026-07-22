@@ -1596,12 +1596,32 @@ def test_run_once_classifies_container_initialization_failure(
 def test_metrics_cache_key_changes_with_strategy_module() -> None:
     first_payload = tomllib.loads(TASK_TOML)
     second_payload = tomllib.loads(TASK_TOML)
+    third_payload = tomllib.loads(TASK_TOML)
     second_payload["strategy"]["module"] = "other_strategy"
+    third_payload["evaluation"]["fixed"]["gate"]["end"] = "2024-11-30"
 
     first = ResearchTask.from_mapping(first_payload)
     second = ResearchTask.from_mapping(second_payload)
+    third = ResearchTask.from_mapping(third_payload)
 
     assert _metrics_key(first) != _metrics_key(second)
+    assert _metrics_key(first) != _metrics_key(third)
+
+
+def test_walk_forward_metrics_cache_key_changes_with_objective_and_constraints() -> None:
+    first_payload = tomllib.loads(WALK_FORWARD_TASK_TOML)
+    objective_payload = tomllib.loads(WALK_FORWARD_TASK_TOML)
+    constraint_payload = tomllib.loads(WALK_FORWARD_TASK_TOML)
+    objective_payload["evaluation"]["objective"] = "sharpe"
+    constraint_payload["evaluation"]["constraints"]["max_drawdown"]["threshold"] = 0.15
+
+    first = ResearchTask.from_mapping(first_payload)
+    objective_changed = ResearchTask.from_mapping(objective_payload)
+    constraint_changed = ResearchTask.from_mapping(constraint_payload)
+
+    assert _metrics_key(first) != _metrics_key(objective_changed)
+    assert _metrics_key(first) != _metrics_key(constraint_changed)
+
 
 def test_run_once_accepts_compact_blocked_output(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"

@@ -102,6 +102,32 @@ def runtime_inputs_manifest(root: Path) -> dict[str, str]:
     return manifest
 
 
+def runtime_inputs_sha256(root: Path) -> str:
+    """Return one stable digest for all fixed runtime inputs."""
+    encoded = json.dumps(
+        runtime_inputs_manifest(root),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _tree_listing_sha256(listing: str) -> str:
+    lines = sorted(line for line in listing.splitlines() if line)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+def evaluator_contract_sha256_for_commit(root: Path, strategy_path: str) -> str:
+    """Hash a worktree's committed evaluator content, excluding its strategy."""
+    listing = _git(root, "ls-tree", "-r", "--full-tree", "HEAD")
+    filtered = "\n".join(
+        line
+        for line in listing.splitlines()
+        if "\t" in line and line.split("\t", 1)[1] != strategy_path
+    )
+    return _tree_listing_sha256(filtered)
+
+
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -384,6 +410,127 @@ class ResearchWorkspace:
                 env=env,
             )
 
+    def evaluator_contract_sha256(
+        self,
+        excluded_paths: Sequence[str],
+        *,
+        strategy_path: str,
+    ) -> str:
+        """Hash the fixed repository content staged into evaluator worktrees."""
+        excluded = [*excluded_paths, "data", "outputs"]
+        if strategy_path not in excluded:
+            excluded.append(strategy_path)
+        if self.source in self.research_root.parents:
+            excluded.append(self.research_root.relative_to(self.source).as_posix())
+        with tempfile.TemporaryDirectory(prefix="quant-contract-") as temporary:
+            index = Path(temporary) / "index"
+            env = {"GIT_INDEX_FILE": str(index), **_GIT_IDENTITY}
+            _git(self.source, "read-tree", "HEAD", env=env)
+            _git(self.source, "add", "-A", env=env)
+            for path in excluded:
+                _git(
+                    self.source,
+                    "rm",
+                    "-r",
+                    "--cached",
+                    "--ignore-unmatch",
+                    "--",
+                    path.rstrip("/"),
+                    env=env,
+                )
+            tree = _git(self.source, "write-tree", env=env)
+            return _tree_listing_sha256(
+                _git(self.source, "ls-tree", "-r", "--full-tree", tree)
+            )
+
+    def metrics_applicability(
+        self,
+        state: Mapping[str, Any],
+        metrics_key: str,
+        *,
+        champion_sha256: str | None = None,
+        evaluator_contract_sha256: str | None = None,
+    ) -> dict[str, str | None]:
+        strategy_path = str(state["strategy_path"])
+        contract = evaluator_contract_sha256 or self.evaluator_contract_sha256(
+            state.get("baseline_exclude", []),
+            strategy_path=strategy_path,
+        )
+        champion = champion_sha256
+        if champion is None and isinstance(state.get("champion_sha256"), str):
+            champion = str(state["champion_sha256"])
+        return {
+            "champion_sha256": champion,
+            "metrics_key": metrics_key,
+            "development_inputs_sha256": runtime_inputs_sha256(self.development_runtime),
+            "gate_inputs_sha256": runtime_inputs_sha256(self.evaluation_runtime),
+            "evaluator_contract_sha256": contract,
+        }
+
+    def refresh_champion_metrics_status(
+        self,
+        state: dict[str, Any],
+        metrics_key: str,
+        *,
+        evaluator_contract_sha256: str | None = None,
+    ) -> dict[str, str | None]:
+        """Refresh validity without discarding the last durable metrics value."""
+        expected = self.metrics_applicability(
+            state,
+            metrics_key,
+            evaluator_contract_sha256=evaluator_contract_sha256,
+        )
+        record = state.get("champion_metrics_record")
+        if not isinstance(record, dict):
+            return expected
+        actual = record.get("applicability")
+        reasons: list[str] = []
+        if not isinstance(actual, dict):
+            existing_reasons = record.get("stale_reasons")
+            if (
+                isinstance(existing_reasons, list)
+                and "legacy_missing_applicability" in existing_reasons
+            ):
+                reasons.append("legacy_missing_applicability")
+            else:
+                reasons.append("missing_applicability")
+        else:
+            for key, value in expected.items():
+                if actual.get(key) != value:
+                    reasons.append(f"{key}_changed")
+        if not isinstance(record.get("metrics"), dict):
+            reasons.append("missing_metrics")
+        status = "stale" if reasons else "valid"
+        if record.get("status") != status or record.get("stale_reasons") != reasons:
+            record["status"] = status
+            record["stale_reasons"] = reasons
+            state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            write_json_atomic(self.state_path, state)
+        return expected
+
+    @staticmethod
+    def valid_champion_metrics(state: Mapping[str, Any]) -> dict[str, Any] | None:
+        record = state.get("champion_metrics_record")
+        if not isinstance(record, Mapping) or record.get("status") != "valid":
+            return None
+        metrics = record.get("metrics")
+        return dict(metrics) if isinstance(metrics, Mapping) else None
+
+    @staticmethod
+    def metrics_record(
+        metrics: Mapping[str, Any],
+        applicability: Mapping[str, str | None],
+        evaluated_in_round: str,
+    ) -> dict[str, Any]:
+        return {
+            "metrics": dict(metrics),
+            "status": "valid",
+            "stale_reasons": [],
+            "evaluated_in_round": evaluated_in_round,
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "applicability": dict(applicability),
+        }
+
     def _add_worktree(self, path: Path, commit: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         _git(self.source, "worktree", "add", "--detach", str(path), commit)
@@ -483,22 +630,42 @@ class ResearchWorkspace:
             return
         state = json.loads(source.read_text(encoding="utf-8"))
         schema_version = state.get("schema_version")
-        if schema_version == 4 and source == self.state_path:
+        if schema_version == 5 and source == self.state_path:
             if "last_experiment_id" in state and "last_round_id" not in state:
                 state["last_round_id"] = state.pop("last_experiment_id")
                 write_json_atomic(self.state_path, state)
             return
-        if schema_version not in {2, 3}:
+        if schema_version not in {2, 3, 4}:
             raise ValueError("research workspace uses an incompatible champion schema")
+        if schema_version == 4 and isinstance(state.get("pending_promotion"), dict):
+            state = self._recover_promotion(state)
         editable = self._strategy_path(state, strategy_path)
         champion_commit = state.get("champion_commit")
-        champion_sha256: str | None = None
-        if isinstance(champion_commit, str):
+        champion_sha256 = (
+            str(state["champion_sha256"])
+            if isinstance(state.get("champion_sha256"), str)
+            else None
+        )
+        if champion_sha256 is None and isinstance(champion_commit, str):
             if not self._extract_champion(champion_commit, editable):
                 raise ValueError("legacy Champion strategy cannot be read from its Git commit")
             champion_sha256 = _file_sha256(self.champion_path)
+        legacy_metrics = state.get("champion_metrics")
+        metrics_record = None
+        if isinstance(legacy_metrics, dict):
+            metrics_record = {
+                "metrics": legacy_metrics,
+                "status": "stale",
+                "stale_reasons": ["legacy_missing_applicability"],
+                "evaluated_in_round": None,
+                "evaluated_at": state.get("updated_at"),
+                "applicability": None,
+            }
+        champion_round_id = state.get("champion_round_id")
+        if champion_round_id is None:
+            champion_round_id = self._latest_accepted_round()
         migrated = {
-            "schema_version": 4,
+            "schema_version": 5,
             "task_id": self.task_id,
             "baseline_mode": state.get("baseline_mode", "workspace"),
             "baseline_exclude": list(state.get("baseline_exclude", [])),
@@ -506,9 +673,8 @@ class ResearchWorkspace:
             "project_revision": _git(self.source, "rev-parse", "HEAD"),
             "champion_number": int(state.get("champion_number", 0)),
             "champion_sha256": champion_sha256,
-            "champion_round_id": self._latest_accepted_round(),
-            "champion_metrics": state.get("champion_metrics"),
-            "champion_metrics_key": state.get("champion_metrics_key"),
+            "champion_round_id": champion_round_id,
+            "champion_metrics_record": metrics_record,
             "last_round_id": state.get(
                 "last_round_id",
                 state.get("last_experiment_id"),
@@ -663,7 +829,20 @@ class ResearchWorkspace:
         if self.champion_path.is_file() and _file_sha256(self.champion_path) == target_sha256:
             state["champion_sha256"] = target_sha256
             state["champion_number"] = int(pending["champion_number"])
-            state["champion_metrics"] = pending["metrics"]
+            if state.get("schema_version") == 4:
+                state["champion_metrics"] = pending["metrics"]
+            else:
+                metrics_record = pending.get("metrics_record")
+                if not isinstance(metrics_record, dict) and isinstance(pending.get("metrics"), dict):
+                    metrics_record = {
+                        "metrics": dict(pending["metrics"]),
+                        "status": "stale",
+                        "stale_reasons": ["legacy_missing_applicability"],
+                        "evaluated_in_round": str(pending["round_id"]),
+                        "evaluated_at": None,
+                        "applicability": None,
+                    }
+                state["champion_metrics_record"] = metrics_record
             state["champion_round_id"] = str(pending["round_id"])
             state["last_round_id"] = str(pending["round_id"])
             state["project_revision"] = str(pending["project_revision"])
@@ -681,8 +860,6 @@ class ResearchWorkspace:
             shutil.rmtree(self.development_runtime, ignore_errors=True)
             copy_runtime_inputs(self.evaluation_runtime, self.development_runtime, end=development_end)
             state["development_end"] = expected
-            state["champion_metrics"] = None
-            state["champion_metrics_key"] = None
             write_json_atomic(self.state_path, state)
 
     def initialize(
@@ -718,7 +895,7 @@ class ResearchWorkspace:
             os.replace(self.champion_next_path, self.champion_path)
             champion_sha256 = _file_sha256(self.champion_path)
         state: dict[str, Any] = {
-            "schema_version": 4,
+            "schema_version": 5,
             "task_id": self.task_id,
             "baseline_mode": baseline_mode,
             "baseline_exclude": list(baseline_exclude),
@@ -727,8 +904,7 @@ class ResearchWorkspace:
             "champion_number": 0,
             "champion_sha256": champion_sha256,
             "champion_round_id": None,
-            "champion_metrics": None,
-            "champion_metrics_key": None,
+            "champion_metrics_record": None,
             "last_round_id": None,
             "pending_promotion": None,
         }
@@ -741,7 +917,7 @@ class ResearchWorkspace:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
-        if state.get("schema_version") != 4:
+        if state.get("schema_version") != 5:
             raise ValueError("research workspace uses an incompatible Champion schema")
         self._strategy_path(state, strategy_path)
         if isinstance(state.get("pending_promotion"), dict):
@@ -851,11 +1027,11 @@ class ResearchWorkspace:
         self,
         state: dict[str, Any],
         round_id: str,
-        champion_metrics: Mapping[str, Any] | None = None,
+        champion_metrics_record: Mapping[str, Any] | None = None,
     ) -> None:
         state["last_round_id"] = round_id
-        if champion_metrics is not None:
-            state["champion_metrics"] = dict(champion_metrics)
+        if champion_metrics_record is not None:
+            state["champion_metrics_record"] = dict(champion_metrics_record)
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         write_json_atomic(self.state_path, state)
 
@@ -866,6 +1042,8 @@ class ResearchWorkspace:
         round_id: str,
         metrics: Mapping[str, Any],
         editable: Sequence[str],
+        metrics_key: str,
+        evaluator_contract_sha256: str,
     ) -> str:
         strategy_path = str(state["strategy_path"])
         if list(editable) != [strategy_path]:
@@ -877,11 +1055,18 @@ class ResearchWorkspace:
         shutil.copy2(candidate_strategy, self.champion_next_path)
         sha256 = _file_sha256(self.champion_next_path)
         number = int(state["champion_number"]) + 1
+        applicability = self.metrics_applicability(
+            state,
+            metrics_key,
+            champion_sha256=sha256,
+            evaluator_contract_sha256=evaluator_contract_sha256,
+        )
+        metrics_record = self.metrics_record(metrics, applicability, round_id)
         state["pending_promotion"] = {
             "round_id": round_id,
             "sha256": sha256,
             "champion_number": number,
-            "metrics": dict(metrics),
+            "metrics_record": metrics_record,
             "project_revision": _git(self.source, "rev-parse", "HEAD"),
         }
         write_json_atomic(self.state_path, state)
@@ -891,7 +1076,7 @@ class ResearchWorkspace:
         state["champion_round_id"] = round_id
         state["project_revision"] = state["pending_promotion"]["project_revision"]
         state["pending_promotion"] = None
-        self.record_state(state, round_id, metrics)
+        self.record_state(state, round_id, metrics_record)
         self._remove_worktree(candidate)
         return sha256
 

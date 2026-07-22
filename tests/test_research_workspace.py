@@ -12,7 +12,8 @@ import pandas as pd
 import pytest
 
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
-from quant_core.research.runner import _run_opencode_container, run_managed_once
+from quant_core.research.contracts import ResearchTask
+from quant_core.research.runner import _metrics_key, _run_opencode_container, run_managed_once
 from quant_core.research.workspace import ResearchWorkspace
 
 
@@ -193,6 +194,71 @@ def test_same_task_in_different_research_roots_uses_distinct_champion_files(
     assert second.state_path.name == "champion.json"
 
 
+def test_rebuilding_development_runtime_preserves_valid_champion_metrics(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/prices.csv").write_text(
+        "date,value\n2021-12-31,1\n2024-01-02,2\n",
+        encoding="utf-8",
+    )
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "metrics-cache")
+    state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    applicability = manager.metrics_applicability(state, "metrics-key")
+    state["champion_metrics_record"] = manager.metrics_record(
+        {"gate": {"sortino": 1.5}},
+        applicability,
+        "001/001",
+    )
+    manager.record_state(state, "001/001")
+
+    manager.cleanup_transient(remove_development_cache=True)
+    rebuilt = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    manager.refresh_champion_metrics_status(rebuilt, "metrics-key")
+
+    assert rebuilt["champion_metrics_record"]["status"] == "valid"
+    assert rebuilt["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.5
+    assert rebuilt["champion_metrics_record"]["evaluated_in_round"] == "001/001"
+
+
+def test_changed_fixed_inputs_or_evaluator_marks_metrics_stale_without_deleting_them(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    (tmp_path / "evaluator.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/prices.csv").write_text("date,value\n2021-12-31,1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "metrics-stale")
+    state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    state["champion_metrics_record"] = manager.metrics_record(
+        {"gate": {"sortino": 1.5}},
+        manager.metrics_applicability(state, "metrics-key"),
+        "001/001",
+    )
+    manager.record_state(state, "001/001")
+
+    (manager.evaluation_runtime / "data/prices.csv").write_text(
+        "date,value\n2021-12-31,2\n",
+        encoding="utf-8",
+    )
+    manager.refresh_champion_metrics_status(state, "metrics-key")
+    assert state["champion_metrics_record"]["status"] == "stale"
+    assert "gate_inputs_sha256_changed" in state["champion_metrics_record"]["stale_reasons"]
+    assert state["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.5
+
+    (manager.evaluation_runtime / "data/prices.csv").write_text(
+        "date,value\n2021-12-31,1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "evaluator.py").write_text("VERSION = 2\n", encoding="utf-8")
+    manager.refresh_champion_metrics_status(state, "metrics-key")
+    assert state["champion_metrics_record"]["status"] == "stale"
+    assert "evaluator_contract_sha256_changed" in state["champion_metrics_record"]["stale_reasons"]
+
+
 def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     _init_repo(tmp_path)
@@ -234,7 +300,7 @@ def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) ->
     migrated_state = manager.initialize(strategy_path="strategy.py")
     run_number = manager.migrate_legacy_loop()
 
-    assert migrated_state["schema_version"] == 4
+    assert migrated_state["schema_version"] == 5
     assert manager.champion_path.read_text(encoding="utf-8") == "1.0\n"
     assert "champion_commit" not in migrated_state
     assert not manager.legacy_state_path.exists()
@@ -243,6 +309,31 @@ def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) ->
     run_state = json.loads((manager.root / "runs/001/state.json").read_text(encoding="utf-8"))
     assert run_state["schema_version"] == 2
     assert run_state["round_ids"] == ["001"]
+
+
+def test_schema_four_metrics_are_preserved_as_stale_during_migration(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "schema-four")
+    state = manager.initialize(strategy_path="strategy.py")
+    state["schema_version"] = 4
+    state["champion_metrics"] = {"gate": {"sortino": 1.3}}
+    state["champion_metrics_key"] = "legacy-key"
+    state.pop("champion_metrics_record")
+    manager.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = manager.load_state(strategy_path="strategy.py")
+
+    assert migrated["schema_version"] == 5
+    assert migrated["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.3
+    assert migrated["champion_metrics_record"]["status"] == "stale"
+    assert migrated["champion_metrics_record"]["stale_reasons"] == [
+        "legacy_missing_applicability"
+    ]
+    assert "champion_metrics" not in migrated
+    assert "champion_metrics_key" not in migrated
 
 
 def test_temporary_worktree_captures_dirty_strategy_without_changing_source(
@@ -343,6 +434,11 @@ def test_consecutive_candidate_worktrees_mount_in_real_agent_container(
                 "001/001",
                 {"development": {"sortino": 1.0}, "gate": {"sortino": 1.0}},
                 ["strategy.py"],
+                "test-metrics-key",
+                manager.evaluator_contract_sha256(
+                    state.get("baseline_exclude", []),
+                    strategy_path="strategy.py",
+                ),
             )
         else:
             manager.reject(candidate, state, f"001/{round_id}")
@@ -374,6 +470,9 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     ).hexdigest()
     baseline_sha256 = hashlib.sha256(b"1.0\n").hexdigest()
     assert state["champion_sha256"] == baseline_sha256
+    assert state["champion_metrics_record"]["status"] == "valid"
+    assert state["champion_metrics_record"]["evaluated_in_round"] == "001/001"
+    assert state["champion_metrics_record"]["applicability"]["champion_sha256"] == baseline_sha256
     assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.0\n"
     assert not (
         tmp_path
@@ -398,6 +497,12 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert second_decision["submission"]["submitted_by_timeout"] is False
     assert state["champion_sha256"] == hashlib.sha256(b"1.2\n").hexdigest()
     assert state["champion_round_id"] == "002/001"
+    assert state["champion_metrics_record"]["status"] == "valid"
+    assert state["champion_metrics_record"]["evaluated_in_round"] == "002/001"
+    assert (
+        state["champion_metrics_record"]["applicability"]["champion_sha256"]
+        == state["champion_sha256"]
+    )
     assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.2\n"
     assert "-1.0" in (second_result.parent / "candidate.patch").read_text(encoding="utf-8")
     assert "+1.2" in (second_result.parent / "candidate.patch").read_text(encoding="utf-8")
@@ -530,6 +635,16 @@ def test_no_baseline_rejects_until_first_candidate_passes_constraints(tmp_path: 
 def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     task = _task(tmp_path)
+    loaded_task = ResearchTask.load(task)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "managed-test")
+    initial_state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    initial_state["champion_metrics_record"] = manager.metrics_record(
+        {"gate": {"sortino": 1.0, "max_drawdown": -0.10}},
+        manager.metrics_applicability(initial_state, _metrics_key(loaded_task)),
+        "000/001",
+    )
+    manager.record_state(initial_state, "000/001")
+    manager.cleanup_transient(remove_development_cache=True)
 
     def failed_opencode(command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int) -> int:
         (cwd / "strategy.py").write_text("99.0\n", encoding="utf-8")
@@ -547,6 +662,9 @@ def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
     state = json.loads((tmp_path / ".research/managed-test/champion.json").read_text(encoding="utf-8"))
     assert decision["decision"] == "failed"
     assert state["champion_sha256"] == hashlib.sha256(b"1.0\n").hexdigest()
+    assert state["champion_metrics_record"]["status"] == "valid"
+    assert state["champion_metrics_record"]["evaluated_in_round"] == "000/001"
+    assert state["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.0
     assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.0\n"
     assert not (
         tmp_path
@@ -636,11 +754,20 @@ def test_recovery_finishes_a_file_promotion_after_state_write_was_interrupted(
     manager.champion_next_path.parent.mkdir(parents=True, exist_ok=True)
     manager.champion_next_path.write_text("2.0\n", encoding="utf-8")
     sha256 = hashlib.sha256(b"2.0\n").hexdigest()
+    metrics_record = manager.metrics_record(
+        {"gate": {"sortino": 2.0}},
+        manager.metrics_applicability(
+            state,
+            "metrics-key",
+            champion_sha256=sha256,
+        ),
+        "001/001",
+    )
     state["pending_promotion"] = {
         "round_id": "001/001",
         "sha256": sha256,
         "champion_number": 1,
-        "metrics": {"gate": {"sortino": 2.0}},
+        "metrics_record": metrics_record,
         "project_revision": _git_text(tmp_path, "rev-parse", "HEAD"),
     }
     manager.state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -649,6 +776,7 @@ def test_recovery_finishes_a_file_promotion_after_state_write_was_interrupted(
 
     assert recovered["champion_sha256"] == sha256
     assert recovered["champion_round_id"] == "001/001"
+    assert recovered["champion_metrics_record"] == metrics_record
     assert recovered["pending_promotion"] is None
     assert manager.champion_path.read_text(encoding="utf-8") == "2.0\n"
     manager._remove_worktree(candidate)
@@ -688,6 +816,10 @@ def test_recovery_finalizes_state_when_champion_file_was_already_replaced(
     state = manager.initialize(strategy_path="strategy.py")
     manager.champion_path.write_text("2.0\n", encoding="utf-8")
     sha256 = hashlib.sha256(b"2.0\n").hexdigest()
+    state["schema_version"] = 4
+    state["champion_metrics"] = {"gate": {"sortino": 1.0}}
+    state["champion_metrics_key"] = "old-key"
+    state.pop("champion_metrics_record")
     state["pending_promotion"] = {
         "round_id": "001/001",
         "sha256": sha256,
@@ -701,6 +833,9 @@ def test_recovery_finalizes_state_when_champion_file_was_already_replaced(
 
     assert recovered["champion_sha256"] == sha256
     assert recovered["champion_round_id"] == "001/001"
+    assert recovered["schema_version"] == 5
+    assert recovered["champion_metrics_record"]["status"] == "stale"
+    assert recovered["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 2.0
     assert recovered["pending_promotion"] is None
 
 

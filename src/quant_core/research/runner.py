@@ -24,6 +24,7 @@ from quant_core.research.contracts import ExperimentResult, ResearchTask
 from quant_core.research.workspace import (
     ResearchWorkspace,
     copy_runtime_inputs,
+    evaluator_contract_sha256_for_commit,
     remove_runtime_inputs,
     write_json_atomic,
     workspace_python_env,
@@ -2023,7 +2024,12 @@ def _metrics_key(task: ResearchTask) -> str:
         "strategy": task.raw.get("strategy"),
         "data": task.raw["data"],
         "commands": task.raw["commands"],
-        "periods": task.evaluation_periods,
+        "evaluation": {
+            "mode": task.evaluation_mode,
+            "objective": task.raw["evaluation"]["objective"],
+            "constraints": task.raw["evaluation"]["constraints"],
+            "periods": task.evaluation_periods,
+        },
     }
     encoded = json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -2069,6 +2075,16 @@ def run_managed_once(
         task.strategy_path,
     )
     has_champion = isinstance(state.get("champion_sha256"), str)
+    metrics_key = _metrics_key(task)
+    evaluator_contract_sha256 = evaluator_contract_sha256_for_commit(
+        candidate,
+        str(state["strategy_path"]),
+    )
+    applicability = manager.refresh_champion_metrics_status(
+        state,
+        metrics_key,
+        evaluator_contract_sha256=evaluator_contract_sha256,
+    )
     research_history = _load_managed_history(manager)
     if source in task_file.parents:
         candidate_task = candidate / task_file.relative_to(source)
@@ -2128,12 +2144,8 @@ def run_managed_once(
         candidate_patch,
     )
     candidate_patch_sha256 = hashlib.sha256(candidate_patch.read_bytes()).hexdigest()
-    metrics_key = _metrics_key(task)
-    champion_metrics = (
-        state.get("champion_metrics")
-        if has_champion and state.get("champion_metrics_key") == metrics_key
-        else None
-    )
+    champion_metrics = manager.valid_champion_metrics(state) if has_champion else None
+    evaluated_champion_record: dict[str, Any] | None = None
     if has_champion and not isinstance(champion_metrics, dict):
         evaluator = manager.create_champion_evaluator(round_id, state)
         try:
@@ -2145,6 +2157,11 @@ def run_managed_once(
                 round_id,
                 experiment,
                 command_runner,
+            )
+            evaluated_champion_record = manager.metrics_record(
+                champion_metrics,
+                applicability,
+                record_id,
             )
         except RuntimeError as exc:
             decision = {
@@ -2169,17 +2186,17 @@ def run_managed_once(
     }
     write_json_atomic(decision_path, decision)
     if decision["decision"] == "accepted":
-        state["champion_metrics_key"] = metrics_key
         manager.promote(
             candidate,
             state,
             record_id,
             result["metrics"],
             task.raw["scope"]["editable"],
+            metrics_key,
+            evaluator_contract_sha256,
         )
     else:
-        if has_champion:
-            state["champion_metrics"] = champion_metrics
-            state["champion_metrics_key"] = metrics_key
+        if evaluated_champion_record is not None:
+            state["champion_metrics_record"] = evaluated_champion_record
         manager.reject(candidate, state, record_id)
     return result_path

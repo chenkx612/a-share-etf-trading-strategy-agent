@@ -13,6 +13,7 @@ from quant_core.research.contracts import ResearchTask
 from quant_core.research.report import generate_loop_report
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
+    _metrics_key,
     preflight_agent_container,
     preflight_provider_authentication,
     run_managed_once,
@@ -204,6 +205,9 @@ def run_loop(
         task.baseline_exclude,
         task.strategy_path,
     )
+    metrics_key = _metrics_key(task)
+    task_state = base_manager.load_state(task.strategy_path)
+    base_manager.refresh_champion_metrics_status(task_state, metrics_key)
     base_manager.migrate_legacy_loop()
     fingerprint = _task_fingerprint(task_file)
     active_runs: list[tuple[int, dict[str, Any]]] = []
@@ -283,11 +287,12 @@ def run_loop(
 
     while True:
         task_state = manager.load_state(task.strategy_path)
-        champion_metrics = task_state.get("champion_metrics")
+        manager.refresh_champion_metrics_status(task_state, metrics_key)
+        champion_metrics = manager.valid_champion_metrics(task_state)
         reason = _stop_reason(
             state,
             task,
-            champion_metrics if isinstance(champion_metrics, dict) else None,
+            champion_metrics,
         )
         if reason is not None:
             return _finish_with_report(

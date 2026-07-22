@@ -29,49 +29,15 @@
 
 ## 当前结论
 
-当前没有开放 P0。启动新 Loop Run 前仍需评估以下 P1/P2 遗留问题：
+当前没有开放 P0。启动新 Loop Run 前仍需评估以下 P2 遗留问题：
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 正常 Run 清理会导致下次初始化清空耐久 Champion 指标 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 
 ## 一、待解决问题
-
-### P1：推荐解决，可带风险继续
-
-#### 正常 Run 清理会导致下次初始化清空耐久 Champion 指标
-
-- **问题**：Run 正常结束或报告失败后会主动删除 disposable Development runtime，因此它在下一次
-  Run 初始化时缺失并非偶发异常，而是标准生命周期路径。`ResearchWorkspace._prepare_runtime` 把“需要
-  重建 Development 派生缓存”和“已记录 Champion 指标失效”绑定处理：仅仅缺少可重建的 runtime，
-  也会把 `champion.json` 中完整的 Development/Gate 指标和 `champion_metrics_key` 写成 `null`。
-  该清空发生在容器和认证预检之前；预检失败可能在新 Run 尚未分配时就破坏耐久状态。如果 Run 已启动，
-  但 Agent 在候选评测前失败，失败路径不会重跑 Champion evaluator，终局报告便无法展示当前 Champion
-  指标。配置了 `evaluation.target` 时，空指标还会使已达目标的 Champion 无法触发 `target_reached`，
-  从而启动本不需要的研发轮次。当前 `champion_metrics_key` 只覆盖部分任务配置，不足以表达数据内容、
-  evaluator 实现契约和 Champion 策略版本等完整适用性。
-- **方案**：
-  - 把指标的适用性元数据与指标值分开保存。正常清理或临时 runtime 缺失只触发缓存重建，不应删除已经
-    冻结的 Development/Gate 证据。
-  - 为指标记录来源 Run/Round、Champion 策略哈希、固定区间、数据内容指纹和 evaluator 契约指纹。
-    只有这些适用性输入变化时才标记指标需要重算；保留旧值并明确标注 `stale`，直到新评测原子替换，
-    而不是先写 `null`。
-  - 晋级比较和 `target_reached` 只能使用适用性完整且匹配的指标；终局报告在本 Run 无候选评测时仍应
-    展示最近有效 Champion 指标，并明确其来源和适用指纹。过期指标可用于历史解释，但不得用于晋级或
-    停止决策。
-- **验证**：先完成一个保存有效 Champion 指标的 Run，再让正常清理删除 Development runtime。分别
-  启动一个预检失败的 Run 和一个在 Agent 阶段失败的 Run，确认缓存可重建、`champion.json` 的最近有效
-  指标不丢失，报告能正确引用来源 Run/Round；配置 `evaluation.target` 并确认匹配的既有指标仍能在分配
-  新 Round 前停止。随后分别改变固定评测数据、区间、evaluator 契约和 Champion 策略哈希，确认旧指标
-  只被标记为 `stale`，且不能用于晋级比较或 `target_reached`，新评测成功后再原子替换指标及适用性元数据。
-- **风险**：当前未配置绝对 `evaluation.target` 且完成候选会在晋级比较前重评 Champion 时，问题通常
-  不会造成错误晋级，因此维持 P1；但它会稳定破坏 `champion.json` 的耐久完整性，并在失败 Run 中造成
-  报告缺失。修复前可从历史接受 Round 的 `result.json`/`decision.json` 或既有 Run 报告恢复解释，但
-  不得手工回填 `champion.json`，以免绕过原子状态语义。若任务启用 `evaluation.target`，或运行流程要求
-  `champion.json` 始终作为完整的权威审计契约，应在继续新 Loop 研发前将该问题提升为 P0。
 
 ### P2：有时间时优化
 
@@ -181,6 +147,22 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
+
+#### Champion 指标值与适用性必须独立于 disposable runtime
+
+- **问题**：正常 Run 清理会删除 Development runtime；旧实现把该派生缓存缺失等同于 Champion 指标
+  失效，在下一次初始化及预检前把耐久指标写成 `null`。失败 Run 因而无法报告当前 Champion，配置了
+  `evaluation.target` 时还会启动本不需要的 Round。
+- **解决**：`champion.json` 升级为 schema v5，用 `champion_metrics_record` 同时保存指标值、评测来源、
+  valid/stale 状态、Champion 哈希、任务评测键、Development/Gate 数据指纹和 evaluator 内容指纹。
+  runtime 重建只重建缓存；内容不变时旧指标保持 valid，适用性变化时保留历史值并标记 stale。晋级比较
+  和 `target_reached` 只读取匹配的 valid 指标；下一次成功评测再原子替换记录。旧 schema 指标迁移后
+  保留为 stale，pending promotion 恢复同时切换策略和完整指标记录。报告明确区分策略来源与指标来源，
+  stale 指标仅用于历史解释。
+- **验证**：确定性测试覆盖正常清理重建、预检失败、分配 Round 前目标停止、固定数据与 evaluator 变化、
+  schema v4 迁移、Champion 重评、接受/拒绝、晋级中断恢复以及 valid/stale 报告；完整测试通过。
+- **风险**：旧 schema 缺少完整适用性证据，升级后的首次晋级比较必须重评 Champion；这是有意的保守
+  行为，不能通过当前 runtime 反推旧指标有效。
 
 #### Round 硬时限不能丢弃截止前已冻结的候选
 

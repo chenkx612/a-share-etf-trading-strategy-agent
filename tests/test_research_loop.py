@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from quant_core.research import run_loop
-from quant_core.research.runner import AgentContainerInfrastructureError
+from quant_core.research.contracts import ResearchTask
+from quant_core.research.runner import AgentContainerInfrastructureError, _metrics_key
 from quant_core.research.workspace import ResearchWorkspace
 
 
@@ -340,7 +341,13 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
         manager = ResearchWorkspace(workspace, research_root, "loop-test", run_number)
         task_state = manager.load_state()
         metrics = {"gate": {"sortino": 1.5, "max_drawdown": -0.10}}
-        manager.record_state(task_state, experiment_id, metrics)
+        loaded_task = ResearchTask.load(task_path)
+        metrics_record = manager.metrics_record(
+            metrics,
+            manager.metrics_applicability(task_state, _metrics_key(loaded_task)),
+            f"{run_number:03d}/{experiment_id}",
+        )
+        manager.record_state(task_state, experiment_id, metrics_record)
         experiment = manager.rounds / experiment_id
         experiment.mkdir()
         result_path = experiment / "result.json"
@@ -361,6 +368,68 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["stop_reason"] == "target_reached"
     assert state["rounds_completed"] == 1
+
+
+def test_rebuilt_runtime_keeps_valid_metrics_for_target_stop_before_a_round(
+    tmp_path: Path,
+) -> None:
+    task_path = _task(tmp_path, target=1.5)
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    state["champion_metrics_record"] = manager.metrics_record(
+        {"gate": {"sortino": 1.5, "max_drawdown": -0.10}},
+        manager.metrics_applicability(state, _metrics_key(task)),
+        "001/001",
+    )
+    manager.record_state(state, "001/001")
+    manager.cleanup_transient(remove_development_cache=True)
+
+    def unexpected_runner(*args, **kwargs):
+        raise AssertionError("a target-reaching Champion must stop before a new round")
+
+    state_path = run_loop(
+        task_path,
+        workspace=tmp_path,
+        managed_runner=unexpected_runner,
+        reporter=_reporter,
+    )
+
+    loop_state = json.loads(state_path.read_text(encoding="utf-8"))
+    champion_state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+    assert loop_state["stop_reason"] == "target_reached"
+    assert loop_state["rounds_completed"] == 0
+    assert champion_state["champion_metrics_record"]["status"] == "valid"
+
+
+def test_preflight_failure_does_not_delete_valid_champion_metrics(tmp_path: Path) -> None:
+    task_path = _task(tmp_path)
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    state["champion_metrics_record"] = manager.metrics_record(
+        {"gate": {"sortino": 1.2, "max_drawdown": -0.10}},
+        manager.metrics_applicability(state, _metrics_key(task)),
+        "001/001",
+    )
+    manager.record_state(state, "001/001")
+    manager.cleanup_transient(remove_development_cache=True)
+
+    def fail_preflight(task: ResearchTask, research_root: Path) -> None:
+        raise RuntimeError("container unavailable")
+
+    with pytest.raises(RuntimeError, match="container unavailable"):
+        run_loop(
+            task_path,
+            workspace=tmp_path,
+            managed_runner=_runner([]),
+            reporter=_reporter,
+            container_preflight=fail_preflight,
+        )
+
+    champion_state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+    assert champion_state["champion_metrics_record"]["status"] == "valid"
+    assert champion_state["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.2
 
 
 def test_loop_recovers_a_completed_unrecorded_round(tmp_path: Path) -> None:

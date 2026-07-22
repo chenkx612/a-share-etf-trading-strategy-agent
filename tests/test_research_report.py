@@ -9,7 +9,9 @@ from typing import Sequence
 
 import pytest
 
+from quant_core.research.contracts import ResearchTask
 from quant_core.research.report import generate_loop_report, regenerate_loop_report
+from quant_core.research.runner import _metrics_key
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 
@@ -69,6 +71,7 @@ def _repo(root: Path) -> None:
     strategy = root / "src/quant_core/strategy/example.py"
     strategy.parent.mkdir(parents=True)
     strategy.write_text("PARAMETER = 1\n", encoding="utf-8")
+    (root / "fixed_evaluator.py").write_text("VERSION = 1\n", encoding="utf-8")
     (root / ".gitignore").write_text(".research/\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
@@ -91,9 +94,20 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     manager.rounds.mkdir(parents=True)
     task_state["champion_number"] = 1
     task_state["champion_round_id"] = "001/001"
-    task_state["champion_metrics"] = {
+    champion_metrics = {
         "development": {"sortino": 1.4, "max_drawdown": -0.10},
         "gate": {"sortino": 1.2, "max_drawdown": -0.12},
+    }
+    task_state["champion_metrics_record"] = {
+        "metrics": champion_metrics,
+        "status": "valid",
+        "stale_reasons": [],
+        "evaluated_in_round": "001/001",
+        "evaluated_at": "2025-01-01T00:00:00+00:00",
+        "applicability": base.metrics_applicability(
+            task_state,
+            _metrics_key(ResearchTask.load(task_path)),
+        ),
     }
     write_json_atomic(manager.state_path, task_state)
     stale = manager.rounds / "000"
@@ -114,7 +128,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         "attempts": "Tested three bounded variants",
         "development_effect": "Sortino improved",
         "candidate": "Set PARAMETER to 1",
-        "metrics": task_state["champion_metrics"],
+        "metrics": champion_metrics,
     })
     write_json_atomic(experiment / "decision.json", {
         "experiment_id": "001/001",
@@ -167,6 +181,9 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert '"decision": "accepted"' in prompt
     assert '"relative_improvement_required": false' in prompt
     assert '"source_round": "001/001"' in prompt
+    assert '"strategy_source_round": "001/001"' in prompt
+    assert '"metrics_source_round": "001/001"' in prompt
+    assert '"metrics_status": "valid"' in prompt
     assert '"sortino": 1.2' in prompt
     assert '"integrity_warnings": []' in prompt
     assert "PARAMETER = 1" in prompt
@@ -191,6 +208,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         "round_ids": ["001"],
     })
     shutil.rmtree(base.runtime)
+    (tmp_path / "fixed_evaluator.py").write_text("VERSION = 2\n", encoding="utf-8")
     regenerated = regenerate_loop_report(
         task_path,
         workspace=tmp_path,
@@ -204,6 +222,8 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert saved_state["report_failure_kind"] is None
     assert saved_state["report_failure_code"] is None
     assert report_input.read_bytes() == frozen_input
+    assert '"metrics_status": "stale"' in str(captured["prompt"])
+    assert '"evaluator_contract_sha256_changed"' in str(captured["prompt"])
     assert "updated_at" in saved_state
     assert not base.runtime.exists()
 
@@ -327,10 +347,19 @@ def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
     base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
-    base.initialize(
+    task_state = base.initialize(
         date(2021, 12, 31),
         strategy_path="src/quant_core/strategy/example.py",
     )
+    task_state["champion_metrics_record"] = {
+        "metrics": {"gate": {"sortino": 1.1}},
+        "status": "stale",
+        "stale_reasons": ["gate_inputs_sha256_changed"],
+        "evaluated_in_round": "001/001",
+        "evaluated_at": "2025-01-01T00:00:00+00:00",
+        "applicability": {"gate_inputs_sha256": "old"},
+    }
+    write_json_atomic(base.state_path, task_state)
     manager = base.for_run(1)
     manager.rounds.mkdir(parents=True)
     captured: dict[str, str] = {}
@@ -368,6 +397,9 @@ def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -
     assert "integrity_warnings" in prompt
     assert "rounds_completed=1 but round_ids contains 0 entries" in prompt
     assert "不得为缺失的轮次或工件虚构研究内容" in prompt
+    assert '"metrics_status": "stale"' in prompt
+    assert '"gate_inputs_sha256_changed"' in prompt
+    assert '"sortino": 1.1' in prompt
 
 
 def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> None:
