@@ -246,7 +246,12 @@ def normalize_daily(raw: pd.DataFrame, symbol: str, name: str) -> pd.DataFrame:
 
 
 def normalize_tencent_daily(raw: pd.DataFrame, symbol: str, name: str) -> pd.DataFrame:
-    df = raw.rename(columns={"amount": "volume"}).copy()
+    df = raw.copy()
+    # Older Tencent payloads used "amount" for share volume and had no "volume".
+    # Current payloads expose both columns; renaming would create a duplicate
+    # "volume" label and break pd.to_numeric under pandas 2+/3.
+    if "volume" not in df.columns and "amount" in df.columns:
+        df = df.rename(columns={"amount": "volume"})
     missing = [col for col in ["date", "open", "high", "low", "close"] if col not in df.columns]
     if missing:
         raise ValueError(f"Tencent ETF daily data for {symbol} missing columns: {missing}")

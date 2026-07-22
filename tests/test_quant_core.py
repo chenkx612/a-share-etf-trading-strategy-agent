@@ -14,7 +14,11 @@ from quant_core.cli import (
     recommendation_output_frame,
     sort_optimization_results,
 )
-from quant_core.data.market_data import AkshareMarketDataClient, to_tencent_symbol
+from quant_core.data.market_data import (
+    AkshareMarketDataClient,
+    normalize_tencent_daily,
+    to_tencent_symbol,
+)
 from quant_core.factors import compute_factors
 from quant_core.strategy.sharpe_corr_threshold import (
     SharpeCorrThresholdParams,
@@ -379,6 +383,37 @@ def test_market_data_client_falls_back_to_tencent_with_qfq(monkeypatch: pytest.M
             "adjust": "qfq",
         },
     )
+
+
+def test_normalize_tencent_daily_keeps_volume_when_amount_also_present() -> None:
+    raw = pd.DataFrame({
+        "date": ["2026-07-22"],
+        "open": [3.65],
+        "close": [3.586],
+        "high": [3.716],
+        "low": [3.575],
+        "volume": [2.59e9],
+        "turnover": [0.15],
+        "amount": [9.48e9],
+    })
+
+    daily = normalize_tencent_daily(raw, "159915", "cyb")
+
+    assert list(daily.columns) == [
+        "date",
+        "symbol",
+        "name",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "turnover",
+    ]
+    assert daily.loc[0, "volume"] == pytest.approx(2.59e9)
+    assert daily.loc[0, "amount"] == pytest.approx(9.48e9)
+    assert daily.loc[0, "symbol"] == "159915"
 
 
 def test_tencent_symbol_uses_shanghai_prefix_for_5_6_9_codes() -> None:
