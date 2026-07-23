@@ -29,16 +29,97 @@
 
 ## 当前结论
 
-当前没有开放 P0/P1。启动新 Loop Run 前仍需评估以下 P2 遗留问题：
+当前存在开放 P0，修复并验证前不得启动新的 Loop Run：
 
 | 优先级 | 问题 |
 | --- | --- |
+| P0 | `baseline.mode = "none"` 的首个新增策略生成空 Candidate Patch |
+| P1 | Agent 单次 Shell 时限与 Round 评测预算不一致 |
+| P1 | Evaluator 契约包含无关文档并触发 Champion 重评 |
+| P1 | 终局报告 Prompt 通过 argv 传递会超过系统上限 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | Harness 风险登记文件名在仓库说明中不一致 |
+| P2 | Evaluator 指纹计算依赖可写 Git 对象库 |
 
 ## 一、待解决问题
+
+### P0：阻断可信研发
+
+#### `baseline.mode = "none"` 的首个新增策略生成空 Candidate Patch
+
+- **问题**：`write_candidate_patch()` 只执行
+  `git diff --binary HEAD -- <editable>`，不会包含未跟踪文件。`baseline.mode = "none"` 的 0→1
+  任务中策略路径原本不存在，因此首个候选始终是 untracked。Run 003 Round 001 已接受并晋级，
+  `submission.strategy_sha256` 和当前 `champion.py` 均存在，但耐久
+  `rounds/001/candidate.patch` 为 0 字节，Decision 记录的 SHA-256 是空内容哈希
+  `e3b0c442...b855`；同 Run 后两轮基于已存在 Champion 的 patch 分别为 7,676 和 6,484 字节。
+  Round 001 目录也没有保留独立候选源码/checkpoint。若未来 Champion 被覆盖，仅凭该轮冻结输入、
+  空 patch 和 Parent Champion 无法重建首次获胜候选，破坏 immutable Loop history 和晋级审计证据。
+- **方案**：生成 patch 前显式处理 editable 路径的 untracked 状态，例如对临时 index 使用
+  `git add -N` 后 `git diff --binary`，或生成可被 `git apply` 恢复的新文件 patch；不要修改候选
+  的真实 index。写入 Decision 前验证：候选策略 SHA 不同于 Parent/基座时 patch 不得为空，且将
+  patch 应用到冻结 Parent 后得到的文件 SHA 必须等于 `submission.strategy_sha256`。对 0→1 接受轮
+  还应保留完整候选源码作为冗余内容寻址证据。
+- **验证**：覆盖 `baseline.mode = "none"` 的新增文件、已有文件修改、文件删除、二进制差异和空改动；
+  对每种情况在干净 Parent 上应用 patch 并核对策略 SHA。增加回归断言，禁止非空候选以空 patch
+  进入 Decision 或晋级。
+- **风险**：高。当前 Run 003 的首个候选暂时仍可由任务级 `champion.py` 和记录的 SHA 核对，但这是
+  可变任务级副本，不满足轮次级不可变证据要求；在修复前继续晋级可能永久覆盖唯一完整源码。
+
+### P1：推荐优先解决
+
+#### Agent 单次 Shell 时限与 Round 评测预算不一致
+
+- **问题**：Harness 为候选声明并强制 `budget.round_minutes = 30`，但 OpenCode `bash` 工具会在
+  600 秒终止单条命令。任务允许最多 128 组参数，Prompt 只给出 Harness Round 截止时间，没有声明
+  这一更短的命令时限。本次 Run 003 Round 001 的 36 组参数 Development walk-forward 持续占用
+  单核正常计算，却在 600 秒被工具终止；此前已通过的策略尚未来得及 checkpoint，浪费约三分之一
+  Round 预算并迫使 Agent 临时改写和缩网格。
+- **方案**：把候选可依赖的单命令硬时限纳入任务/Prompt 契约，并在 Harness 校验参数网格时结合
+  折数与一次选择基准给出可执行性预警；更稳妥的做法是由 Harness 提供可取消、可观测、时限不超过
+  Round 剩余预算的 Development 评测接口。Agent 仍应先提交通过 focused test 的 checkpoint，
+  再启动可能接近时限的完整评测。
+- **验证**：构造评测耗时超过 600 秒但小于 Round 预算的假 evaluator，确认不会被未声明的工具时限
+  静默截断；或确认 Prompt 明确暴露限制且 Agent 在长评测前已冻结 checkpoint。记录终止原因、实际
+  运行时间和剩余 Round 预算。
+- **风险**：中。候选可通过缩小网格或优化策略绕开，但失败可能耗尽研发轮次，且
+  `max_parameter_sets` 当前不能代表实际可执行搜索预算。
+
+#### Evaluator 契约包含无关文档并触发 Champion 重评
+
+- **问题**：`evaluator_contract_sha256()` 对除少数排除路径外的整个工作树执行 `git add -A`，
+  因而把 `ISSUES.md` 等不参与固定测试、数据、回测或晋级逻辑的文档也纳入 evaluator 契约。
+  本次 Run 003 Round 001 运行期间按观测要求更新 `ISSUES.md` 后，已接受 Champion 的指标在
+  Round 002 决策前被判 stale；Harness 额外运行了一次
+  `002-champion-development`，随后才完成拒绝决策。评测结果未失真，但无关文档变更造成昂贵重评，
+  并使“运行中记录 Harness 问题”与指标适用性产生非预期耦合。
+- **方案**：把 evaluator 契约改为显式、可审计的固定评测输入集合，例如 evaluator/backtest/data
+  读取与契约代码、配置、测试命令依赖和锁定环境；策略、数据指纹和环境继续使用各自独立契约。
+  不应简单忽略所有未跟踪文件，必须覆盖真正会被 Python 导入或被命令读取的未提交 evaluator 改动。
+- **验证**：修改 `ISSUES.md`、README 和无关 Skill 时契约哈希保持不变且不触发 Champion 重评；
+  修改 backtest、research evaluator、固定测试或其实际导入依赖时哈希必须变化。用导入追踪或显式
+  allowlist 测试防止漏掉间接依赖。
+- **风险**：中。当前保守哈希不会静默复用已改变 evaluator 的指标，但会增加长 Run 的耗时和外部
+  状态暴露；修复时若依赖集合不完整，反而可能引入错误复用，必须优先保证保守性。
+
+#### 终局报告 Prompt 通过 argv 传递会超过系统上限
+
+- **问题**：报告输入包含逐折 Development/Gate 记录，Run 003 的冻结
+  `report-input.json` 为 258,525 字节。`_run_opencode_container()` 将完整报告 Prompt 追加为
+  `opencode run` 的位置参数，再作为 `docker run ...` 的 argv 启动，最终失败为
+  `exec /sbin/docker-init: argument list too long`。Loop 的三轮 Result/Decision 和 Champion 均已
+  耐久落盘，但 `report_status = failed`、`report_path = null`；错误又只记为通用 exit 255，
+  `report_failure_kind` 和 `report_failure_code` 均为空。
+- **方案**：不要把大型 Prompt 放入 Docker/OpenCode argv。通过容器内只读输入文件、stdin 或
+  OpenCode 支持的文件消息接口传递，并为报告输入设置启动前字节预算与确定性摘要层；冻结的完整
+  `report-input.json` 继续作为审计来源。将 `E2BIG`/`argument list too long` 分类为明确的本地
+  invocation infrastructure failure，便于无需重新认证地修复后重试。
+- **验证**：用超过宿主 `ARG_MAX`、包含多轮逐折记录的报告 payload 生成报告，确认容器能启动且
+  模型读取内容与冻结输入一致；覆盖空格、Unicode、大 JSON、超时与重试，并断言失败分类字段完整。
+- **风险**：中。报告失败不改变晋级结论，但缺少终局复盘工件；直接截断 Prompt 会丢失审计事实，
+  因此不能把无界裁剪当作修复。
 
 ### P2：有时间时优化
 
@@ -82,6 +163,22 @@
   检查避免再次漂移；不要创建内容重复的第二份风险文档。
 - **验证**：仓库搜索不再出现旧文件名，README 链接和 Agent 启动前检查均指向同一现有文件。
 - **风险**：低；修复前操作人员应以现有 `ISSUES.md` 为准。
+
+#### Evaluator 指纹计算依赖可写 Git 对象库
+
+- **问题**：`evaluator_contract_sha256()` 虽用临时 `GIT_INDEX_FILE` 隔离 index，仍执行
+  `git add -A` 和 `git write-tree`，需要向仓库 Git 对象库写入 blob/tree。在仅允许读取
+  `.git`、但允许写工作区的受管执行环境中，Loop 会在分配 Run 前以
+  `unable to create temporary file: Operation not permitted` 失败；本次在扫描
+  `.agents/skills/etf-sharpe-topk/SKILL.md` 时复现。
+- **方案**：将临时 object database 一并放入可写临时目录，并通过
+  `GIT_OBJECT_DIRECTORY`/alternate object directories 只读复用原仓库对象；或改为不写 Git 对象库
+  的确定性工作树内容哈希。两种方案都必须保持未提交 evaluator 改动可进入契约、排除规则不变，
+  且不能污染主仓库 index/object database。
+- **验证**：在主 `.git` 只读、工作区可写的测试夹具中计算契约哈希；覆盖 tracked 修改、未跟踪文件、
+  删除、排除目录及相同内容的稳定哈希，并确认主仓库 index 和对象库均无变化。
+- **风险**：低。当前可在明确授权后于具有 Git 对象库写权限的宿主环境启动，不影响评测语义；
+  但未授权提升权限时无法运行 Harness。
 
 ## 二、已解决问题
 
