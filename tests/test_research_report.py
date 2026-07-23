@@ -15,6 +15,9 @@ from quant_core.research.runner import _metrics_key
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 
+ENVIRONMENT_SHA256 = "e" * 64
+
+
 TASK = """
 id = "report-test"
 goal = "Improve a strategy"
@@ -85,7 +88,12 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
     task_state = base.initialize(
         date(2021, 12, 31),
         strategy_path="src/quant_core/strategy/example.py",
@@ -232,7 +240,12 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
     base.initialize(
         date(2021, 12, 31),
         strategy_path="src/quant_core/strategy/example.py",
@@ -268,7 +281,12 @@ def test_report_authentication_failure_is_retryable_with_frozen_input(
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
     base.initialize(
         date(2021, 12, 31),
         strategy_path="src/quant_core/strategy/example.py",
@@ -346,7 +364,12 @@ def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
     task_state = base.initialize(
         date(2021, 12, 31),
         strategy_path="src/quant_core/strategy/example.py",
@@ -406,7 +429,12 @@ def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> Non
     task_path = tmp_path / "task.toml"
     task_path.write_text(TASK, encoding="utf-8")
     _repo(tmp_path)
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
     base.initialize(
         date(2021, 12, 31),
         strategy_path="src/quant_core/strategy/example.py",

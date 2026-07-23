@@ -10,8 +10,15 @@ import pytest
 
 from quant_core.research import run_loop
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.environment import EvaluationEnvironment
 from quant_core.research.runner import AgentContainerInfrastructureError, _metrics_key
 from quant_core.research.workspace import ResearchWorkspace
+
+
+ENVIRONMENT = EvaluationEnvironment.from_manifest({
+    "schema_version": 1,
+    "runner": "injected",
+})
 
 
 TASK = """
@@ -132,10 +139,11 @@ def _reporter(task_path: Path, manager: ResearchWorkspace, state: dict[str, obje
 
 def _running_state(task: Path, experiment_id: str = "001") -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "task_id": "loop-test",
         "run_number": 1,
         "task_fingerprint": hashlib.sha256(task.read_bytes()).hexdigest(),
+        "evaluation_environment_sha256": ENVIRONMENT.sha256,
         "status": "running",
         "started_at": "2026-01-01T00:00:00+00:00",
         "updated_at": "2026-01-01T00:00:00+00:00",
@@ -202,6 +210,24 @@ def test_container_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> 
         )
 
     assert not (tmp_path / ".research/loop-test/runs").exists()
+
+
+def test_environment_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+
+    def fail_environment() -> EvaluationEnvironment:
+        raise RuntimeError("Research Harness requires Conda environment 'quant'")
+
+    with pytest.raises(RuntimeError, match="requires Conda environment 'quant'"):
+        run_loop(
+            task,
+            workspace=tmp_path,
+            managed_runner=_runner(["rejected"]),
+            reporter=_reporter,
+            environment_probe=fail_environment,
+        )
+
+    assert not (tmp_path / ".research/loop-test").exists()
 
 
 def test_provider_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> None:
@@ -338,7 +364,13 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
         run_number: int,
         event_sink,
     ) -> Path:
-        manager = ResearchWorkspace(workspace, research_root, "loop-test", run_number)
+        manager = ResearchWorkspace(
+            workspace,
+            research_root,
+            "loop-test",
+            run_number=run_number,
+            evaluation_environment_sha256=ENVIRONMENT.sha256,
+        )
         task_state = manager.load_state()
         metrics = {"gate": {"sortino": 1.5, "max_drawdown": -0.10}}
         loaded_task = ResearchTask.load(task_path)
@@ -375,7 +407,12 @@ def test_rebuilt_runtime_keeps_valid_metrics_for_target_stop_before_a_round(
 ) -> None:
     task_path = _task(tmp_path, target=1.5)
     task = ResearchTask.load(task_path)
-    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
     state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.5, "max_drawdown": -0.10}},
@@ -405,7 +442,12 @@ def test_rebuilt_runtime_keeps_valid_metrics_for_target_stop_before_a_round(
 def test_preflight_failure_does_not_delete_valid_champion_metrics(tmp_path: Path) -> None:
     task_path = _task(tmp_path)
     task = ResearchTask.load(task_path)
-    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
     state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.2, "max_drawdown": -0.10}},
@@ -434,13 +476,23 @@ def test_preflight_failure_does_not_delete_valid_champion_metrics(tmp_path: Path
 
 def test_loop_recovers_a_completed_unrecorded_round(tmp_path: Path) -> None:
     task = _task(tmp_path, max_rounds=1)
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
     task_state = base.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     manager = base.for_run(1)
     manager.rounds.mkdir(parents=True)
+    task_state["champion_round_id"] = "001/001"
     manager.record_state(task_state, "001/001")
     experiment = manager.rounds / "001"
     experiment.mkdir()
+    (experiment / "result.json").write_text(json.dumps({
+        "experiment_id": "001/001",
+        "status": "completed",
+    }), encoding="utf-8")
     (experiment / "decision.json").write_text(json.dumps({
         "experiment_id": "001/001",
         "decision": "accepted",
@@ -485,6 +537,114 @@ def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -
     assert result["status"] == "failed"
 
 
+def test_loop_stops_instead_of_resuming_under_a_changed_environment(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, max_rounds=2, max_failures=2)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        run_number=1,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.rounds.mkdir(parents=True)
+    manager.loop_state_path.write_text(
+        json.dumps(_running_state(task)),
+        encoding="utf-8",
+    )
+    changed = EvaluationEnvironment.from_manifest({
+        "schema_version": 1,
+        "runner": "changed",
+    })
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["accepted"]),
+        reporter=_reporter,
+        environment_probe=lambda: changed,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    result = json.loads(
+        (manager.rounds / "001/result.json").read_text(encoding="utf-8")
+    )
+    assert state["status"] == "stopped"
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["rounds_completed"] == 1
+    assert state["resume_environment_sha256"] == changed.sha256
+    assert result["failure_code"] == "evaluation_environment_changed"
+    assert not (manager.rounds / "002").exists()
+
+
+def test_changed_environment_preserves_an_applied_round(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, max_rounds=2, max_failures=2)
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    task_state = base.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    task_state["champion_round_id"] = "001/001"
+    task_state["champion_number"] = 1
+    manager = base.for_run(1)
+    manager.rounds.mkdir(parents=True)
+    manager.record_state(task_state, "001/001")
+    experiment = manager.rounds / "001"
+    experiment.mkdir()
+    result_payload = {
+        "experiment_id": "001/001",
+        "status": "completed",
+        "candidate": "preserve this evidence",
+    }
+    decision_payload = {
+        "experiment_id": "001/001",
+        "decision": "accepted",
+        "reasons": ["promotion completed"],
+    }
+    (experiment / "result.json").write_text(
+        json.dumps(result_payload),
+        encoding="utf-8",
+    )
+    (experiment / "decision.json").write_text(
+        json.dumps(decision_payload),
+        encoding="utf-8",
+    )
+    manager.loop_state_path.write_text(
+        json.dumps(_running_state(task)),
+        encoding="utf-8",
+    )
+    changed = EvaluationEnvironment.from_manifest({
+        "schema_version": 1,
+        "runner": "changed",
+    })
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+        environment_probe=lambda: changed,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    champion = json.loads(base.state_path.read_text(encoding="utf-8"))
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["accepted"] == 1
+    assert state["failed"] == 0
+    assert json.loads(
+        (experiment / "result.json").read_text(encoding="utf-8")
+    ) == result_payload
+    assert json.loads(
+        (experiment / "decision.json").read_text(encoding="utf-8")
+    ) == decision_payload
+    assert champion["champion_round_id"] == "001/001"
+
+
 def test_loop_materializes_missing_interrupted_round_before_allocating_next(
     tmp_path: Path,
 ) -> None:
@@ -494,6 +654,7 @@ def test_loop_materializes_missing_interrupted_round_before_allocating_next(
         tmp_path / ".research",
         "loop-test",
         run_number=1,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
     )
     manager.rounds.mkdir(parents=True)
     manager.loop_state_path.write_text(
@@ -534,6 +695,7 @@ def test_resumed_loop_materializes_current_round_before_authentication_fuse(
         tmp_path / ".research",
         "loop-test",
         run_number=1,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
     )
     manager.rounds.mkdir(parents=True)
     manager.loop_state_path.write_text(
@@ -634,7 +796,13 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
         run_number: int,
         event_sink,
     ) -> Path:
-        manager = ResearchWorkspace(workspace, research_root, "loop-test", run_number)
+        manager = ResearchWorkspace(
+            workspace,
+            research_root,
+            "loop-test",
+            run_number=run_number,
+            evaluation_environment_sha256=ENVIRONMENT.sha256,
+        )
         manager.create_candidate(
             experiment_id,
             date(2021, 12, 31),

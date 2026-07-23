@@ -29,15 +29,36 @@
 
 ## 当前结论
 
-当前没有开放 P0。启动新 Loop Run 前仍需评估以下 P2 遗留问题：
+当前没有开放 P0。启动新 Loop Run 前仍需评估以下 P1/P2 遗留问题：
 
 | 优先级 | 问题 |
 | --- | --- |
+| P1 | 恢复 Run 后 Docker bind source 不可见可持续超过一次重试 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
+| P2 | Harness 风险登记文件名在仓库说明中不一致 |
 
 ## 一、待解决问题
+
+### P1：重要可靠性问题
+
+#### 恢复 Run 后 Docker bind source 不可见可持续超过一次重试
+
+- **问题**：真实 Run `002` 从中断状态恢复后创建 Round `002`，宿主 Harness 已进入
+  `agent_started`，但 Docker Desktop daemon 报候选 worktree 的 bind source 不存在。现有逻辑在
+  宿主所有 bind source 存在时用新容器名安全重试一次，本次仍在约 0.43 秒内以
+  `infrastructure/container_runtime` 失败并熔断；说明已解决条目中面向“晋级后瞬态不可见”的
+  单次重试没有覆盖恢复路径或持续性 daemon 可见性故障。
+- **方案**：在启动 Agent 前对本轮真实候选路径执行无副作用的 bind 可见性探针，并记录每次尝试、
+  宿主 `stat` 结果和 Docker 错误，不要让重试日志互相覆盖。保持活动 Run 的父目录 inode 稳定，
+  查明中断清理与恢复创建是否仍会重建 daemon 观察的路径；只在 Agent 尚未启动且宿主路径身份未变时
+  采用有界退避重试，持续不可见则在消耗研究轮次前按预检基础设施故障停止。
+- **验证**：真实 Docker Desktop 测试覆盖“中断 Round 后恢复下一 Round”、连续不可见超过一次、
+  首次失败后恢复以及宿主路径真实缺失；确认恢复成功时 Agent 只执行一次，持续故障不分配研究轮次，
+  且每次探针和重试均有独立证据。
+- **风险**：修复前即使 Run 前通用容器预检通过，真实候选 worktree 仍可能在 Round 启动时不可挂载，
+  并立即熔断整个 Run。
 
 ### P2：有时间时优化
 
@@ -72,12 +93,39 @@
 - **风险**：修复前必须保留失败记录并继续使用同一任务根；直接删除 Round 目录或编辑状态文件会破坏
   恢复语义。
 
+#### Harness 风险登记文件名在仓库说明中不一致
+
+- **问题**：实际登记表和 README 使用 `ISSUES.md`，但 `AGENTS.md` 的项目结构及启动规则仍写作
+  `HARNESS_ISSUES.md`。按说明执行启动前 P0 检查时会先遇到文件不存在，增加漏检或误建第二份登记表
+  的风险。
+- **方案**：确定 `ISSUES.md` 为唯一 canonical 名称后，统一仓库内全部引用，并增加轻量文档链接
+  检查避免再次漂移；不要创建内容重复的第二份风险文档。
+- **验证**：仓库搜索不再出现旧文件名，README 链接和 Agent 启动前检查均指向同一现有文件。
+- **风险**：低；修复前操作人员应以现有 `ISSUES.md` 为准。
+
 ## 二、已解决问题
 
 本节只保留会影响信任边界、评测语义、恢复一致性或长时间运行可靠性的经验。一次性的字段遗漏、
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
 
 ### P0：曾阻断可信研发
+
+#### 宿主固定评测环境必须进入 Champion 指标适用性契约
+
+- **问题**：Harness 控制器、固定测试以及 Development/Gate 评测使用启动 Loop 的宿主解释器，
+  旧 applicability 却不包含 Python 和依赖环境。不同宿主环境评出的候选可能直接与缓存的旧 Champion
+  指标比较，破坏跨 Run 的确定性和晋级正确性。
+- **解决**：Research 入口强制使用 Conda `quant`，在任何 Run 状态变更、Docker 或 Provider 调用前
+  校验环境。Harness 对 Python/ABI/平台、Conda package build 和 Python distribution 生成 canonical
+  manifest，按 SHA-256 内容寻址保存到任务级 `environments/`。Champion schema v6 的 applicability、
+  Loop state v3、Round Result、独立 Test 和报告输入均记录该哈希；环境变化保留旧指标但标记 stale，
+  晋级前在当前环境重评。活动 Run 缺少或改变环境证据时以
+  `infrastructure/evaluation_environment_changed` 审计化停止，不跨环境恢复。
+- **验证**：测试覆盖错误 Conda 环境在分配 Run 前失败、manifest 稳定排序与脱敏、环境 registry
+  完整性、旧 schema 迁移、环境变化 stale、同环境缓存有效、跨环境恢复熔断、成功及失败 Result 和
+  Test/Report 环境引用；Conda `quant` 全量测试 `224 passed, 2 skipped`。
+- **风险**：`quant` 内包升级会主动使指标 stale 并触发重评；当前未增加跨平台 Conda lockfile，
+  但每次实际评测环境均有不可歧义的耐久清单，不能静默复用异环境指标。
 
 #### Provider 刷新令牌失效必须持久化并按基础设施错误熔断
 

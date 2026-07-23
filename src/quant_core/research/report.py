@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.environment import (
+    EvaluationEnvironment,
+    capture_evaluation_environment,
+    persist_evaluation_environment,
+)
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     _metrics_key,
@@ -247,6 +252,9 @@ def generate_loop_report(
         )
     }
     loop_payload["integrity_warnings"] = integrity_warnings
+    loop_payload["evaluation_environment_sha256"] = loop_state.get(
+        "evaluation_environment_sha256"
+    )
     payload = {
         "task": {
             "id": task.task_id,
@@ -361,6 +369,7 @@ def regenerate_loop_report(
     research_root: str | Path = ".research",
     run_number: int | None = None,
     agent_runner: ReportAgentRunner = _run_opencode_read_only,
+    evaluation_environment: EvaluationEnvironment | None = None,
 ) -> Path:
     task_file = Path(task_path).resolve()
     task = ResearchTask.load(task_file)
@@ -368,7 +377,14 @@ def regenerate_loop_report(
     managed_root = Path(research_root)
     if not managed_root.is_absolute():
         managed_root = source / managed_root
-    base_manager = ResearchWorkspace(source, managed_root, task.task_id)
+    environment = evaluation_environment or capture_evaluation_environment()
+    base_manager = ResearchWorkspace(
+        source,
+        managed_root,
+        task.task_id,
+        evaluation_environment_sha256=environment.sha256,
+    )
+    persist_evaluation_environment(base_manager.root, environment)
     base_manager.load_state(task.strategy_path)
     base_manager.migrate_legacy_loop()
     available = base_manager.run_numbers()

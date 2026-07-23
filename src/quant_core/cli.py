@@ -35,6 +35,10 @@ from quant_core.research import (
     run_loop,
     run_once,
 )
+from quant_core.research.environment import (
+    capture_evaluation_environment,
+    persist_evaluation_environment,
+)
 from quant_core.research.workspace import (
     ResearchWorkspace,
     copy_runtime_inputs,
@@ -478,7 +482,16 @@ def command_recommend_today(args: argparse.Namespace) -> None:
 
 
 def command_research_run_once(args: argparse.Namespace) -> None:
-    result_path = run_once(args.task, args.experiment_id, args.output, workspace=args.root)
+    environment = capture_evaluation_environment()
+    output = Path(args.output).resolve()
+    persist_evaluation_environment(output, environment)
+    result_path = run_once(
+        args.task,
+        args.experiment_id,
+        output,
+        workspace=args.root,
+        evaluation_environment=environment,
+    )
     print(f"wrote experiment result to {result_path}")
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if result.get("status") != "completed":
@@ -565,7 +578,14 @@ def command_research_test(args: argparse.Namespace) -> None:
     research_root = Path(args.research_root)
     if not research_root.is_absolute():
         research_root = source / research_root
-    manager = ResearchWorkspace(source, research_root, task.task_id)
+    environment = capture_evaluation_environment()
+    manager = ResearchWorkspace(
+        source,
+        research_root,
+        task.task_id,
+        evaluation_environment_sha256=environment.sha256,
+    )
+    persist_evaluation_environment(manager.root, environment)
     state = manager.initialize(
         date.fromisoformat(task.evaluation_periods["development"]["end"]),
         task.baseline_mode, task.baseline_exclude, task.strategy_path,
@@ -605,6 +625,7 @@ def command_research_test(args: argparse.Namespace) -> None:
         write_json_atomic(output / "result.json", {
             "test_id": test_id,
             "strategy_sha256": state["champion_sha256"],
+            "evaluation_environment_sha256": environment.sha256,
             "runtime_inputs": runtime_inputs,
             "metrics": metrics,
         })

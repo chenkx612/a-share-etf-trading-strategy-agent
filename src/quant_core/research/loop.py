@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.environment import (
+    EvaluationEnvironment,
+    capture_evaluation_environment,
+    persist_evaluation_environment,
+)
 from quant_core.research.report import generate_loop_report
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
@@ -26,6 +31,7 @@ ManagedRunner = Callable[..., Path]
 LoopReporter = Callable[[Path, ResearchWorkspace, dict[str, Any]], Path]
 ContainerPreflight = Callable[[ResearchTask, Path], None]
 ProviderPreflight = Callable[[ResearchTask, Path], None]
+EnvironmentProbe = Callable[[], EvaluationEnvironment]
 _ROUND_ID = re.compile(r"^(\d+)$")
 
 
@@ -37,13 +43,19 @@ def _task_fingerprint(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _new_state(task: ResearchTask, fingerprint: str, run_number: int) -> dict[str, Any]:
+def _new_state(
+    task: ResearchTask,
+    fingerprint: str,
+    run_number: int,
+    evaluation_environment_sha256: str,
+) -> dict[str, Any]:
     now = _timestamp()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "task_id": task.task_id,
         "run_number": run_number,
         "task_fingerprint": fingerprint,
+        "evaluation_environment_sha256": evaluation_environment_sha256,
         "status": "running",
         "started_at": now,
         "updated_at": now,
@@ -72,8 +84,38 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
         state["current_round"] = state.pop("current_experiment_id", None)
     if "last_round" not in state:
         state["last_round"] = state.pop("last_experiment_id", None)
-    state["schema_version"] = 2
+    if state.get("schema_version") not in {2, 3}:
+        raise ValueError("research loop uses an incompatible state schema")
     return state
+
+
+def _applied_round_decision(
+    manager: ResearchWorkspace,
+    task_state: dict[str, Any],
+    round_id: str,
+) -> str | None:
+    record_id = f"{manager.run_id}/{round_id}"
+    experiment = manager.rounds / round_id
+    decision_path = experiment / "decision.json"
+    if not (experiment / "result.json").is_file() or not decision_path.is_file():
+        return None
+    if task_state.get("last_round_id", task_state.get("last_experiment_id")) not in {
+        round_id,
+        record_id,
+    }:
+        return None
+    try:
+        decision = json.loads(decision_path.read_text(encoding="utf-8")).get("decision")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if decision not in {"accepted", "rejected", "failed"}:
+        return None
+    if decision == "accepted" and task_state.get("champion_round_id") not in {
+        round_id,
+        record_id,
+    }:
+        return None
+    return str(decision)
 
 
 def _next_round_id(experiments: Path, reserved: Sequence[object] = ()) -> str:
@@ -189,6 +231,7 @@ def run_loop(
     monotonic: Callable[[], float] = time.monotonic,
     container_preflight: ContainerPreflight | None = None,
     provider_preflight: ProviderPreflight | None = None,
+    environment_probe: EnvironmentProbe | None = None,
 ) -> Path:
     """Run managed research rounds until one of the configured budgets is exhausted."""
     task_file = Path(task_path).resolve()
@@ -197,7 +240,23 @@ def run_loop(
     managed_root = Path(research_root)
     if not managed_root.is_absolute():
         managed_root = source / managed_root
-    base_manager = ResearchWorkspace(source, managed_root, task.task_id)
+    if environment_probe is None:
+        if managed_runner is run_managed_once:
+            environment = capture_evaluation_environment()
+        else:
+            environment = EvaluationEnvironment.from_manifest({
+                "schema_version": 1,
+                "runner": "injected",
+            })
+    else:
+        environment = environment_probe()
+    base_manager = ResearchWorkspace(
+        source,
+        managed_root,
+        task.task_id,
+        evaluation_environment_sha256=environment.sha256,
+    )
+    persist_evaluation_environment(base_manager.root, environment)
     development_end = task.development_period["end"]
     base_manager.initialize(
         date.fromisoformat(development_end),
@@ -231,6 +290,53 @@ def run_loop(
         run_number = base_manager.next_run_number()
         manager = base_manager.for_run(run_number)
 
+    if active_runs and state.get("evaluation_environment_sha256") != environment.sha256:
+        current = state.get("current_round")
+        if isinstance(current, str):
+            record_id = f"{manager.run_id}/{current}"
+            experiment = manager.rounds / current
+            experiment.mkdir(parents=True, exist_ok=True)
+            applied = _applied_round_decision(
+                manager,
+                manager.load_state(task.strategy_path),
+                current,
+            )
+            if applied is None:
+                result_path = experiment / "result.json"
+                if not result_path.exists():
+                    write_json_atomic(result_path, {
+                        "experiment_id": record_id,
+                        "status": "failed",
+                        "error": "Evaluation environment changed before the interrupted Round resumed",
+                        "failure_kind": "infrastructure",
+                        "failure_code": "evaluation_environment_changed",
+                        "evaluation_environment_sha256": environment.sha256,
+                    })
+                write_json_atomic(experiment / "decision.json", {
+                    "experiment_id": record_id,
+                    "decision": "failed",
+                    "reasons": [
+                        "evaluation environment changed before the interrupted Round resumed"
+                    ],
+                    "failure_kind": "infrastructure",
+                    "failure_code": "evaluation_environment_changed",
+                })
+                applied = "failed"
+            _record_decision(state, current, applied)
+        state["schema_version"] = 3
+        state["resume_environment_sha256"] = environment.sha256
+        _save(manager.loop_state_path, state)
+        return _finish_with_report(
+            task_file,
+            manager,
+            manager.loop_state_path,
+            state,
+            "infrastructure_failure",
+            reporter,
+        )
+    if active_runs:
+        state["schema_version"] = 3
+
     # Injected managed runners own their execution environment. The production
     # runner must prove its Docker boundary before a Run is allocated or resumed.
     preflight = container_preflight
@@ -251,7 +357,7 @@ def run_loop(
         lifecycle_event = ("run_resumed", "resumed")
     else:
         manager.rounds.mkdir(parents=True, exist_ok=False)
-        state = _new_state(task, fingerprint, run_number)
+        state = _new_state(task, fingerprint, run_number, environment.sha256)
         lifecycle_event = ("run_started", "started")
     loop_state_path = manager.loop_state_path
     _save(loop_state_path, state)
@@ -262,12 +368,8 @@ def run_loop(
         decision_path = manager.rounds / current / "decision.json"
         task_state = manager.load_state(task.strategy_path)
         record_id = f"{manager.run_id}/{current}"
-        if decision_path.exists() and task_state.get(
-            "last_round_id",
-            task_state.get("last_experiment_id"),
-        ) in {current, record_id}:
-            decision = json.loads(decision_path.read_text(encoding="utf-8")).get("decision", "failed")
-        else:
+        decision = _applied_round_decision(manager, task_state, current)
+        if decision is None:
             decision = "failed"
             decision_path.parent.mkdir(parents=True, exist_ok=True)
             result_path = decision_path.parent / "result.json"
@@ -276,6 +378,7 @@ def run_loop(
                     "experiment_id": record_id,
                     "status": "failed",
                     "error": "Loop was interrupted before the round was finalized",
+                    "evaluation_environment_sha256": environment.sha256,
                 })
             write_json_atomic(decision_path, {
                 "experiment_id": record_id,
@@ -327,14 +430,15 @@ def run_loop(
         manager.emit_event("round_started", round=round_id, message="candidate started")
         started = monotonic()
         try:
-            result_path = managed_runner(
-                task_file,
-                round_id,
-                workspace=source,
-                research_root=managed_root,
-                run_number=run_number,
-                event_sink=manager.emit_event,
-            )
+            runner_options = {
+                "workspace": source,
+                "research_root": managed_root,
+                "run_number": run_number,
+                "event_sink": manager.emit_event,
+            }
+            if managed_runner is run_managed_once:
+                runner_options["evaluation_environment"] = environment
+            result_path = managed_runner(task_file, round_id, **runner_options)
         except KeyboardInterrupt:
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"

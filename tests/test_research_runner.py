@@ -217,7 +217,9 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
         opencode_runner=fake_opencode,
     )
 
-    assert json.loads(result_path.read_text(encoding="utf-8"))["status"] == "completed"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "completed"
+    assert len(result["evaluation_environment_sha256"]) == 64
     assert observed_config["period"] == {"start": "2018-01-01", "end": "2021-12-31"}
     assert observed_config["walk_forward"] == {
         "train_months": 36,
@@ -1590,6 +1592,7 @@ def test_run_once_classifies_container_initialization_failure(
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["status"] == "failed"
     assert result["failure_kind"] == "infrastructure"
+    assert len(result["evaluation_environment_sha256"]) == 64
     assert "OCI runtime create failed" in result["error"]
 
 

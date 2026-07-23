@@ -311,6 +311,18 @@ class ExperimentResult:
             raise ValueError(
                 "result.failure_code must be a non-empty string for infrastructure failures"
             )
+        environment_sha256 = data.get("evaluation_environment_sha256")
+        if environment_sha256 is not None and (
+            not isinstance(environment_sha256, str)
+            or len(environment_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in environment_sha256
+            )
+        ):
+            raise ValueError(
+                "result.evaluation_environment_sha256 must be a SHA-256 digest"
+            )
         feedback = data.get("feedback")
         if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
             raise ValueError("result.feedback must be a non-empty str when present")

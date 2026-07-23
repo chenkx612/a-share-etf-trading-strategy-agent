@@ -73,7 +73,13 @@ def test_research_test_snapshots_current_runtime_inputs(
     )
 
     class FakeWorkspace:
-        def __init__(self, source: Path, research_root: Path, task_id: str) -> None:
+        def __init__(
+            self,
+            source: Path,
+            research_root: Path,
+            task_id: str,
+            evaluation_environment_sha256: str | None = None,
+        ) -> None:
             self.source = source
             self.root = research_root / task_id
             self.evaluation_runtime = stale_runtime
@@ -113,6 +119,12 @@ def test_research_test_snapshots_current_runtime_inputs(
     result_path = next((tmp_path / ".research/test-snapshot/tests").glob("*/result.json"))
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["metrics"]["sortino"] == 2.0
+    assert len(result["evaluation_environment_sha256"]) == 64
+    assert (
+        tmp_path
+        / ".research/test-snapshot/environments"
+        / f"{result['evaluation_environment_sha256']}.json"
+    ).is_file()
     assert result["runtime_inputs"] == {
         "data/etf_daily.csv": hashlib.sha256(latest_data).hexdigest(),
     }

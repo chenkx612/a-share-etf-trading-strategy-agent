@@ -57,8 +57,8 @@ Harness 遵循以下核心原则：
 安装项目：
 
 ```bash
-python3 -m pip install -e ".[dev]"
-pytest
+conda run --no-capture-output -n quant python -m pip install -e ".[dev]"
+conda run --no-capture-output -n quant pytest
 ```
 
 构建候选 Agent 镜像：
@@ -73,7 +73,7 @@ docker build \
 运行自动化策略研究循环：
 
 ```bash
-python3 -m quant_core.cli research loop \
+conda run --no-capture-output -n quant python -m quant_core.cli research loop \
   --task path/to/task.toml
 ```
 
@@ -110,6 +110,10 @@ python3 -m quant_core.cli research loop \
   checkpoint 对 Agent 不可写。
 - 固定 evaluator 要求策略实现 `select(daily, universe, start, end)`，返回包含 `date`、
   `symbol`、`target_weight` 的 pandas DataFrame。权重必须有限且非负，每日总和不超过 1。
+- Harness 控制器、固定测试和 Development/Gate/Test 评测必须从 Conda `quant` 启动。Harness 会
+  对实际 Python、ABI、平台、Conda build 和 Python distribution 生成稳定环境指纹；环境变化会使
+  历史 Champion 指标变为 stale，并在下一次晋级比较前重评。完整清单保存在
+  `.research/<task-id>/environments/<sha256>.json`。
 
 运行前还应确认 OpenCode 模型与认证可用，并且任务声明的测试和回测命令可以在仓库根目录运行。
 Provider 模型名、推理档位、认证和价格属于外部状态，不在仓库中维护静态清单。
@@ -167,18 +171,22 @@ QUANT_TEST_AGENT_CONTAINER=1 pytest -q \
 
 ```bash
 # 运行一次候选研发，不管理 Champion
-python3 -m quant_core.cli research run-once \
+conda run --no-capture-output -n quant python -m quant_core.cli research run-once \
   --task tasks/sharpe_corr_threshold_optimization.toml \
   --experiment-id experiment-001 \
   --output path/to/experiment
 
 # 重新生成最近或指定 Run 的终局报告
-python3 -m quant_core.cli research report --task tasks/sharpe_corr_threshold_optimization.toml
-python3 -m quant_core.cli research report --task tasks/sharpe_corr_threshold_optimization.toml --run 2
+conda run --no-capture-output -n quant python -m quant_core.cli research report \
+  --task tasks/sharpe_corr_threshold_optimization.toml
+conda run --no-capture-output -n quant python -m quant_core.cli research report \
+  --task tasks/sharpe_corr_threshold_optimization.toml --run 2
 
 # 清理临时 worktree、派生缓存和冗余成功日志
-python3 -m quant_core.cli research clean --task tasks/sharpe_corr_threshold_optimization.toml
-python3 -m quant_core.cli research clean --task-id <task-id>
+conda run --no-capture-output -n quant python -m quant_core.cli research clean \
+  --task tasks/sharpe_corr_threshold_optimization.toml
+conda run --no-capture-output -n quant python -m quant_core.cli research clean \
+  --task-id <task-id>
 ```
 
 任务级 Champion 保存在 `.research/<task-id>/champion.py` 和 `champion.json`；每轮的
@@ -246,9 +254,9 @@ src/quant_core/backtest/  # Fixed simulation engine and metrics
 scripts/                  # Repository-level operational and universe-building commands
 tests/                    # Framework and harness tests
 universes/                # Repository-level stock pools shared across skills
-HARNESS_ISSUES.md         # Prioritized Harness issue and resolution history
+ISSUES.md                 # Prioritized Harness issue and resolution history
 .agents/skills/           # Skill-specific knowledge, prompts, scripts, parameters, and outputs
-.research/<task-id>/      # Champion, numbered Run history, cache, and temp observation
+.research/<task-id>/      # Champion, environment manifests, Run history, cache, and temp observation
 ```
 
 运行命令默认把本地日线缓存写到当前工作目录下的 `data/etf_daily.*`，把因子、回测和推荐等中间结果写到 `outputs/`。跨技能共享的股票池放在 `universes/`，当前 sector-rotation 的 canonical 股票池为 `universes/sector_rotation.csv`；技能目录只保存技能专属输入和产物。股票池不保存在 `data/` 下；调用框架 CLI 时通过 `--universe path/to/universe.csv` 显式传入。

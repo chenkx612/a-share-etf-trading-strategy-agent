@@ -148,6 +148,7 @@ class ResearchWorkspace:
     research_root: Path
     task_id: str
     run_number: int | None = None
+    evaluation_environment_sha256: str | None = None
 
     def __post_init__(self) -> None:
         self.source = self.source.resolve()
@@ -156,6 +157,14 @@ class ResearchWorkspace:
             raise ValueError("task.id may contain only letters, numbers, '.', '_' and '-'")
         if self.run_number is not None and self.run_number < 1:
             raise ValueError("run number must be positive")
+        if self.evaluation_environment_sha256 is not None and (
+            len(self.evaluation_environment_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.evaluation_environment_sha256
+            )
+        ):
+            raise ValueError("evaluation environment must be a SHA-256 digest")
         repository = Path(_git(self.source, "rev-parse", "--show-toplevel")).resolve()
         if repository != self.source:
             raise ValueError("research workspace must be the Git repository root")
@@ -252,6 +261,7 @@ class ResearchWorkspace:
             self.research_root,
             self.task_id,
             run_number=run_number,
+            evaluation_environment_sha256=self.evaluation_environment_sha256,
         )
 
     def next_run_number(self) -> int:
@@ -451,6 +461,8 @@ class ResearchWorkspace:
         champion_sha256: str | None = None,
         evaluator_contract_sha256: str | None = None,
     ) -> dict[str, str | None]:
+        if self.evaluation_environment_sha256 is None:
+            raise RuntimeError("fixed evaluation environment was not configured")
         strategy_path = str(state["strategy_path"])
         contract = evaluator_contract_sha256 or self.evaluator_contract_sha256(
             state.get("baseline_exclude", []),
@@ -465,6 +477,7 @@ class ResearchWorkspace:
             "development_inputs_sha256": runtime_inputs_sha256(self.development_runtime),
             "gate_inputs_sha256": runtime_inputs_sha256(self.evaluation_runtime),
             "evaluator_contract_sha256": contract,
+            "evaluation_environment_sha256": self.evaluation_environment_sha256,
         }
 
     def refresh_champion_metrics_status(
@@ -630,15 +643,29 @@ class ResearchWorkspace:
             return
         state = json.loads(source.read_text(encoding="utf-8"))
         schema_version = state.get("schema_version")
-        if schema_version == 5 and source == self.state_path:
+        if schema_version == 6 and source == self.state_path:
             if "last_experiment_id" in state and "last_round_id" not in state:
                 state["last_round_id"] = state.pop("last_experiment_id")
                 write_json_atomic(self.state_path, state)
             return
-        if schema_version not in {2, 3, 4}:
+        if schema_version not in {2, 3, 4, 5}:
             raise ValueError("research workspace uses an incompatible champion schema")
-        if schema_version == 4 and isinstance(state.get("pending_promotion"), dict):
+        if schema_version in {4, 5} and isinstance(state.get("pending_promotion"), dict):
             state = self._recover_promotion(state)
+        if schema_version == 5:
+            metrics_record = state.get("champion_metrics_record")
+            if isinstance(metrics_record, dict):
+                reasons = metrics_record.get("stale_reasons")
+                stale_reasons = list(reasons) if isinstance(reasons, list) else []
+                if "legacy_missing_evaluation_environment" not in stale_reasons:
+                    stale_reasons.append("legacy_missing_evaluation_environment")
+                metrics_record["status"] = "stale"
+                metrics_record["stale_reasons"] = stale_reasons
+            state["schema_version"] = 6
+            write_json_atomic(self.state_path, state)
+            if source != self.state_path:
+                source.unlink()
+            return
         editable = self._strategy_path(state, strategy_path)
         champion_commit = state.get("champion_commit")
         champion_sha256 = (
@@ -665,7 +692,7 @@ class ResearchWorkspace:
         if champion_round_id is None:
             champion_round_id = self._latest_accepted_round()
         migrated = {
-            "schema_version": 5,
+            "schema_version": 6,
             "task_id": self.task_id,
             "baseline_mode": state.get("baseline_mode", "workspace"),
             "baseline_exclude": list(state.get("baseline_exclude", [])),
@@ -895,7 +922,7 @@ class ResearchWorkspace:
             os.replace(self.champion_next_path, self.champion_path)
             champion_sha256 = _file_sha256(self.champion_path)
         state: dict[str, Any] = {
-            "schema_version": 5,
+            "schema_version": 6,
             "task_id": self.task_id,
             "baseline_mode": baseline_mode,
             "baseline_exclude": list(baseline_exclude),
@@ -917,7 +944,7 @@ class ResearchWorkspace:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
-        if state.get("schema_version") != 5:
+        if state.get("schema_version") != 6:
             raise ValueError("research workspace uses an incompatible Champion schema")
         self._strategy_path(state, strategy_path)
         if isinstance(state.get("pending_promotion"), dict):

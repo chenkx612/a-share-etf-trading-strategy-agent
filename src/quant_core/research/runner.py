@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from quant_core.research.contracts import ExperimentResult, ResearchTask
+from quant_core.research.environment import (
+    EvaluationEnvironment,
+    capture_evaluation_environment,
+)
 from quant_core.research.workspace import (
     ResearchWorkspace,
     copy_runtime_inputs,
@@ -1479,7 +1483,7 @@ def _write_failed(
     return result_path
 
 
-def run_once(
+def _run_once_impl(
     task_path: str | Path,
     experiment_id: str,
     output_dir: str | Path,
@@ -1841,6 +1845,46 @@ def run_once(
     return result_path
 
 
+def run_once(
+    task_path: str | Path,
+    experiment_id: str,
+    output_dir: str | Path,
+    *,
+    workspace: str | Path = ".",
+    gate_runtime: str | Path | None = None,
+    research_history: Sequence[Mapping[str, Any]] = (),
+    has_champion: bool | None = None,
+    parent_champion_sha256: str | None = None,
+    command_runner: CommandRunner = _run_command,
+    opencode_runner: AgentRunner | None = None,
+    event_sink: EventSink | None = None,
+    round_id: str | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    evaluation_environment: EvaluationEnvironment | None = None,
+) -> Path:
+    environment = evaluation_environment or capture_evaluation_environment()
+    result_path = _run_once_impl(
+        task_path,
+        experiment_id,
+        output_dir,
+        workspace=workspace,
+        gate_runtime=gate_runtime,
+        research_history=research_history,
+        has_champion=has_champion,
+        parent_champion_sha256=parent_champion_sha256,
+        command_runner=command_runner,
+        opencode_runner=opencode_runner,
+        event_sink=event_sink,
+        round_id=round_id,
+        monotonic=monotonic,
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["evaluation_environment_sha256"] = environment.sha256
+    ExperimentResult.from_mapping(result)
+    write_json_atomic(result_path, result)
+    return result_path
+
+
 def _evaluate_existing(
     task: ResearchTask,
     task_path: str | Path,
@@ -2046,6 +2090,7 @@ def run_managed_once(
     opencode_runner: AgentRunner | None = None,
     event_sink: EventSink | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    evaluation_environment: EvaluationEnvironment | None = None,
 ) -> Path:
     """Run one isolated candidate and promote it only when it beats the champion."""
     task_file = Path(task_path).resolve()
@@ -2061,11 +2106,13 @@ def run_managed_once(
         or round_id != f"{int(round_id):03d}"
     ):
         raise ValueError("round id must be a zero-padded positive number")
+    environment = evaluation_environment or capture_evaluation_environment()
     manager = ResearchWorkspace(
         source,
         managed_root,
         task.task_id,
         run_number=run_number,
+        evaluation_environment_sha256=environment.sha256,
     )
     candidate, experiment, state = manager.create_candidate(
         round_id,
@@ -2108,6 +2155,7 @@ def run_managed_once(
         event_sink=event_sink,
         round_id=round_id,
         monotonic=monotonic,
+        evaluation_environment=environment,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["experiment_id"] = f"{manager.run_id}/{round_id}"
