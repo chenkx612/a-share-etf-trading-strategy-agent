@@ -59,6 +59,15 @@ class AgentContainerInfrastructureError(RuntimeError):
     """Raised when the isolated Agent container cannot be started safely."""
 
 
+class CandidateBindPreflightError(AgentContainerInfrastructureError):
+    """Raised before a Round is allocated when Docker cannot see its worktree."""
+
+    def __init__(self, message: str, code: str, evidence_path: Path) -> None:
+        super().__init__(message)
+        self.code = code
+        self.evidence_path = evidence_path
+
+
 @dataclass(frozen=True)
 class InfrastructureFailure:
     code: str
@@ -693,6 +702,210 @@ def _is_retryable_bind_source_failure(
     return "bind source path does not exist" in detail
 
 
+def _bind_source_identity(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    try:
+        stat = resolved.stat()
+    except OSError as exc:
+        return {
+            "path": str(resolved),
+            "exists": False,
+            "error": str(exc),
+        }
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "mode": stat.st_mode,
+    }
+
+
+def probe_candidate_bind_source(
+    candidate: Path,
+    evidence_path: Path,
+    *,
+    event_sink: EventSink | None = None,
+    round_id: str | None = None,
+    timeout: float = 5.0,
+    process_runner: AgentRunner | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> Path:
+    """Prove Docker can read the exact candidate path without starting the Agent."""
+    if timeout <= 0:
+        raise ValueError("candidate bind probe timeout must be positive")
+    candidate = candidate.resolve()
+    evidence_path.mkdir(parents=True, exist_ok=False)
+    runner = process_runner or _run_prompt_process
+    started = monotonic()
+    delays = (0.0, 0.25, 0.5, 1.0, 2.0)
+    attempts: list[dict[str, Any]] = []
+    event_details = {"round": round_id} if round_id is not None else {}
+    _emit(
+        event_sink,
+        "bind_probe_started",
+        message="checking candidate Docker bind",
+        timeout_seconds=timeout,
+        **event_details,
+    )
+    initial_identity = _bind_source_identity(candidate)
+    failure_code = "candidate_bind_unavailable"
+    failure_message = "Docker could not bind the candidate workspace"
+
+    for attempt_number, delay in enumerate(delays, start=1):
+        elapsed = max(0.0, monotonic() - started)
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            break
+        if delay:
+            wait = min(delay, remaining)
+            sleeper(wait)
+            remaining = timeout - max(0.0, monotonic() - started)
+            if remaining <= 0:
+                break
+
+        before = _bind_source_identity(candidate)
+        if not before.get("exists"):
+            failure_code = "candidate_bind_source_missing"
+            failure_message = "Candidate bind source disappeared on the host"
+            attempts.append({
+                "attempt": attempt_number,
+                "delay_seconds": delay,
+                "host_before": before,
+                "exit_code": None,
+                "retryable": False,
+            })
+            break
+        if before != initial_identity:
+            failure_code = "candidate_bind_source_changed"
+            failure_message = "Candidate bind source identity changed before Docker could mount it"
+            attempts.append({
+                "attempt": attempt_number,
+                "delay_seconds": delay,
+                "host_before": before,
+                "exit_code": None,
+                "retryable": False,
+            })
+            break
+
+        container_name = f"quant-bind-probe-{uuid.uuid4().hex}"
+        log_path = evidence_path / f"attempt-{attempt_number:03d}.log"
+        command = [
+            "docker", "run", "--rm", "--name", container_name,
+            "--mount", (
+                f"type=bind,src={candidate},dst={_CONTAINER_WORKSPACE},readonly"
+            ),
+            os.environ.get("QUANT_RESEARCH_AGENT_IMAGE", _AGENT_CONTAINER_IMAGE),
+            "python3", "-c",
+            (
+                "from pathlib import Path; "
+                "assert Path('/workspace/.git').exists(), "
+                "'candidate worktree marker is not visible'"
+            ),
+        ]
+        exit_code = runner(
+            command,
+            "",
+            candidate,
+            log_path,
+            max(0.1, remaining),
+        )
+        removed = _remove_agent_container(container_name)
+        after = _bind_source_identity(candidate)
+        try:
+            detail = log_path.read_text(encoding="utf-8")
+        except OSError:
+            detail = ""
+        retryable = (
+            exit_code != 0
+            and removed
+            and after == initial_identity
+            and "bind source path does not exist" in detail.casefold()
+        )
+        attempt = {
+            "attempt": attempt_number,
+            "delay_seconds": delay,
+            "container_name": container_name,
+            "exit_code": exit_code,
+            "container_removed": removed,
+            "host_before": before,
+            "host_after": after,
+            "retryable": retryable,
+            "log": log_path.name if detail else None,
+        }
+        attempts.append(attempt)
+        _emit(
+            event_sink,
+            "bind_probe_attempt",
+            message=f"candidate bind probe attempt {attempt_number}",
+            attempt=attempt_number,
+            exit_code=exit_code,
+            retryable=retryable,
+            **event_details,
+        )
+        if exit_code == 0 and removed and after == initial_identity:
+            if not detail:
+                log_path.unlink(missing_ok=True)
+            summary = evidence_path / "summary.json"
+            write_json_atomic(summary, {
+                "status": "passed",
+                "timeout_seconds": timeout,
+                "candidate": str(candidate),
+                "initial_host_identity": initial_identity,
+                "attempts": attempts,
+            })
+            _emit(
+                event_sink,
+                "bind_probe_succeeded",
+                message="candidate Docker bind is visible",
+                attempts=len(attempts),
+                **event_details,
+            )
+            return summary
+        if not removed:
+            failure_code = "candidate_bind_probe_cleanup_failed"
+            failure_message = "Candidate bind probe container could not be removed safely"
+            break
+        if after.get("exists") is not True:
+            failure_code = "candidate_bind_source_missing"
+            failure_message = "Candidate bind source disappeared on the host"
+            break
+        if after != initial_identity:
+            failure_code = "candidate_bind_source_changed"
+            failure_message = "Candidate bind source identity changed during Docker probing"
+            break
+        if not retryable:
+            failure_code = "candidate_bind_probe_failed"
+            compact = " ".join(detail.split())
+            failure_message = compact[:2000] or f"Docker bind probe exited with code {exit_code}"
+            break
+
+    summary = evidence_path / "summary.json"
+    write_json_atomic(summary, {
+        "status": "failed",
+        "failure_code": failure_code,
+        "message": failure_message,
+        "timeout_seconds": timeout,
+        "candidate": str(candidate),
+        "initial_host_identity": initial_identity,
+        "attempts": attempts,
+    })
+    _emit(
+        event_sink,
+        "bind_probe_failed",
+        message="candidate Docker bind is unavailable",
+        attempts=len(attempts),
+        failure_code=failure_code,
+        **event_details,
+    )
+    raise CandidateBindPreflightError(
+        failure_message,
+        failure_code,
+        summary,
+    )
+
+
 def _run_opencode_container(
     command: Sequence[str],
     prompt: str,
@@ -749,6 +962,9 @@ def _run_opencode_container(
                 try:
                     for attempt in range(2):
                         container_name = f"quant-agent-{uuid.uuid4().hex}"
+                        attempt_log = log_path.with_name(
+                            f"{log_path.stem}.attempt-{attempt + 1:03d}{log_path.suffix}"
+                        )
                         container_command = _docker_opencode_command(
                             container_command_parts,
                             cwd,
@@ -764,7 +980,7 @@ def _run_opencode_container(
                                 container_command,
                                 container_input,
                                 cwd,
-                                log_path,
+                                attempt_log,
                                 max(
                                     0.1,
                                     float(timeout) - (time.monotonic() - session_started),
@@ -774,17 +990,22 @@ def _run_opencode_container(
                             removed = _remove_agent_container(container_name)
                             container_stopped = removed
                         if not removed:
-                            with log_path.open("a", encoding="utf-8") as log:
+                            with attempt_log.open("a", encoding="utf-8") as log:
                                 log.write("\nFailed to remove Agent container")
                             exit_code = 127
+                            attempt_log.replace(log_path)
                             break
                         if attempt == 0 and _is_retryable_bind_source_failure(
                             exit_code,
-                            log_path,
+                            attempt_log,
                             container_command,
                         ):
                             time.sleep(0.25)
                             continue
+                        if attempt_log.exists():
+                            attempt_log.replace(log_path)
+                        else:
+                            log_path.write_text("", encoding="utf-8")
                         break
                 except KeyboardInterrupt:
                     interrupted = True
@@ -2091,6 +2312,7 @@ def run_managed_once(
     event_sink: EventSink | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     evaluation_environment: EvaluationEnvironment | None = None,
+    prepared_candidate: tuple[Path, Path, dict[str, Any]] | None = None,
 ) -> Path:
     """Run one isolated candidate and promote it only when it beats the champion."""
     task_file = Path(task_path).resolve()
@@ -2114,13 +2336,22 @@ def run_managed_once(
         run_number=run_number,
         evaluation_environment_sha256=environment.sha256,
     )
-    candidate, experiment, state = manager.create_candidate(
-        round_id,
-        date.fromisoformat(development_end),
-        task.baseline_mode,
-        task.baseline_exclude,
-        task.strategy_path,
-    )
+    if prepared_candidate is None:
+        candidate, experiment, state = manager.create_candidate(
+            round_id,
+            date.fromisoformat(development_end),
+            task.baseline_mode,
+            task.baseline_exclude,
+            task.strategy_path,
+        )
+    else:
+        candidate, experiment, state = prepared_candidate
+        if candidate.resolve() != (manager.candidates / round_id).resolve():
+            raise ValueError("prepared candidate path does not match the requested Round")
+        if experiment.resolve() != (manager.rounds / round_id).resolve():
+            raise ValueError("prepared experiment path does not match the requested Round")
+        if not candidate.is_dir() or not experiment.is_dir():
+            raise FileNotFoundError("prepared candidate Round is incomplete")
     has_champion = isinstance(state.get("champion_sha256"), str)
     metrics_key = _metrics_key(task)
     evaluator_contract_sha256 = evaluator_contract_sha256_for_commit(

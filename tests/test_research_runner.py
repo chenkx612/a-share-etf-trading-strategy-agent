@@ -16,6 +16,7 @@ from quant_core.research import ResearchTask, run_once
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
+    CandidateBindPreflightError,
     _agent_read_only_paths,
     _docker_opencode_command,
     _metrics_key,
@@ -26,6 +27,7 @@ from quant_core.research.runner import (
     _workspace_env,
     preflight_agent_container,
     preflight_provider_authentication,
+    probe_candidate_bind_source,
 )
 
 
@@ -623,9 +625,160 @@ def test_container_runner_retries_daemon_missing_bind_source_once(
     assert exit_code == 0
     assert len(invocations) == 2
     assert len(removed) == 2
+    assert (tmp_path / "agent.attempt-001.log").is_file()
+    assert (tmp_path / "agent.log").is_file()
     first_name = invocations[0][invocations[0].index("--name") + 1]
     second_name = invocations[1][invocations[1].index("--name") + 1]
     assert first_name != second_name
+
+
+def test_candidate_bind_probe_retries_with_independent_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    invocations: list[Sequence[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def process(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        invocations.append(command)
+        if len(invocations) == 1:
+            log_path.write_text(
+                "docker: Error response from daemon: "
+                "bind source path does not exist",
+                encoding="utf-8",
+            )
+            return 125
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+    summary_path = probe_candidate_bind_source(
+        candidate,
+        tmp_path / "evidence",
+        process_runner=process,
+        sleeper=lambda seconds: None,
+        event_sink=lambda event, **details: events.append((event, details)),
+        round_id="002",
+    )
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["status"] == "passed"
+    assert len(summary["attempts"]) == 2
+    assert (summary_path.parent / "attempt-001.log").is_file()
+    assert not (summary_path.parent / "attempt-002.log").exists()
+    assert [event for event, _details in events] == [
+        "bind_probe_started",
+        "bind_probe_attempt",
+        "bind_probe_attempt",
+        "bind_probe_succeeded",
+    ]
+    first_name = invocations[0][invocations[0].index("--name") + 1]
+    second_name = invocations[1][invocations[1].index("--name") + 1]
+    assert first_name != second_name
+
+
+def test_candidate_bind_probe_fails_after_bounded_retries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    invocations = 0
+
+    def unavailable(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        nonlocal invocations
+        invocations += 1
+        log_path.write_text(
+            "docker: Error response from daemon: bind source path does not exist",
+            encoding="utf-8",
+        )
+        return 125
+
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+    with pytest.raises(CandidateBindPreflightError) as raised:
+        probe_candidate_bind_source(
+            candidate,
+            tmp_path / "evidence",
+            process_runner=unavailable,
+            sleeper=lambda seconds: None,
+        )
+
+    assert raised.value.code == "candidate_bind_unavailable"
+    assert invocations == 5
+    summary = json.loads(raised.value.evidence_path.read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert len(summary["attempts"]) == 5
+    assert len(list(raised.value.evidence_path.parent.glob("attempt-*.log"))) == 5
+
+
+def test_candidate_bind_probe_stops_when_host_source_disappears(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    invocations = 0
+
+    def disappear(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        nonlocal invocations
+        invocations += 1
+        candidate.rmdir()
+        log_path.write_text(
+            "docker: Error response from daemon: bind source path does not exist",
+            encoding="utf-8",
+        )
+        return 125
+
+    monkeypatch.setattr(research_runner, "_remove_agent_container", lambda name: True)
+    with pytest.raises(CandidateBindPreflightError) as raised:
+        probe_candidate_bind_source(
+            candidate,
+            tmp_path / "evidence",
+            process_runner=disappear,
+            sleeper=lambda seconds: None,
+        )
+
+    assert raised.value.code == "candidate_bind_source_missing"
+    assert invocations == 1
+
+
+@pytest.mark.skipif(
+    os.environ.get("QUANT_TEST_AGENT_CONTAINER") != "1",
+    reason="set QUANT_TEST_AGENT_CONTAINER=1 after building the research Agent image",
+)
+def test_candidate_bind_probe_uses_real_agent_container(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / ".git").write_text("gitdir: /tmp/not-used\n", encoding="utf-8")
+
+    summary_path = probe_candidate_bind_source(
+        candidate,
+        tmp_path / "evidence",
+    )
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["status"] == "passed"
+    assert len(summary["attempts"]) == 1
 
 
 def test_container_runner_does_not_retry_when_bind_source_is_locally_missing(

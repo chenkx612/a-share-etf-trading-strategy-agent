@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import time
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timezone
@@ -18,9 +19,11 @@ from quant_core.research.environment import (
 from quant_core.research.report import generate_loop_report
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
+    CandidateBindPreflightError,
     _metrics_key,
     preflight_agent_container,
     preflight_provider_authentication,
+    probe_candidate_bind_source,
     run_managed_once,
     target_reached,
 )
@@ -425,6 +428,68 @@ def run_loop(
         round_ids = state.get("round_ids")
         reserved = round_ids if isinstance(round_ids, list) else []
         round_id = _next_round_id(manager.rounds, reserved)
+        prepared_candidate: tuple[Path, Path, dict[str, Any]] | None = None
+        if managed_runner is run_managed_once:
+            candidate: Path | None = None
+            probe_root = manager.run_temp / "bind-probes" / round_id
+            try:
+                candidate, candidate_state = manager.prepare_candidate(
+                    round_id,
+                    date.fromisoformat(development_end),
+                    task.baseline_mode,
+                    task.baseline_exclude,
+                    task.strategy_path,
+                )
+                probe_candidate_bind_source(
+                    candidate,
+                    probe_root,
+                    event_sink=manager.emit_event,
+                    round_id=round_id,
+                )
+                experiment = manager.activate_candidate(candidate, round_id)
+                probe_evidence = experiment / "bind-probe"
+                probe_evidence.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(probe_root), str(probe_evidence))
+                prepared_candidate = (candidate, experiment, candidate_state)
+            except CandidateBindPreflightError as exc:
+                if candidate is not None and candidate.exists():
+                    manager.discard_prepared_candidate(candidate)
+                diagnostic = manager.run_root / "diagnostics" / f"bind-probe-{round_id}"
+                diagnostic.parent.mkdir(parents=True, exist_ok=True)
+                source = exc.evidence_path.parent
+                if source.exists():
+                    shutil.move(str(source), str(diagnostic))
+                state["preflight_failure"] = {
+                    "failure_kind": "infrastructure",
+                    "failure_code": exc.code,
+                    "message": str(exc),
+                    "evidence_path": diagnostic.relative_to(manager.run_root).as_posix(),
+                }
+                _save(loop_state_path, state)
+                return _finish_with_report(
+                    task_file,
+                    manager,
+                    loop_state_path,
+                    state,
+                    "infrastructure_failure",
+                    reporter,
+                )
+            except KeyboardInterrupt:
+                if candidate is not None and candidate.exists():
+                    manager.discard_prepared_candidate(candidate)
+                state["status"] = "interrupted"
+                state["stop_reason"] = "interrupted"
+                manager.cleanup_transient(preserve_worktree_parents=True)
+                manager.emit_event(
+                    "run_interrupted",
+                    message="interrupted before Round allocation",
+                )
+                _save(loop_state_path, state)
+                return loop_state_path
+            except Exception:
+                if candidate is not None and candidate.exists():
+                    manager.discard_prepared_candidate(candidate)
+                raise
         state["current_round"] = round_id
         _save(loop_state_path, state)
         manager.emit_event("round_started", round=round_id, message="candidate started")
@@ -438,12 +503,13 @@ def run_loop(
             }
             if managed_runner is run_managed_once:
                 runner_options["evaluation_environment"] = environment
+                runner_options["prepared_candidate"] = prepared_candidate
             result_path = managed_runner(task_file, round_id, **runner_options)
         except KeyboardInterrupt:
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"
             state["stop_reason"] = "interrupted"
-            manager.cleanup_transient()
+            manager.cleanup_transient(preserve_worktree_parents=True)
             manager.emit_event("run_interrupted", round=round_id, message="interrupted")
             _save(loop_state_path, state)
             return loop_state_path
@@ -451,7 +517,7 @@ def run_loop(
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"
             state["stop_reason"] = "runner_error"
-            manager.cleanup_transient()
+            manager.cleanup_transient(preserve_worktree_parents=True)
             manager.emit_event("runner_error", round=round_id, message="runner error")
             _save(loop_state_path, state)
             raise

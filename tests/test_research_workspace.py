@@ -474,6 +474,51 @@ def test_candidate_parent_remains_stable_between_rounds(tmp_path: Path) -> None:
     manager.reject(second, state, "001/002")
 
 
+def test_interruption_cleanup_preserves_candidate_parent_inode(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "stable-recovery")
+    manager = base.for_run(1)
+
+    first, _experiment, _state = manager.create_candidate(
+        "001",
+        strategy_path="strategy.py",
+    )
+    parent_inode = manager.candidates.stat().st_ino
+
+    manager.cleanup_transient(preserve_worktree_parents=True)
+
+    assert not first.exists()
+    assert manager.candidates.stat().st_ino == parent_inode
+    second, _state = manager.prepare_candidate(
+        "002",
+        strategy_path="strategy.py",
+    )
+    assert manager.candidates.stat().st_ino == parent_inode
+    manager.discard_prepared_candidate(second)
+
+
+def test_prepare_candidate_reclaims_orphaned_preallocation_worktree(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "probe-recovery")
+    manager = base.for_run(1)
+
+    orphan, _state = manager.prepare_candidate("001", strategy_path="strategy.py")
+    (orphan / "orphaned-probe.txt").write_text("interrupted", encoding="utf-8")
+    parent_inode = manager.candidates.stat().st_ino
+
+    recovered, _state = manager.prepare_candidate("001", strategy_path="strategy.py")
+
+    assert recovered == orphan
+    assert recovered.is_dir()
+    assert not (recovered / "orphaned-probe.txt").exists()
+    assert manager.candidates.stat().st_ino == parent_inode
+    manager.discard_prepared_candidate(recovered)
+
+
 @pytest.mark.skipif(
     os.environ.get("QUANT_TEST_AGENT_CONTAINER") != "1",
     reason="set QUANT_TEST_AGENT_CONTAINER=1 after building the research Agent image",
@@ -483,7 +528,12 @@ def test_consecutive_candidate_worktrees_mount_in_real_agent_container(
 ) -> None:
     _init_repo(tmp_path)
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
-    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "docker-stable-parent")
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "docker-stable-parent",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
     manager = base.for_run(1)
     parent_inode: int | None = None
 
@@ -530,6 +580,8 @@ def test_consecutive_candidate_worktrees_mount_in_real_agent_container(
                     strategy_path="strategy.py",
                 ),
             )
+            manager.cleanup_transient(preserve_worktree_parents=True)
+            assert manager.candidates.stat().st_ino == parent_inode
         else:
             manager.reject(candidate, state, f"001/{round_id}")
 

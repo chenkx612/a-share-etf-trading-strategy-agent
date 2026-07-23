@@ -8,10 +8,16 @@ from pathlib import Path
 
 import pytest
 
+import quant_core.research.loop as research_loop
 from quant_core.research import run_loop
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.environment import EvaluationEnvironment
-from quant_core.research.runner import AgentContainerInfrastructureError, _metrics_key
+from quant_core.research.runner import (
+    AgentContainerInfrastructureError,
+    CandidateBindPreflightError,
+    _metrics_key,
+    run_managed_once,
+)
 from quant_core.research.workspace import ResearchWorkspace
 
 
@@ -271,6 +277,50 @@ def test_provider_preflight_stops_before_allocating_next_round(tmp_path: Path) -
     assert state["rounds_completed"] == 1
     assert state["round_ids"] == ["001"]
     assert not (state_path.parent / "rounds/002").exists()
+
+
+def test_candidate_bind_preflight_failure_does_not_allocate_a_round(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task = _task(tmp_path)
+
+    def fail_bind(candidate: Path, evidence_path: Path, **kwargs) -> Path:
+        evidence_path.mkdir(parents=True)
+        summary = evidence_path / "summary.json"
+        summary.write_text(
+            json.dumps({
+                "status": "failed",
+                "failure_code": "candidate_bind_unavailable",
+            }),
+            encoding="utf-8",
+        )
+        raise CandidateBindPreflightError(
+            "Docker could not bind the candidate workspace",
+            "candidate_bind_unavailable",
+            summary,
+        )
+
+    monkeypatch.setattr(research_loop, "probe_candidate_bind_source", fail_bind)
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=run_managed_once,
+        reporter=_reporter,
+        container_preflight=lambda task, root: None,
+        provider_preflight=lambda task, root: None,
+        environment_probe=lambda: ENVIRONMENT,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["rounds_completed"] == 0
+    assert state["round_ids"] == []
+    assert state["current_round"] is None
+    assert state["preflight_failure"]["failure_code"] == "candidate_bind_unavailable"
+    diagnostic = state_path.parent / state["preflight_failure"]["evidence_path"]
+    assert (diagnostic / "summary.json").is_file()
+    assert not (state_path.parent / "rounds/001").exists()
 
 
 def test_infrastructure_failure_stops_after_one_round(tmp_path: Path) -> None:
@@ -818,9 +868,12 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
     )
     interrupted = json.loads(interrupted_path.read_text(encoding="utf-8"))
     assert interrupted["status"] == "interrupted"
-    assert not (
-        tmp_path / ".research/loop-test/.tmp/worktrees/001/candidates/001"
-    ).exists()
+    candidates = (
+        tmp_path / ".research/loop-test/.tmp/worktrees/001/candidates"
+    )
+    assert not (candidates / "001").exists()
+    assert candidates.is_dir()
+    parent_inode = candidates.stat().st_ino
 
     resumed_path = run_loop(
         task,
@@ -832,6 +885,7 @@ def test_interrupted_loop_is_resumed_on_the_next_invocation(tmp_path: Path) -> N
     resumed = json.loads(resumed_path.read_text(encoding="utf-8"))
     assert resumed["stop_reason"] == "max_consecutive_failures"
     assert resumed["rounds_completed"] == 1
+    assert parent_inode > 0
 
 
 def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path) -> None:

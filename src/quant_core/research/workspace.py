@@ -714,7 +714,12 @@ class ResearchWorkspace:
         if source != self.state_path:
             source.unlink()
 
-    def cleanup_transient(self, *, remove_development_cache: bool = False) -> None:
+    def cleanup_transient(
+        self,
+        *,
+        remove_development_cache: bool = False,
+        preserve_worktree_parents: bool = False,
+    ) -> None:
         """Remove disposable worktrees and optionally the derived development cache."""
         self._migrate_transient_layout()
         if self.run_number is None:
@@ -733,18 +738,28 @@ class ResearchWorkspace:
                         pass
             shutil.rmtree(self.root / ".tmp" / "runs", ignore_errors=True)
         else:
-            self._cleanup_worktrees(self.candidates)
-            self._cleanup_worktrees(self.evaluators)
+            self._cleanup_worktrees(
+                self.candidates,
+                remove_root=not preserve_worktree_parents,
+            )
+            self._cleanup_worktrees(
+                self.evaluators,
+                remove_root=not preserve_worktree_parents,
+            )
             shutil.rmtree(self.run_temp, ignore_errors=True)
         if remove_development_cache:
             shutil.rmtree(self.development_runtime, ignore_errors=True)
-        for path in (
-            self.root / ".tmp" / "worktrees",
+        removable = [
             self.root / ".tmp" / "runs",
-            self.root / ".tmp",
             self.runtime,
             self.root / ".cache",
-        ):
+        ]
+        if not preserve_worktree_parents:
+            removable.extend([
+                self.root / ".tmp" / "worktrees",
+                self.root / ".tmp",
+            ])
+        for path in removable:
             try:
                 path.rmdir()
             except OSError:
@@ -810,6 +825,10 @@ class ResearchWorkspace:
                         remove(experiment / name)
                 if result.get("status") == "completed" or had_agent_output:
                     remove(experiment / "opencode-events.jsonl")
+                    for attempt_log in experiment.glob(
+                        "opencode-events.attempt-*.jsonl"
+                    ):
+                        remove(attempt_log)
 
         report_roots = (
             [self]
@@ -959,14 +978,14 @@ class ResearchWorkspace:
                 raise ValueError("Champion strategy hash does not match champion.json")
         return state
 
-    def create_candidate(
+    def prepare_candidate(
         self,
         round_id: str,
         development_end: date | None = None,
         baseline_mode: str = "workspace",
         baseline_exclude: Sequence[str] = (),
         strategy_path: str | None = None,
-    ) -> tuple[Path, Path, dict[str, Any]]:
+    ) -> tuple[Path, dict[str, Any]]:
         if (
             not round_id.isdigit()
             or int(round_id) < 1
@@ -979,9 +998,9 @@ class ResearchWorkspace:
             baseline_exclude,
             strategy_path,
         )
-        # Keep the per-Run parent stable between rounds. Docker Desktop can
-        # briefly lose newly recreated bind paths when this directory is
-        # removed immediately before the next candidate is mounted.
+        # Keep the per-Run parent stable between rounds.  Removing only child
+        # worktrees also recovers a candidate left by an uncatchable interrupt
+        # during the pre-allocation bind probe, before it has any Round state.
         self._cleanup_worktrees(self.candidates, remove_root=False)
         candidate = self.candidates / round_id
         experiment = self.rounds / round_id
@@ -999,7 +1018,35 @@ class ResearchWorkspace:
         )
         self._add_worktree(candidate, base_commit)
         copy_runtime_inputs(self.development_runtime, candidate)
+        return candidate, state
+
+    def activate_candidate(self, candidate: Path, round_id: str) -> Path:
+        expected = self.candidates / round_id
+        if candidate.resolve() != expected.resolve() or not candidate.is_dir():
+            raise ValueError("prepared candidate does not match the requested Round")
+        experiment = self.rounds / round_id
         experiment.mkdir(parents=True)
+        return experiment
+
+    def discard_prepared_candidate(self, candidate: Path) -> None:
+        self._remove_worktree(candidate)
+
+    def create_candidate(
+        self,
+        round_id: str,
+        development_end: date | None = None,
+        baseline_mode: str = "workspace",
+        baseline_exclude: Sequence[str] = (),
+        strategy_path: str | None = None,
+    ) -> tuple[Path, Path, dict[str, Any]]:
+        candidate, state = self.prepare_candidate(
+            round_id,
+            development_end,
+            baseline_mode,
+            baseline_exclude,
+            strategy_path,
+        )
+        experiment = self.activate_candidate(candidate, round_id)
         return candidate, experiment, state
 
     def create_champion_evaluator(self, round_id: str, state: Mapping[str, Any]) -> Path:

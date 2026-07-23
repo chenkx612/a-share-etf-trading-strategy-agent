@@ -153,6 +153,8 @@ OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Ro
 Research Root 被遮蔽、OpenCode runtime 文件可见且任务配置的模型存在。预检失败不会创建
 Run 或消耗 Round。Harness 还会在 Run 和后续 Round 分配前发起无工具的轻量 Provider 认证请求；
 明确的认证或 refresh token 故障会标记为 `infrastructure` 并立即停止，不会连续重试至耗尽预算。
+每个真实候选 worktree 在分配 Round 和启动 Agent 前还会执行只读 bind 可见性探针；Docker Desktop
+瞬态不可见会在固定 5 秒内有界退避，持续故障保留 Run 级诊断并停止，但不消耗候选研究轮次。
 
 镜像只包含 OpenCode、基础工具和 `pyproject.toml` 声明的 Python 依赖，不包含项目源码。
 候选代码始终来自当前 worktree 挂载；因此普通源码修改和每轮 Loop 都不需要重新构建镜像，

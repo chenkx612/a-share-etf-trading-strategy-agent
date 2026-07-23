@@ -186,6 +186,8 @@ def _report_prompt(payload: Mapping[str, Any]) -> str:
         "开发集和 gate 的结果必须明确区分；失败或中断轮次也必须如实说明。",
         "如果 loop.integrity_warnings 非空，必须在总览中明确标为 Harness 状态一致性问题；"
         "不得为缺失的轮次或工件虚构研究内容。",
+        "如果 loop.preflight_failure 非空，必须在总览和遗留风险中说明该 Run 在分配下一 Round 前"
+        "因基础设施预检失败停止；不得把它计作候选失败。",
         "接受或拒绝原因必须以 decision_objective、decision_constraints 和 decision_reasons "
         "为准；特别要准确说明当时 champion 是否可行、是否要求相对目标改善。",
         "如果 champion.metrics_status 是 stale，仍可展示历史指标，但必须明确其适用性已过期，"
@@ -255,6 +257,7 @@ def generate_loop_report(
     loop_payload["evaluation_environment_sha256"] = loop_state.get(
         "evaluation_environment_sha256"
     )
+    loop_payload["preflight_failure"] = loop_state.get("preflight_failure")
     payload = {
         "task": {
             "id": task.task_id,

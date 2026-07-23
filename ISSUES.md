@@ -29,36 +29,16 @@
 
 ## 当前结论
 
-当前没有开放 P0。启动新 Loop Run 前仍需评估以下 P1/P2 遗留问题：
+当前没有开放 P0/P1。启动新 Loop Run 前仍需评估以下 P2 遗留问题：
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 恢复 Run 后 Docker bind source 不可见可持续超过一次重试 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | Harness 风险登记文件名在仓库说明中不一致 |
 
 ## 一、待解决问题
-
-### P1：重要可靠性问题
-
-#### 恢复 Run 后 Docker bind source 不可见可持续超过一次重试
-
-- **问题**：真实 Run `002` 从中断状态恢复后创建 Round `002`，宿主 Harness 已进入
-  `agent_started`，但 Docker Desktop daemon 报候选 worktree 的 bind source 不存在。现有逻辑在
-  宿主所有 bind source 存在时用新容器名安全重试一次，本次仍在约 0.43 秒内以
-  `infrastructure/container_runtime` 失败并熔断；说明已解决条目中面向“晋级后瞬态不可见”的
-  单次重试没有覆盖恢复路径或持续性 daemon 可见性故障。
-- **方案**：在启动 Agent 前对本轮真实候选路径执行无副作用的 bind 可见性探针，并记录每次尝试、
-  宿主 `stat` 结果和 Docker 错误，不要让重试日志互相覆盖。保持活动 Run 的父目录 inode 稳定，
-  查明中断清理与恢复创建是否仍会重建 daemon 观察的路径；只在 Agent 尚未启动且宿主路径身份未变时
-  采用有界退避重试，持续不可见则在消耗研究轮次前按预检基础设施故障停止。
-- **验证**：真实 Docker Desktop 测试覆盖“中断 Round 后恢复下一 Round”、连续不可见超过一次、
-  首次失败后恢复以及宿主路径真实缺失；确认恢复成功时 Agent 只执行一次，持续故障不分配研究轮次，
-  且每次探针和重试均有独立证据。
-- **风险**：修复前即使 Run 前通用容器预检通过，真实候选 worktree 仍可能在 Round 启动时不可挂载，
-  并立即熔断整个 Run。
 
 ### P2：有时间时优化
 
@@ -236,6 +216,23 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **验证**：测试覆盖父目录稳定性、瞬态单次重试和真实缺失不重试；真实容器连续挂载五轮通过。
 - **风险**：Docker daemon 持续不可用或 bind source 在宿主机真实消失仍按
   `infrastructure_failure` 熔断；重试条件必须保证 Agent 尚未启动，避免重复产生候选副作用。
+
+#### 恢复 Run 后 Docker bind source 不可见可持续超过一次重试
+
+- **问题**：中断清理会删除活动 Run 的 candidates 父目录；恢复时虽然宿主已重建真实候选 worktree，
+  Docker Desktop daemon 仍可能持续报告 bind source 不存在。原有固定等待 0.25 秒的单次重试会覆盖
+  首次日志，并在 Agent 启动事件和 Round 分配之后才失败。
+- **解决**：候选生命周期拆成暂存、真实路径 bind 探针和正式激活。探针不启动 OpenCode，以只读方式
+  挂载候选路径，在固定 5 秒内最多尝试五次并采用 0.25、0.5、1、2 秒退避；每次记录独立日志、容器名
+  以及探针前后的宿主 device/inode。只有 Docker 明确报告 source 不存在且路径身份稳定时才重试。
+  中断清理保留活动 Run 的父目录 inode；持续不可见、宿主路径缺失或身份变化会在分配 Round 前生成
+  Run 级 `preflight_failure` 和耐久诊断并按基础设施故障停止。Agent 启动阶段的最后防线也改用独立
+  attempt 日志，避免覆盖首次证据。
+- **验证**：确定性测试覆盖首次失败后恢复、连续五次不可见、宿主路径消失、失败不分配 Round、独立
+  证据和中断清理后的 inode 稳定。真实 Docker Desktop 测试通过新探针，并覆盖中断式清理后连续五轮
+  候选挂载；Conda `quant` 全量测试 `229 passed, 3 skipped`。
+- **风险**：持续超过 5 秒的 daemon 可见性故障仍会停止 Run，但不会消耗候选研究轮次；固定预算避免
+  Docker Desktop 故障无限阻塞 Harness。
 
 #### Run 边界及状态—工件一致性必须由 Harness 强制
 
