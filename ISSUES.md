@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 终局报告 Prompt 通过 argv 传递会超过系统上限 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -41,25 +40,6 @@
 | P2 | Evaluator 指纹计算依赖可写 Git 对象库 |
 
 ## 一、待解决问题
-
-### P1：推荐优先解决
-
-#### 终局报告 Prompt 通过 argv 传递会超过系统上限
-
-- **问题**：报告输入包含逐折 Development/Gate 记录，Run 003 的冻结
-  `report-input.json` 为 258,525 字节。`_run_opencode_container()` 将完整报告 Prompt 追加为
-  `opencode run` 的位置参数，再作为 `docker run ...` 的 argv 启动，最终失败为
-  `exec /sbin/docker-init: argument list too long`。Loop 的三轮 Result/Decision 和 Champion 均已
-  耐久落盘，但 `report_status = failed`、`report_path = null`；错误又只记为通用 exit 255，
-  `report_failure_kind` 和 `report_failure_code` 均为空。
-- **方案**：不要把大型 Prompt 放入 Docker/OpenCode argv。通过容器内只读输入文件、stdin 或
-  OpenCode 支持的文件消息接口传递，并为报告输入设置启动前字节预算与确定性摘要层；冻结的完整
-  `report-input.json` 继续作为审计来源。将 `E2BIG`/`argument list too long` 分类为明确的本地
-  invocation infrastructure failure，便于无需重新认证地修复后重试。
-- **验证**：用超过宿主 `ARG_MAX`、包含多轮逐折记录的报告 payload 生成报告，确认容器能启动且
-  模型读取内容与冻结输入一致；覆盖空格、Unicode、大 JSON、超时与重试，并断言失败分类字段完整。
-- **风险**：中。报告失败不改变晋级结论，但缺少终局复盘工件；直接截断 Prompt 会丢失审计事实，
-  因此不能把无界裁剪当作修复。
 
 ### P2：有时间时优化
 
@@ -124,6 +104,22 @@
 
 本节只保留会影响信任边界、评测语义、恢复一致性或长时间运行可靠性的经验。一次性的字段遗漏、
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
+
+### P1：曾影响终局复盘完整性
+
+#### 终局报告大型输入不得通过 argv 传递
+
+- **问题**：逐折 Development/Gate 记录令 Run 003 的冻结 `report-input.json` 达到 258,525
+  字节；旧实现把完整 Prompt 作为 `opencode run` 的单个位置参数嵌入 `docker run`，容器 init
+  因参数过长退出 255，且 Loop state 没有记录结构化失败类型。
+- **解决**：完整冻结输入改由 OpenCode `--file /workspace/report-input.json` 附加，并在报告
+  容器中对该文件使用只读覆盖挂载；argv 只保留有 64 KiB 启动前预算的固定报告指令和小型 Champion
+  指标适用性覆盖。`E2BIG` 与 `argument list too long` 统一分类为
+  `infrastructure/invocation_argument_too_long`，报告重试仍逐字节复用原冻结输入。
+- **验证**：回归测试使用超过宿主 `ARG_MAX`、包含空格和 Unicode 的输入，确认完整字节只进入附件、
+  不进入任何 argv 元素；同时覆盖只读挂载、冻结输入重试和 Loop state 失败分类。
+- **风险**：附件大小不再受操作系统 argv 限制，但仍可能在未来触及模型上下文上限；若出现实际证据，
+  应另行设计确定性摘要工件，不能静默截断审计输入。
 
 ### P0：曾阻断可信研发
 

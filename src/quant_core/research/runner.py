@@ -1063,6 +1063,11 @@ def _infrastructure_failure(log_path: Path) -> InfrastructureFailure | None:
     except OSError:
         return None
     folded = detail.casefold()
+    if "argument list too long" in folded or "e2big" in folded:
+        return InfrastructureFailure(
+            "invocation_argument_too_long",
+            "Local process invocation exceeded the operating system argument limit",
+        )
     authentication_markers = (
         "invalid_grant",
         "token refresh failed",
@@ -1281,6 +1286,24 @@ def _run_opencode_read_only(
         cwd,
         log_path,
         timeout,
+        permissions=_NO_TOOL_PERMISSIONS,
+    )
+
+
+def _run_opencode_report_read_only(
+    command: Sequence[str],
+    prompt: str,
+    cwd: Path,
+    log_path: Path,
+    timeout: int,
+) -> int:
+    return _run_opencode_container(
+        command,
+        prompt,
+        cwd,
+        log_path,
+        timeout,
+        read_only_paths=(cwd / "report-input.json",),
         permissions=_NO_TOOL_PERMISSIONS,
     )
 

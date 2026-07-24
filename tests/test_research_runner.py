@@ -604,6 +604,41 @@ def test_container_runner_removes_container_after_timeout(
     assert invocations[0][1] == ""
 
 
+def test_report_container_runner_mounts_frozen_input_read_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    report_input = tmp_path / "report-input.json"
+    report_input.write_text('{"rounds": []}', encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def capture_container(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+        **kwargs,
+    ) -> int:
+        captured["read_only_paths"] = kwargs["read_only_paths"]
+        captured["permissions"] = kwargs["permissions"]
+        return 0
+
+    monkeypatch.setattr(research_runner, "_run_opencode_container", capture_container)
+
+    exit_code = research_runner._run_opencode_report_read_only(
+        ["opencode", "run", "--file", "/workspace/report-input.json"],
+        "short instructions",
+        tmp_path,
+        tmp_path / "report.log",
+        10,
+    )
+
+    assert exit_code == 0
+    assert captured["read_only_paths"] == (report_input,)
+    assert captured["permissions"] == research_runner._NO_TOOL_PERMISSIONS
+
+
 def test_container_runner_retries_daemon_missing_bind_source_once(
     tmp_path: Path,
     monkeypatch,

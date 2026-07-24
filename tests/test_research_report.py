@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 from datetime import date
@@ -9,6 +11,7 @@ from typing import Sequence
 
 import pytest
 
+import quant_core.research.report as research_report
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.report import generate_loop_report, regenerate_loop_report
 from quant_core.research.runner import _metrics_key
@@ -188,24 +191,27 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
 
     prompt = str(captured["prompt"])
     command = list(captured["command"])
-    assert "Use a faster risk filter" in prompt
-    assert "Historical hypothesis from an earlier loop" not in prompt
-    assert '"decision": "accepted"' in prompt
-    assert '"relative_improvement_required": false' in prompt
-    assert '"source_round": "001/001"' in prompt
-    assert '"strategy_source_round": "001/001"' in prompt
-    assert '"metrics_source_round": "001/001"' in prompt
-    assert '"metrics_status": "valid"' in prompt
-    assert '"sortino": 1.2' in prompt
-    assert '"integrity_warnings": []' in prompt
-    assert "PARAMETER = 1" in prompt
+    report_input = manager.run_root / "report-input.json"
+    attached = report_input.read_text(encoding="utf-8")
+    assert "Use a faster risk filter" in attached
+    assert "Historical hypothesis from an earlier loop" not in attached
+    assert '"decision": "accepted"' in attached
+    assert '"relative_improvement_required": false' in attached
+    assert '"source_round": "001/001"' in attached
+    assert '"strategy_source_round": "001/001"' in attached
+    assert '"metrics_source_round": "001/001"' in attached
+    assert '"metrics_status": "valid"' in attached
+    assert '"sortino": 1.2' in attached
+    assert '"integrity_warnings": []' in attached
+    assert "PARAMETER = 1" in attached
+    assert "Use a faster risk filter" not in prompt
+    assert command[command.index("--file") + 1] == "/workspace/report-input.json"
     assert command[command.index("--model") + 1] == "xai/grok-4.5"
     assert command[command.index("--variant") + 1] == "high"
     assert captured["cwd"] == manager.run_root
     assert captured["timeout"] == 600
     assert report_path.read_text(encoding="utf-8").startswith("# Research Loop 总结")
     assert not (manager.run_root / "report-events.jsonl").exists()
-    report_input = manager.run_root / "report-input.json"
     frozen_input = report_input.read_bytes()
 
     loop_state_path = manager.loop_state_path
@@ -238,6 +244,21 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert '"evaluator_contract_sha256_changed"' in str(captured["prompt"])
     assert "updated_at" in saved_state
     assert not base.runtime.exists()
+
+    newer_state = json.loads(base.state_path.read_text(encoding="utf-8"))
+    newer_source = "PARAMETER = 2\n"
+    base.champion_path.write_text(newer_source, encoding="utf-8")
+    newer_state["champion_sha256"] = hashlib.sha256(
+        newer_source.encode("utf-8")
+    ).hexdigest()
+    write_json_atomic(base.state_path, newer_state)
+    regenerate_loop_report(
+        task_path,
+        workspace=tmp_path,
+        agent_runner=fake_agent,
+    )
+    assert "以下 Champion 指标适用性状态" not in str(captured["prompt"])
+    assert report_input.read_bytes() == frozen_input
 
 
 def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> None:
@@ -363,6 +384,31 @@ def test_report_authentication_failure_is_retryable_with_frozen_input(
     assert recovered_state["report_failure_kind"] is None
     assert recovered_state["report_failure_code"] is None
 
+    def argument_too_long(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        log_path.write_text(
+            "exec /sbin/docker-init: argument list too long",
+            encoding="utf-8",
+        )
+        return 255
+
+    with pytest.raises(RuntimeError, match="argument limit"):
+        regenerate_loop_report(
+            task_path,
+            workspace=tmp_path,
+            run_number=1,
+            agent_runner=argument_too_long,
+        )
+    invocation_state = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
+    assert invocation_state["report_failure_kind"] == "infrastructure"
+    assert invocation_state["report_failure_code"] == "invocation_argument_too_long"
+    assert report_input.read_bytes() == frozen_input
+
 
 def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
@@ -421,12 +467,13 @@ def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -
     )
 
     prompt = captured["prompt"]
-    assert "integrity_warnings" in prompt
-    assert "rounds_completed=1 but round_ids contains 0 entries" in prompt
+    attached = (manager.run_root / "report-input.json").read_text(encoding="utf-8")
+    assert "integrity_warnings" in attached
+    assert "rounds_completed=1 but round_ids contains 0 entries" in attached
     assert "不得为缺失的轮次或工件虚构研究内容" in prompt
     assert '"metrics_status": "stale"' in prompt
     assert '"gate_inputs_sha256_changed"' in prompt
-    assert '"sortino": 1.1' in prompt
+    assert '"sortino": 1.1' in attached
 
 
 def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> None:
@@ -483,6 +530,93 @@ def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> Non
         agent_runner=fake_agent,
     )
 
-    assert "Current loop" in captured["prompt"]
-    assert "Earlier loop" not in captured["prompt"]
-    assert '"integrity_warnings": []' in captured["prompt"]
+    attached = (manager.run_root / "report-input.json").read_text(encoding="utf-8")
+    assert "Current loop" in attached
+    assert "Earlier loop" not in attached
+    assert '"integrity_warnings": []' in attached
+
+
+def test_large_report_input_is_attached_without_entering_argv(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK, encoding="utf-8")
+    _repo(tmp_path)
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
+    manager = base.for_run(1)
+    experiment = manager.rounds / "001"
+    experiment.mkdir(parents=True)
+    large_text = "含空格的逐折记录 Δ " * (os.sysconf("SC_ARG_MAX") // 10)
+    write_json_atomic(experiment / "result.json", {
+        "status": "completed",
+        "hypothesis": "large payload",
+        "attempts": large_text,
+    })
+    write_json_atomic(experiment / "decision.json", {
+        "experiment_id": "001/001",
+        "decision": "rejected",
+    })
+    captured: dict[str, object] = {}
+
+    def fake_agent(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        captured["command"] = list(command)
+        captured["prompt"] = prompt
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": "# Research Loop 总结\n\n## 总览\n\n完成。"},
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    generate_loop_report(
+        task_path,
+        manager,
+        {
+            "rounds_completed": 1,
+            "accepted": 0,
+            "rejected": 1,
+            "failed": 0,
+            "round_ids": ["001"],
+        },
+        agent_runner=fake_agent,
+    )
+
+    frozen = (manager.run_root / "report-input.json").read_bytes()
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert len(frozen) > os.sysconf("SC_ARG_MAX")
+    assert large_text.encode("utf-8") in frozen
+    assert all(len(str(part).encode("utf-8")) < 64 * 1024 for part in command)
+    assert large_text not in str(captured["prompt"])
+
+    monkeypatch.setattr(
+        research_report,
+        "_report_prompt",
+        lambda applicability: "x" * (64 * 1024 + 1),
+    )
+    with pytest.raises(
+        research_report.ReportInfrastructureError,
+        match="argument budget",
+    ) as failure:
+        generate_loop_report(
+            task_path,
+            manager,
+            {"rounds_completed": 1, "round_ids": ["001"]},
+            agent_runner=fake_agent,
+        )
+    assert failure.value.failure_code == "invocation_argument_too_long"

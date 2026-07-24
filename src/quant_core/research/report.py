@@ -20,7 +20,7 @@ from quant_core.research.runner import (
     _metrics_key,
     _infrastructure_failure,
     _redact_authentication_log,
-    _run_opencode_read_only,
+    _run_opencode_report_read_only,
     preflight_provider_authentication,
 )
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
@@ -28,6 +28,8 @@ from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 ReportAgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 _ROUND_ID = re.compile(r"^\d+$")
+_REPORT_INPUT_CONTAINER_PATH = "/workspace/report-input.json"
+_REPORT_INSTRUCTION_MAX_BYTES = 64 * 1024
 
 
 class ReportInfrastructureError(RuntimeError):
@@ -179,9 +181,10 @@ def _last_text_event(events_path: Path) -> str | None:
     return text
 
 
-def _report_prompt(payload: Mapping[str, Any]) -> str:
-    return "\n".join([
-        "你是量化研发复盘员。根据下方完整、可信的 Harness 记录，生成一份简洁清晰的中文 Markdown 报告。",
+def _report_prompt(champion_applicability: Mapping[str, Any]) -> str:
+    lines = [
+        "你是量化研发复盘员。根据所附 report-input.json 中完整、可信的 Harness 记录，"
+        "生成一份简洁清晰的中文 Markdown 报告。",
         "只总结给定记录，不搜索外部信息，不运行工具，不修改文件，不虚构指标或因果关系。",
         "开发集和 gate 的结果必须明确区分；失败或中断轮次也必须如实说明。",
         "如果 loop.integrity_warnings 非空，必须在总览中明确标为 Harness 状态一致性问题；"
@@ -209,10 +212,14 @@ def _report_prompt(payload: Mapping[str, Any]) -> str:
         "只列最重要的 2 至 4 项。",
         "指标优先展示 objective 和硬约束相关项，避免堆砌所有数字。",
         "最终回复必须只有 Markdown 正文，不要代码围栏、前言、致谢或 JSON。",
-        "",
-        "Harness record:",
-        json.dumps(payload, ensure_ascii=False, indent=2),
-    ])
+    ]
+    if champion_applicability:
+        lines.extend([
+            "",
+            "以下 Champion 指标适用性状态比附件中的冻结状态更新，必须以此覆盖信息为准：",
+            json.dumps(champion_applicability, ensure_ascii=False, indent=2),
+        ])
+    return "\n".join(lines)
 
 
 def generate_loop_report(
@@ -220,7 +227,7 @@ def generate_loop_report(
     manager: ResearchWorkspace,
     loop_state: Mapping[str, Any],
     *,
-    agent_runner: ReportAgentRunner = _run_opencode_read_only,
+    agent_runner: ReportAgentRunner = _run_opencode_report_read_only,
 ) -> Path:
     task = ResearchTask.load(task_path)
     task_state = manager.load_state(task.strategy_path)
@@ -301,12 +308,22 @@ def generate_loop_report(
             ),
         },
     }
+    current_champion = payload["champion"]
+    champion_applicability: dict[str, Any] = {}
     report_input_path = manager.run_root / "report-input.json"
     frozen_payload = _read_json(report_input_path)
     if report_input_path.exists() and frozen_payload is None:
         raise RuntimeError("Frozen report input is missing or invalid")
     if frozen_payload is None:
         write_json_atomic(report_input_path, payload)
+        champion_applicability = {
+            key: current_champion.get(key)
+            for key in (
+                "metrics_status",
+                "metrics_applicability",
+                "metrics_stale_reasons",
+            )
+        }
     else:
         frozen_champion = frozen_payload.get("champion")
         current_champion = payload.get("champion")
@@ -315,16 +332,35 @@ def generate_loop_report(
             and isinstance(current_champion, dict)
             and frozen_champion.get("sha256") == current_champion.get("sha256")
         ):
-            for key in (
-                "metrics_status",
-                "metrics_applicability",
-                "metrics_stale_reasons",
-            ):
-                frozen_champion[key] = current_champion.get(key)
+            champion_applicability = {
+                key: current_champion.get(key)
+                for key in (
+                    "metrics_status",
+                    "metrics_applicability",
+                    "metrics_stale_reasons",
+                )
+            }
         payload = frozen_payload
+    if not report_input_path.is_file():
+        raise ReportInfrastructureError(
+            "Frozen report input is unavailable",
+            "report_input_unavailable",
+        )
+    prompt = _report_prompt(champion_applicability)
+    if len(prompt.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
+        raise ReportInfrastructureError(
+            "Report instructions exceed the safe process argument budget",
+            "invocation_argument_too_long",
+        )
+    if len(_REPORT_INPUT_CONTAINER_PATH.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
+        raise ReportInfrastructureError(
+            "Report attachment path exceeds the safe process argument budget",
+            "invocation_argument_too_long",
+        )
     opencode = task.raw["opencode"]
     command = [
         "opencode", "run", "--auto", "--format", "json",
+        "--file", _REPORT_INPUT_CONTAINER_PATH,
         "--model", str(opencode["model"]), "--dir", str(manager.run_root),
     ]
     if variant := opencode.get("variant"):
@@ -332,14 +368,14 @@ def generate_loop_report(
     timeout = min(int(opencode["timeout_minutes"]) * 60, 600)
     events_path = manager.run_temp / "report-events.jsonl"
     events_path.parent.mkdir(parents=True, exist_ok=True)
-    if agent_runner is _run_opencode_read_only:
+    if agent_runner is _run_opencode_report_read_only:
         try:
             preflight_provider_authentication(task, manager.research_root)
         except AgentContainerInfrastructureError as exc:
             raise ReportInfrastructureError(str(exc), "provider_authentication") from exc
     exit_code = agent_runner(
         command,
-        _report_prompt(payload),
+        prompt,
         manager.run_root,
         events_path,
         timeout,
@@ -375,7 +411,7 @@ def regenerate_loop_report(
     workspace: str | Path = ".",
     research_root: str | Path = ".research",
     run_number: int | None = None,
-    agent_runner: ReportAgentRunner = _run_opencode_read_only,
+    agent_runner: ReportAgentRunner = _run_opencode_report_read_only,
     evaluation_environment: EvaluationEnvironment | None = None,
 ) -> Path:
     task_file = Path(task_path).resolve()
