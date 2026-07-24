@@ -53,6 +53,26 @@ def _git(
     return completed.stdout.strip()
 
 
+def _git_bytes(
+    root: Path,
+    *args: str,
+    env: Mapping[str, str] | None = None,
+) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env={**os.environ, **(env or {})},
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode(errors="replace").strip()
+        if not detail:
+            detail = completed.stdout.decode(errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return completed.stdout
+
+
 def _filter_tables(root: Path, end: date) -> None:
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix not in {".csv", ".parquet"}:
@@ -131,6 +151,12 @@ def evaluator_contract_sha256_for_commit(root: Path, strategy_path: str) -> str:
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _write_bytes_atomic(path: Path, content: bytes) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(content)
     os.replace(temporary, path)
 
 
@@ -1086,16 +1112,130 @@ class ResearchWorkspace:
         state: Mapping[str, Any],
         editable: Sequence[str],
         destination: Path,
-    ) -> None:
-        patch = _git(
-            candidate,
-            "diff",
-            "--binary",
-            "HEAD",
-            "--",
-            *editable,
+        expected_strategy_sha256: str | None,
+    ) -> str:
+        strategy_path = str(state["strategy_path"])
+        if list(editable) != [strategy_path]:
+            raise ValueError("editable strategy path does not match champion.json")
+        candidate_strategy = candidate / strategy_path
+        candidate_content = (
+            candidate_strategy.read_bytes()
+            if candidate_strategy.is_file()
+            else None
         )
-        destination.write_text(patch + ("\n" if patch else ""), encoding="utf-8")
+        candidate_sha256 = (
+            hashlib.sha256(candidate_content).hexdigest()
+            if candidate_content is not None
+            else None
+        )
+        if candidate_sha256 != expected_strategy_sha256:
+            raise RuntimeError(
+                "candidate strategy hash does not match submission.strategy_sha256"
+            )
+
+        with tempfile.TemporaryDirectory(prefix="quant-patch-") as temporary:
+            temporary_root = Path(temporary)
+            generation_index = temporary_root / "generation.index"
+            generation_env = {"GIT_INDEX_FILE": str(generation_index)}
+            _git(candidate, "read-tree", "HEAD", env=generation_env)
+            tracked = _git(
+                candidate,
+                "ls-tree",
+                "--name-only",
+                "HEAD",
+                "--",
+                strategy_path,
+            )
+            if candidate_content is not None and not tracked:
+                _git(
+                    candidate,
+                    "add",
+                    "-N",
+                    "--",
+                    strategy_path,
+                    env=generation_env,
+                )
+            patch_content = _git_bytes(
+                candidate,
+                "diff",
+                "--binary",
+                "HEAD",
+                "--",
+                strategy_path,
+                env=generation_env,
+            )
+            _write_bytes_atomic(destination, patch_content)
+
+            validation_index = temporary_root / "validation.index"
+            validation_env = {"GIT_INDEX_FILE": str(validation_index)}
+            _git(candidate, "read-tree", "HEAD", env=validation_env)
+            if patch_content:
+                patch_path = temporary_root / "candidate.patch"
+                patch_path.write_bytes(patch_content)
+                _git(
+                    candidate,
+                    "apply",
+                    "--cached",
+                    "--whitespace=nowarn",
+                    str(patch_path),
+                    env=validation_env,
+                )
+            staged = _git(
+                candidate,
+                "ls-files",
+                "--stage",
+                "--",
+                strategy_path,
+                env=validation_env,
+            )
+            reconstructed = (
+                _git_bytes(
+                    candidate,
+                    "show",
+                    f":{strategy_path}",
+                    env=validation_env,
+                )
+                if staged
+                else None
+            )
+            if reconstructed != candidate_content:
+                raise RuntimeError(
+                    "candidate patch does not reconstruct the submitted strategy"
+                )
+            reconstructed_sha256 = (
+                hashlib.sha256(reconstructed).hexdigest()
+                if reconstructed is not None
+                else None
+            )
+            if reconstructed_sha256 != expected_strategy_sha256:
+                raise RuntimeError(
+                    "reconstructed strategy hash does not match submission.strategy_sha256"
+                )
+        return hashlib.sha256(patch_content).hexdigest()
+
+    def write_candidate_source(
+        self,
+        candidate: Path,
+        state: Mapping[str, Any],
+        destination: Path,
+        expected_strategy_sha256: str,
+    ) -> None:
+        strategy_path = str(state["strategy_path"])
+        candidate_strategy = candidate / strategy_path
+        if not candidate_strategy.is_file():
+            raise FileNotFoundError(
+                f"Candidate strategy does not exist: {candidate_strategy}"
+            )
+        content = candidate_strategy.read_bytes()
+        if hashlib.sha256(content).hexdigest() != expected_strategy_sha256:
+            raise RuntimeError(
+                "candidate strategy hash does not match submission.strategy_sha256"
+            )
+        _write_bytes_atomic(destination, content)
+        if _file_sha256(destination) != expected_strategy_sha256:
+            raise RuntimeError(
+                "persisted candidate source hash does not match submission.strategy_sha256"
+            )
 
     def record_state(
         self,

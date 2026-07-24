@@ -2300,6 +2300,43 @@ def _metrics_key(task: ResearchTask) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _fail_candidate_evidence(
+    manager: ResearchWorkspace,
+    candidate: Path,
+    state: dict[str, Any],
+    experiment: Path,
+    decision_path: Path,
+    record_id: str,
+    result: Mapping[str, Any],
+    error: Exception,
+    *,
+    candidate_patch_sha256: str | None = None,
+) -> Path:
+    message = f"Candidate evidence integrity failure: {error}"
+    decision = {
+        "experiment_id": record_id,
+        "decision": "failed",
+        "reasons": [message],
+        "failure_kind": "infrastructure",
+        "failure_code": "candidate_patch_integrity_failed",
+    }
+    submission = result.get("submission")
+    if isinstance(submission, Mapping):
+        decision["submission"] = dict(submission)
+    if candidate_patch_sha256 is not None:
+        decision["candidate_patch_sha256"] = candidate_patch_sha256
+    write_json_atomic(decision_path, decision)
+    manager.reject(candidate, state, record_id)
+    return _write_failed(
+        experiment,
+        record_id,
+        message,
+        result,
+        failure_kind="infrastructure",
+        failure_code="candidate_patch_integrity_failed",
+    )
+
+
 def run_managed_once(
     task_path: str | Path,
     round_id: str,
@@ -2416,13 +2453,31 @@ def run_managed_once(
         return result_path
 
     candidate_patch = experiment / "candidate.patch"
-    manager.write_candidate_patch(
-        candidate,
-        state,
-        task.raw["scope"]["editable"],
-        candidate_patch,
-    )
-    candidate_patch_sha256 = hashlib.sha256(candidate_patch.read_bytes()).hexdigest()
+    try:
+        candidate_patch_sha256 = manager.write_candidate_patch(
+            candidate,
+            state,
+            task.raw["scope"]["editable"],
+            candidate_patch,
+            str(result["submission"]["strategy_sha256"]),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        patch_sha256 = (
+            hashlib.sha256(candidate_patch.read_bytes()).hexdigest()
+            if candidate_patch.is_file()
+            else None
+        )
+        return _fail_candidate_evidence(
+            manager,
+            candidate,
+            state,
+            experiment,
+            decision_path,
+            record_id,
+            result,
+            exc,
+            candidate_patch_sha256=patch_sha256,
+        )
     champion_metrics = manager.valid_champion_metrics(state) if has_champion else None
     evaluated_champion_record: dict[str, Any] | None = None
     if has_champion and not isinstance(champion_metrics, dict):
@@ -2463,6 +2518,26 @@ def run_managed_once(
         "submission": dict(result["submission"]),
         "candidate_patch_sha256": candidate_patch_sha256,
     }
+    if decision["decision"] == "accepted" and not has_champion:
+        try:
+            manager.write_candidate_source(
+                candidate,
+                state,
+                experiment / "candidate.py",
+                str(result["submission"]["strategy_sha256"]),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _fail_candidate_evidence(
+                manager,
+                candidate,
+                state,
+                experiment,
+                decision_path,
+                record_id,
+                result,
+                exc,
+                candidate_patch_sha256=candidate_patch_sha256,
+            )
     write_json_atomic(decision_path, decision)
     if decision["decision"] == "accepted":
         manager.promote(

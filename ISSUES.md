@@ -29,11 +29,10 @@
 
 ## 当前结论
 
-当前存在开放 P0，修复并验证前不得启动新的 Loop Run：
+当前没有开放 P0；以下问题按优先级继续处理：
 
 | 优先级 | 问题 |
 | --- | --- |
-| P0 | `baseline.mode = "none"` 的首个新增策略生成空 Candidate Patch |
 | P1 | Agent 单次 Shell 时限与 Round 评测预算不一致 |
 | P1 | Evaluator 契约包含无关文档并触发 Champion 重评 |
 | P1 | 终局报告 Prompt 通过 argv 传递会超过系统上限 |
@@ -44,29 +43,6 @@
 | P2 | Evaluator 指纹计算依赖可写 Git 对象库 |
 
 ## 一、待解决问题
-
-### P0：阻断可信研发
-
-#### `baseline.mode = "none"` 的首个新增策略生成空 Candidate Patch
-
-- **问题**：`write_candidate_patch()` 只执行
-  `git diff --binary HEAD -- <editable>`，不会包含未跟踪文件。`baseline.mode = "none"` 的 0→1
-  任务中策略路径原本不存在，因此首个候选始终是 untracked。Run 003 Round 001 已接受并晋级，
-  `submission.strategy_sha256` 和当前 `champion.py` 均存在，但耐久
-  `rounds/001/candidate.patch` 为 0 字节，Decision 记录的 SHA-256 是空内容哈希
-  `e3b0c442...b855`；同 Run 后两轮基于已存在 Champion 的 patch 分别为 7,676 和 6,484 字节。
-  Round 001 目录也没有保留独立候选源码/checkpoint。若未来 Champion 被覆盖，仅凭该轮冻结输入、
-  空 patch 和 Parent Champion 无法重建首次获胜候选，破坏 immutable Loop history 和晋级审计证据。
-- **方案**：生成 patch 前显式处理 editable 路径的 untracked 状态，例如对临时 index 使用
-  `git add -N` 后 `git diff --binary`，或生成可被 `git apply` 恢复的新文件 patch；不要修改候选
-  的真实 index。写入 Decision 前验证：候选策略 SHA 不同于 Parent/基座时 patch 不得为空，且将
-  patch 应用到冻结 Parent 后得到的文件 SHA 必须等于 `submission.strategy_sha256`。对 0→1 接受轮
-  还应保留完整候选源码作为冗余内容寻址证据。
-- **验证**：覆盖 `baseline.mode = "none"` 的新增文件、已有文件修改、文件删除、二进制差异和空改动；
-  对每种情况在干净 Parent 上应用 patch 并核对策略 SHA。增加回归断言，禁止非空候选以空 patch
-  进入 Decision 或晋级。
-- **风险**：高。当前 Run 003 的首个候选暂时仍可由任务级 `champion.py` 和记录的 SHA 核对，但这是
-  可变任务级副本，不满足轮次级不可变证据要求；在修复前继续晋级可能永久覆盖唯一完整源码。
 
 ### P1：推荐优先解决
 
@@ -186,6 +162,23 @@
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
 
 ### P0：曾阻断可信研发
+
+#### 首个新增策略必须生成可重放的 Candidate Patch
+
+- **问题**：`baseline.mode = "none"` 的首轮策略是 untracked 文件，旧
+  `git diff --binary HEAD -- <editable>` 不会记录它。候选可直接复制为 Champion，但耐久
+  `candidate.patch` 为空，未来覆盖 Champion 后无法从轮次证据重建首次获胜源码。
+- **解决**：Harness 使用隔离的临时 index 对新增策略执行 intent-to-add，并以 Git 原始字节生成
+  binary patch，不修改候选真实 index。写 Decision 和晋级前，在另一个临时 index 上将 patch 应用到
+  冻结 Parent，逐字节核对重建策略、候选策略及 `submission.strategy_sha256`；失败统一记录为
+  `infrastructure/candidate_patch_integrity_failed` 并熔断。首次 0→1 晋级还原子保存
+  `candidate.py` 作为冗余内容寻址证据。
+- **验证**：回归测试覆盖新增文件、空文件、已有文件修改、文件删除、二进制新增/修改、真实空改动、
+  submission 哈希不符及错误空 patch；每个有效 patch 均在干净 Parent 上重放，并确认候选 index
+  未变化。集成测试覆盖首次晋级源码保全、后续普通修改以及完整性故障不改变 Champion；Conda
+  `quant` 全量测试 `240 passed, 3 skipped`。
+- **风险**：历史 Run 003 Round 001 的空 patch 无法追溯修补；当前任务级 Champion 仍存在时应另行
+  冻结核对。新 Round 已具备可重放 patch 和首次晋级冗余源码。
 
 #### 宿主固定评测环境必须进入 Champion 指标适用性契约
 

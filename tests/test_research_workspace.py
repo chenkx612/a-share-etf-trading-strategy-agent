@@ -11,6 +11,7 @@ from typing import Sequence
 import pandas as pd
 import pytest
 
+import quant_core.research.workspace as workspace_module
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.environment import EvaluationEnvironment
@@ -586,6 +587,168 @@ def test_consecutive_candidate_worktrees_mount_in_real_agent_container(
             manager.reject(candidate, state, f"001/{round_id}")
 
 
+@pytest.mark.parametrize(
+    ("parent_content", "candidate_content", "baseline_mode"),
+    [
+        (None, b"VALUE = 1\n", "none"),
+        (None, b"", "none"),
+        (None, b"\x00new-binary\n", "none"),
+        (b"VALUE = 1\n", b"VALUE = 2\n", "workspace"),
+        (b"\x00old-binary\n", b"\x00new-binary\n", "workspace"),
+        (b"VALUE = 1\n", None, "workspace"),
+        (b"VALUE = 1\n", b"VALUE = 1\n", "workspace"),
+    ],
+    ids=(
+        "new",
+        "new-empty",
+        "new-binary",
+        "modified",
+        "modified-binary",
+        "deleted",
+        "unchanged",
+    ),
+)
+def test_candidate_patch_replays_without_mutating_candidate_index(
+    tmp_path: Path,
+    parent_content: bytes | None,
+    candidate_content: bytes | None,
+    baseline_mode: str,
+) -> None:
+    if parent_content is not None:
+        (tmp_path / "strategy.py").write_bytes(parent_content)
+    _task(tmp_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "managed-test",
+    ).for_run(1)
+    candidate, experiment, state = manager.create_candidate(
+        "001",
+        baseline_mode=baseline_mode,
+        baseline_exclude=["strategy.py"] if baseline_mode == "none" else [],
+        strategy_path="strategy.py",
+    )
+    candidate_strategy = candidate / "strategy.py"
+    if candidate_content is None:
+        candidate_strategy.unlink(missing_ok=True)
+    else:
+        candidate_strategy.write_bytes(candidate_content)
+    staged_before = _git_text(candidate, "diff", "--cached", "--binary")
+    expected_sha256 = (
+        hashlib.sha256(candidate_content).hexdigest()
+        if candidate_content is not None
+        else None
+    )
+
+    patch_path = experiment / "candidate.patch"
+    patch_sha256 = manager.write_candidate_patch(
+        candidate,
+        state,
+        ["strategy.py"],
+        patch_path,
+        expected_sha256,
+    )
+
+    assert patch_sha256 == hashlib.sha256(patch_path.read_bytes()).hexdigest()
+    assert _git_text(candidate, "diff", "--cached", "--binary") == staged_before
+    replay = tmp_path / "replay"
+    subprocess.run(
+        ["git", "-C", str(candidate), "worktree", "add", "--detach", str(replay), "HEAD"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        if patch_path.stat().st_size:
+            subprocess.run(
+                ["git", "-C", str(replay), "apply", "--binary", str(patch_path)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        replay_strategy = replay / "strategy.py"
+        assert (
+            replay_strategy.read_bytes() if replay_strategy.is_file() else None
+        ) == candidate_content
+    finally:
+        subprocess.run(
+            ["git", "-C", str(candidate), "worktree", "remove", "--force", str(replay)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    manager.reject(candidate, state, "001/001")
+
+
+def test_candidate_patch_rejects_submission_hash_mismatch(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _task(tmp_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "managed-test",
+    ).for_run(1)
+    candidate, experiment, state = manager.create_candidate(
+        "001",
+        strategy_path="strategy.py",
+    )
+    (candidate / "strategy.py").write_text("2.0\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="submission.strategy_sha256"):
+        manager.write_candidate_patch(
+            candidate,
+            state,
+            ["strategy.py"],
+            experiment / "candidate.patch",
+            hashlib.sha256(b"1.0\n").hexdigest(),
+        )
+
+    manager.reject(candidate, state, "001/001")
+
+
+def test_candidate_patch_rejects_empty_patch_for_changed_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _task(tmp_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "managed-test",
+    ).for_run(1)
+    candidate, experiment, state = manager.create_candidate(
+        "001",
+        strategy_path="strategy.py",
+    )
+    content = b"2.0\n"
+    (candidate / "strategy.py").write_bytes(content)
+    original_git_bytes = workspace_module._git_bytes
+
+    def empty_diff(
+        root: Path,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> bytes:
+        if args[:2] == ("diff", "--binary"):
+            return b""
+        return original_git_bytes(root, *args, env=env)
+
+    monkeypatch.setattr(workspace_module, "_git_bytes", empty_diff)
+
+    with pytest.raises(RuntimeError, match="does not reconstruct"):
+        manager.write_candidate_patch(
+            candidate,
+            state,
+            ["strategy.py"],
+            experiment / "candidate.patch",
+            hashlib.sha256(content).hexdigest(),
+        )
+
+    assert (experiment / "candidate.patch").read_bytes() == b""
+    manager.reject(candidate, state, "001/001")
+
+
 def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     (tmp_path / "data").mkdir()
@@ -772,6 +935,81 @@ def test_no_baseline_rejects_until_first_candidate_passes_constraints(tmp_path: 
     assert isinstance(state["champion_sha256"], str)
     assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.2\n"
     assert not (accepted_result.parent / "champion-development.log").exists()
+    accepted_patch = accepted_result.parent / "candidate.patch"
+    assert accepted_patch.stat().st_size > 0
+    assert "new file mode" in accepted_patch.read_text(encoding="utf-8")
+    candidate_source = accepted_result.parent / "candidate.py"
+    assert candidate_source.read_text(encoding="utf-8") == "1.2\n"
+    assert (
+        hashlib.sha256(candidate_source.read_bytes()).hexdigest()
+        == accepted_decision["submission"]["strategy_sha256"]
+    )
+    assert not (rejected_result.parent / "candidate.py").exists()
+
+    subsequent_result = run_managed_once(
+        task,
+        "001",
+        run_number=3,
+        workspace=tmp_path,
+        command_runner=constraint_command,
+        opencode_runner=_opencode_with_signal(1.4),
+    )
+    subsequent_decision = json.loads(
+        (subsequent_result.parent / "decision.json").read_text(encoding="utf-8")
+    )
+    assert subsequent_decision["decision"] == "accepted"
+    subsequent_patch = (subsequent_result.parent / "candidate.patch").read_text(
+        encoding="utf-8"
+    )
+    assert "-1.2" in subsequent_patch
+    assert "+1.4" in subsequent_patch
+    assert not (subsequent_result.parent / "candidate.py").exists()
+
+
+def test_candidate_evidence_hash_mismatch_is_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task = _task(tmp_path)
+
+    def mutating_command(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        exit_code = _command(command, cwd, log_path, timeout)
+        if (
+            command[0] == "backtest"
+            and command[command.index("--start") + 1] == "2022-01-01"
+        ):
+            (cwd / "strategy.py").write_text("9.9\n", encoding="utf-8")
+        return exit_code
+
+    result_path = run_managed_once(
+        task,
+        "001",
+        run_number=1,
+        workspace=tmp_path,
+        command_runner=mutating_command,
+        opencode_runner=_opencode_with_signal(1.2),
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    decision = json.loads(
+        (result_path.parent / "decision.json").read_text(encoding="utf-8")
+    )
+    state = json.loads(
+        (tmp_path / ".research/managed-test/champion.json").read_text(encoding="utf-8")
+    )
+    assert result["status"] == "failed"
+    assert result["failure_kind"] == "infrastructure"
+    assert result["failure_code"] == "candidate_patch_integrity_failed"
+    assert decision["decision"] == "failed"
+    assert decision["failure_kind"] == "infrastructure"
+    assert decision["failure_code"] == "candidate_patch_integrity_failed"
+    assert state["champion_sha256"] == hashlib.sha256(b"1.0\n").hexdigest()
+    assert (tmp_path / ".research/managed-test/champion.py").read_text() == "1.0\n"
 
 
 def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:

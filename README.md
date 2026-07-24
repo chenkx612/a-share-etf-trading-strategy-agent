@@ -192,7 +192,9 @@ conda run --no-capture-output -n quant python -m quant_core.cli research clean \
 ```
 
 任务级 Champion 保存在 `.research/<task-id>/champion.py` 和 `champion.json`；每轮的
-`result.json`、`decision.json` 和候选 patch 保存在 `runs/<run>/rounds/<round>/`，终局复盘
+`result.json`、`decision.json` 和可从冻结 Parent 重放的 `candidate.patch` 保存在
+`runs/<run>/rounds/<round>/`。`baseline.mode = "none"` 的首次 0→1 晋级还会保留完整
+`candidate.py`，其内容哈希与 Round submission 一致。终局复盘
 保存在 `runs/<run>/report.md`，冻结的报告输入保存在 `runs/<run>/report-input.json`。报告认证失败
 不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop
 的阶段事件会同时输出到终端和
@@ -205,8 +207,8 @@ Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止
 Run，没有完整决策的当前 Round 会作为失败证据
 落盘；已经正常停止的 Run 不会恢复，而是分配下一个编号。
 
-`research clean` 不会删除结构化 Round 结果、Decision、候选 checkpoint 与 patch、Champion、冻结的
-Evaluation 数据或终局报告，也不会清理仍在运行的 Loop。
+`research clean` 不会删除结构化 Round 结果、Decision、候选 checkpoint、patch、首次 0→1
+候选源码、Champion、冻结的 Evaluation 数据或终局报告，也不会清理仍在运行的 Loop。
 
 ## Quant framework
 
