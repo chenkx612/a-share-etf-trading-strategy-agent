@@ -224,7 +224,11 @@ def generate_loop_report(
 ) -> Path:
     task = ResearchTask.load(task_path)
     task_state = manager.load_state(task.strategy_path)
-    manager.refresh_champion_metrics_status(task_state, _metrics_key(task))
+    manager.refresh_champion_metrics_status(
+        task_state,
+        _metrics_key(task),
+        task.evaluator_contract_paths,
+    )
     round_ids = _loop_round_ids(manager.rounds, loop_state)
     experiments = _experiment_records(manager.rounds, round_ids)
     integrity_warnings = _loop_integrity_warnings(manager.rounds, loop_state, round_ids)

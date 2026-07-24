@@ -65,6 +65,20 @@ metrics_path = "outputs/backtests/{run_id}/metrics.json"
 mode = "walk_forward"
 objective = "sortino"
 
+[evaluation.contract]
+paths = [
+  "pyproject.toml",
+  "src/quant_core/__init__.py",
+  "src/quant_core/backtest",
+  "src/quant_core/config.py",
+  "src/quant_core/data",
+  "src/quant_core/factors",
+  "src/quant_core/research",
+  "src/quant_core/strategy/__init__.py",
+  "tests/test_sector_rotation_research.py",
+  "universes/sector_rotation.csv",
+]
+
 [evaluation.constraints]
 annual_return = { operator = ">=", threshold = 0.05 }
 max_drawdown = { operator = "abs<=", threshold = 0.15 }

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import ast
+import tomllib
+from pathlib import Path
+
 import pytest
 
 from quant_core.research import ExperimentResult, ResearchTask
 from quant_core.research.runner import _decide, target_reached
+
+
+REPOSITORY_ROOT = Path(__file__).parents[1]
 
 
 def fixed_task() -> dict:
@@ -28,6 +35,7 @@ def fixed_task() -> dict:
         "evaluation": {
             "mode": "fixed",
             "objective": "sortino",
+            "contract": {"paths": ["README.md"]},
             "constraints": {
                 "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
             },
@@ -132,6 +140,111 @@ def test_task_requires_exactly_one_editable_strategy_script() -> None:
 
     with pytest.raises(ValueError, match="exactly one"):
         ResearchTask.from_mapping(payload)
+
+
+def test_task_requires_explicit_evaluator_contract_paths() -> None:
+    payload = fixed_task()
+    del payload["evaluation"]["contract"]
+
+    with pytest.raises(ValueError, match="evaluation.contract"):
+        ResearchTask.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        [],
+        ["/absolute/path"],
+        ["../outside.py"],
+        ["src\\evaluator.py"],
+        ["src/evaluator/"],
+        ["src//evaluator.py"],
+        ["./src/evaluator.py"],
+        [" src/evaluator.py"],
+        ["."],
+        ["outputs/metrics.json"],
+        ["src/quant_core/strategy/etf_momentum.py"],
+        ["src/quant_core", "src/quant_core/config.py"],
+        ["README.md", "README.md"],
+    ],
+)
+def test_task_rejects_unsafe_evaluator_contract_paths(paths: list[str]) -> None:
+    payload = fixed_task()
+    payload["evaluation"]["contract"]["paths"] = paths
+
+    with pytest.raises(ValueError, match="contract.paths|paths must"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_exposes_evaluator_contract_paths() -> None:
+    task = ResearchTask.from_mapping(fixed_task())
+
+    assert task.evaluator_contract_paths == ["README.md"]
+
+
+@pytest.mark.parametrize(
+    "task_name",
+    [
+        "liquid_etf_rerank_topk.toml",
+        "sharpe_corr_threshold_optimization.toml",
+    ],
+)
+def test_repository_task_contracts_cover_local_python_imports(task_name: str) -> None:
+    task_path = REPOSITORY_ROOT / "tasks" / task_name
+    task = ResearchTask.from_mapping(tomllib.loads(task_path.read_text(encoding="utf-8")))
+    declared = [REPOSITORY_ROOT / path for path in task.evaluator_contract_paths]
+
+    def covered(path: Path) -> bool:
+        return any(path == root or root in path.parents for root in declared)
+
+    python_files: list[Path] = []
+    for path in declared:
+        if path.is_dir():
+            python_files.extend(path.rglob("*.py"))
+        elif path.suffix == ".py":
+            python_files.append(path)
+    strategy_file = REPOSITORY_ROOT / task.strategy_path
+    if strategy_file.is_file():
+        python_files.append(strategy_file)
+    strategy_package = strategy_file.parent / "__init__.py"
+    assert covered(strategy_package), (
+        f"{task_name} evaluator contract misses strategy package initializer: "
+        f"{strategy_package.relative_to(REPOSITORY_ROOT)}"
+    )
+
+    missing: set[str] = set()
+    for path in python_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        modules = [
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and isinstance(node.module, str)
+            and node.module.startswith("quant_core")
+        ]
+        modules.extend(
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name.startswith("quant_core")
+        )
+        for module in modules:
+            relative = Path("src").joinpath(*module.split("."))
+            candidates = [
+                REPOSITORY_ROOT / relative.with_suffix(".py"),
+                REPOSITORY_ROOT / relative / "__init__.py",
+            ]
+            dependency = next((candidate for candidate in candidates if candidate.is_file()), None)
+            if dependency is None:
+                continue
+            dependency_relative = dependency.relative_to(REPOSITORY_ROOT).as_posix()
+            if dependency_relative == task.strategy_path or covered(dependency):
+                continue
+            missing.add(dependency_relative)
+
+    assert not missing, f"{task_name} evaluator contract misses imports: {sorted(missing)}"
 
 
 def test_task_requires_opencode_model() -> None:

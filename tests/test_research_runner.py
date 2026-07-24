@@ -69,6 +69,9 @@ metrics_path = "outputs/backtests/{run_id}/metrics.json"
 mode = "fixed"
 objective = "sortino"
 
+[evaluation.contract]
+paths = [".gitignore"]
+
 [evaluation.constraints]
 max_drawdown = { operator = "abs<=", threshold = 0.20 }
 

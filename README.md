@@ -89,6 +89,10 @@ conda run --no-capture-output -n quant python -m quant_core.cli research loop \
 `src/quant_core/research/contracts.py` 验证。
 
 - `scope.editable` 当前只能声明一个仓库相对策略文件。
+- `evaluation.contract.paths` 必须显式列出固定测试、回测及其导入或读取的仓库文件和目录。
+  路径必须是规范化的仓库相对字面量，不能使用 glob、运行时目录或包含 editable 策略；Harness
+  会哈希这些路径下已跟踪改动及非 ignored 的未跟踪文件。README、`ISSUES.md` 和无关 Skill 等
+  未声明内容不会使 Champion 指标失效。新增评测依赖时必须同时扩充该清单。
 - `baseline.mode = "workspace"` 从工作区策略初始化 Champion；`"none"` 用于 0→1 研发，
   可配合 `baseline.exclude` 从候选基座排除旧策略实现。
 - 回测命令支持 `{python}`、`{universe}`、`{start}`、`{end}`、`{run_id}`、

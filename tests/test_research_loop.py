@@ -57,6 +57,9 @@ metrics_path = "outputs/backtests/{{run_id}}/metrics.json"
 mode = "fixed"
 objective = "sortino"
 
+[evaluation.contract]
+paths = [".gitignore"]
+
 [evaluation.constraints]
 max_drawdown = {{ operator = "abs<=", threshold = 0.20 }}
 
@@ -426,7 +429,11 @@ def test_loop_stops_when_champion_reaches_target(tmp_path: Path) -> None:
         loaded_task = ResearchTask.load(task_path)
         metrics_record = manager.metrics_record(
             metrics,
-            manager.metrics_applicability(task_state, _metrics_key(loaded_task)),
+            manager.metrics_applicability(
+                task_state,
+                _metrics_key(loaded_task),
+                loaded_task.evaluator_contract_paths,
+            ),
             f"{run_number:03d}/{experiment_id}",
         )
         manager.record_state(task_state, experiment_id, metrics_record)
@@ -466,7 +473,11 @@ def test_rebuilt_runtime_keeps_valid_metrics_for_target_stop_before_a_round(
     state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.5, "max_drawdown": -0.10}},
-        manager.metrics_applicability(state, _metrics_key(task)),
+        manager.metrics_applicability(
+            state,
+            _metrics_key(task),
+            task.evaluator_contract_paths,
+        ),
         "001/001",
     )
     manager.record_state(state, "001/001")
@@ -501,7 +512,11 @@ def test_preflight_failure_does_not_delete_valid_champion_metrics(tmp_path: Path
     state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.2, "max_drawdown": -0.10}},
-        manager.metrics_applicability(state, _metrics_key(task)),
+        manager.metrics_applicability(
+            state,
+            _metrics_key(task),
+            task.evaluator_contract_paths,
+        ),
         "001/001",
     )
     manager.record_state(state, "001/001")

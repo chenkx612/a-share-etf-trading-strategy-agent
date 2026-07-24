@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Evaluator 契约包含无关文档并触发 Champion 重评 |
 | P1 | 终局报告 Prompt 通过 argv 传递会超过系统上限 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
@@ -44,23 +43,6 @@
 ## 一、待解决问题
 
 ### P1：推荐优先解决
-
-#### Evaluator 契约包含无关文档并触发 Champion 重评
-
-- **问题**：`evaluator_contract_sha256()` 对除少数排除路径外的整个工作树执行 `git add -A`，
-  因而把 `ISSUES.md` 等不参与固定测试、数据、回测或晋级逻辑的文档也纳入 evaluator 契约。
-  本次 Run 003 Round 001 运行期间按观测要求更新 `ISSUES.md` 后，已接受 Champion 的指标在
-  Round 002 决策前被判 stale；Harness 额外运行了一次
-  `002-champion-development`，随后才完成拒绝决策。评测结果未失真，但无关文档变更造成昂贵重评，
-  并使“运行中记录 Harness 问题”与指标适用性产生非预期耦合。
-- **方案**：把 evaluator 契约改为显式、可审计的固定评测输入集合，例如 evaluator/backtest/data
-  读取与契约代码、配置、测试命令依赖和锁定环境；策略、数据指纹和环境继续使用各自独立契约。
-  不应简单忽略所有未跟踪文件，必须覆盖真正会被 Python 导入或被命令读取的未提交 evaluator 改动。
-- **验证**：修改 `ISSUES.md`、README 和无关 Skill 时契约哈希保持不变且不触发 Champion 重评；
-  修改 backtest、research evaluator、固定测试或其实际导入依赖时哈希必须变化。用导入追踪或显式
-  allowlist 测试防止漏掉间接依赖。
-- **风险**：中。当前保守哈希不会静默复用已改变 evaluator 的指标，但会增加长 Run 的耗时和外部
-  状态暴露；修复时若依赖集合不完整，反而可能引入错误复用，必须优先保证保守性。
 
 #### 终局报告 Prompt 通过 argv 传递会超过系统上限
 
@@ -247,6 +229,22 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
+
+#### Evaluator 契约必须显式声明固定评测输入
+
+- **问题**：旧 `evaluator_contract_sha256()` 对除少数排除路径外的整个工作树执行 `git add -A`，
+  使 `ISSUES.md` 等无关文档变化也会将 Champion 指标标记 stale，并触发昂贵的 Development/Gate
+  重评。
+- **解决**：任务必须通过 `evaluation.contract.paths` 显式声明固定测试、回测、配置及其导入或读取
+  的仓库输入。Harness 只用临时 Git index 哈希这些字面路径，覆盖 tracked 修改、删除和非 ignored
+  的未跟踪依赖，不修改用户 index；工作区与候选提交使用同一 canonical manifest。路径校验拒绝
+  editable 策略、运行时目录、重复、重叠、越界、缺失和空输入；两个现有任务均声明完整清单，并用
+  静态 Python 导入审计防止漏掉仓库内间接依赖。
+- **验证**：测试覆盖 README、`ISSUES.md` 和无关 Skill 变化哈希稳定且不触发 Champion 重评，
+  evaluator tracked 修改和未跟踪依赖变化哈希改变并重评，工作区/提交哈希一致、用户 index 不变及
+  非法清单提前失败；Conda `quant` 全量测试 `266 passed, 3 skipped`。
+- **风险**：任务使用非 Python 动态读取的新资源时，维护者仍须显式扩充清单；缺漏不会由静态导入
+  审计发现，因此任务评测命令的资源变更必须同步评审 `evaluation.contract.paths`。
 
 #### Agent 单次 Shell 时限与 Round 评测预算不一致
 

@@ -5,7 +5,7 @@ import math
 import tomllib
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 
@@ -113,6 +113,48 @@ class ResearchTask:
             raise ValueError("task.evaluation.mode must be 'fixed' or 'walk_forward'")
         if mode == "walk_forward" and strategy is None:
             raise ValueError("task.strategy is required for walk_forward evaluation")
+        contract = _required(evaluation, "contract", dict, "task.evaluation")
+        if set(contract) != {"paths"}:
+            raise ValueError("task.evaluation.contract must contain exactly paths")
+        cls._string_list(contract, "paths", required=True)
+        normalized_contract_paths: list[str] = []
+        for value in contract["paths"]:
+            if (
+                "\\" in value
+                or value.endswith("/")
+                or PurePosixPath(value).is_absolute()
+                or value in {"", "."}
+                or value != value.strip()
+                or PurePosixPath(value).as_posix() != value
+                or ".." in PurePosixPath(value).parts
+            ):
+                raise ValueError(
+                    "task.evaluation.contract.paths must contain normalized "
+                    "repository-relative files or directories"
+                )
+            normalized = PurePosixPath(value).as_posix()
+            root = PurePosixPath(normalized).parts[0]
+            if root in {"data", "outputs", ".research", ".tmp", ".cache"}:
+                raise ValueError(
+                    "task.evaluation.contract.paths must not include runtime "
+                    "or independently fingerprinted paths"
+                )
+            if normalized in normalized_contract_paths:
+                raise ValueError("task.evaluation.contract.paths must not contain duplicates")
+            normalized_contract_paths.append(normalized)
+        strategy_posix = PurePosixPath(editable[0])
+        for index, path in enumerate(normalized_contract_paths):
+            contract_path = PurePosixPath(path)
+            if contract_path == strategy_posix or contract_path in strategy_posix.parents:
+                raise ValueError(
+                    "task.evaluation.contract.paths must not include the editable strategy"
+                )
+            for other in normalized_contract_paths[index + 1:]:
+                other_path = PurePosixPath(other)
+                if contract_path in other_path.parents or other_path in contract_path.parents:
+                    raise ValueError(
+                        "task.evaluation.contract.paths must not contain overlapping paths"
+                    )
 
         commands = _required(data, "commands", dict, "task")
         cls._string_list(commands, "test", required=True)
@@ -271,6 +313,10 @@ class ResearchTask:
     @property
     def strategy_path(self) -> str:
         return str(self.raw["scope"]["editable"][0])
+
+    @property
+    def evaluator_contract_paths(self) -> list[str]:
+        return list(self.raw["evaluation"]["contract"]["paths"])
 
     @property
     def strategy_name(self) -> str | None:

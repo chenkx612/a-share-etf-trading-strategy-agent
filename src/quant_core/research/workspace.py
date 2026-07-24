@@ -132,20 +132,36 @@ def runtime_inputs_sha256(root: Path) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _tree_listing_sha256(listing: str) -> str:
-    lines = sorted(line for line in listing.splitlines() if line)
-    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+def _evaluator_contract_digest(paths: Sequence[str], listing: str) -> str:
+    payload = {
+        "schema_version": 1,
+        "paths": sorted(paths),
+        "tree": sorted(line for line in listing.splitlines() if line),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def evaluator_contract_sha256_for_commit(root: Path, strategy_path: str) -> str:
-    """Hash a worktree's committed evaluator content, excluding its strategy."""
-    listing = _git(root, "ls-tree", "-r", "--full-tree", "HEAD")
-    filtered = "\n".join(
-        line
-        for line in listing.splitlines()
-        if "\t" in line and line.split("\t", 1)[1] != strategy_path
-    )
-    return _tree_listing_sha256(filtered)
+def evaluator_contract_sha256_for_commit(
+    root: Path,
+    contract_paths: Sequence[str],
+    strategy_path: str,
+) -> str:
+    """Hash declared evaluator content from a worktree commit."""
+    lines: list[str] = []
+    for path in contract_paths:
+        listing = _git(root, "ls-tree", "-r", "--full-tree", "HEAD", "--", path)
+        path_lines = [
+            line
+            for line in listing.splitlines()
+            if "\t" in line and line.split("\t", 1)[1] != strategy_path
+        ]
+        if not path_lines:
+            raise FileNotFoundError(
+                f"evaluator contract path has no committed files: {path}"
+            )
+        lines.extend(path_lines)
+    return _evaluator_contract_digest(contract_paths, "\n".join(lines))
 
 
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -448,41 +464,48 @@ class ResearchWorkspace:
 
     def evaluator_contract_sha256(
         self,
-        excluded_paths: Sequence[str],
+        contract_paths: Sequence[str],
         *,
         strategy_path: str,
     ) -> str:
-        """Hash the fixed repository content staged into evaluator worktrees."""
-        excluded = [*excluded_paths, "data", "outputs"]
-        if strategy_path not in excluded:
-            excluded.append(strategy_path)
-        if self.source in self.research_root.parents:
-            excluded.append(self.research_root.relative_to(self.source).as_posix())
+        """Hash the explicitly declared fixed evaluator inputs."""
+        for path in contract_paths:
+            if not os.path.lexists(self.source / path):
+                raise FileNotFoundError(f"evaluator contract path does not exist: {path}")
         with tempfile.TemporaryDirectory(prefix="quant-contract-") as temporary:
             index = Path(temporary) / "index"
             env = {"GIT_INDEX_FILE": str(index), **_GIT_IDENTITY}
             _git(self.source, "read-tree", "HEAD", env=env)
-            _git(self.source, "add", "-A", env=env)
-            for path in excluded:
-                _git(
-                    self.source,
-                    "rm",
-                    "-r",
-                    "--cached",
-                    "--ignore-unmatch",
-                    "--",
-                    path.rstrip("/"),
-                    env=env,
-                )
+            _git(self.source, "add", "-A", "--", *contract_paths, env=env)
             tree = _git(self.source, "write-tree", env=env)
-            return _tree_listing_sha256(
-                _git(self.source, "ls-tree", "-r", "--full-tree", tree)
-            )
+            lines: list[str] = []
+            for path in contract_paths:
+                listing = _git(
+                    self.source,
+                    "ls-tree",
+                    "-r",
+                    "--full-tree",
+                    tree,
+                    "--",
+                    path,
+                )
+                path_lines = [
+                    line
+                    for line in listing.splitlines()
+                    if "\t" in line and line.split("\t", 1)[1] != strategy_path
+                ]
+                if not path_lines:
+                    raise ValueError(
+                        f"evaluator contract path has no hashable files: {path}"
+                    )
+                lines.extend(path_lines)
+            return _evaluator_contract_digest(contract_paths, "\n".join(lines))
 
     def metrics_applicability(
         self,
         state: Mapping[str, Any],
         metrics_key: str,
+        evaluator_contract_paths: Sequence[str],
         *,
         champion_sha256: str | None = None,
         evaluator_contract_sha256: str | None = None,
@@ -491,7 +514,7 @@ class ResearchWorkspace:
             raise RuntimeError("fixed evaluation environment was not configured")
         strategy_path = str(state["strategy_path"])
         contract = evaluator_contract_sha256 or self.evaluator_contract_sha256(
-            state.get("baseline_exclude", []),
+            evaluator_contract_paths,
             strategy_path=strategy_path,
         )
         champion = champion_sha256
@@ -510,6 +533,7 @@ class ResearchWorkspace:
         self,
         state: dict[str, Any],
         metrics_key: str,
+        evaluator_contract_paths: Sequence[str],
         *,
         evaluator_contract_sha256: str | None = None,
     ) -> dict[str, str | None]:
@@ -517,6 +541,7 @@ class ResearchWorkspace:
         expected = self.metrics_applicability(
             state,
             metrics_key,
+            evaluator_contract_paths,
             evaluator_contract_sha256=evaluator_contract_sha256,
         )
         record = state.get("champion_metrics_record")
@@ -1257,6 +1282,7 @@ class ResearchWorkspace:
         metrics: Mapping[str, Any],
         editable: Sequence[str],
         metrics_key: str,
+        evaluator_contract_paths: Sequence[str],
         evaluator_contract_sha256: str,
     ) -> str:
         strategy_path = str(state["strategy_path"])
@@ -1272,6 +1298,7 @@ class ResearchWorkspace:
         applicability = self.metrics_applicability(
             state,
             metrics_key,
+            evaluator_contract_paths,
             champion_sha256=sha256,
             evaluator_contract_sha256=evaluator_contract_sha256,
         )

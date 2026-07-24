@@ -16,7 +16,10 @@ from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.environment import EvaluationEnvironment
 from quant_core.research.runner import _metrics_key, _run_opencode_container, run_managed_once
-from quant_core.research.workspace import ResearchWorkspace
+from quant_core.research.workspace import (
+    ResearchWorkspace,
+    evaluator_contract_sha256_for_commit,
+)
 
 
 ENVIRONMENT = EvaluationEnvironment.from_manifest({
@@ -24,6 +27,7 @@ ENVIRONMENT = EvaluationEnvironment.from_manifest({
     "runner": "test",
 })
 ENVIRONMENT_SHA256 = ENVIRONMENT.sha256
+CONTRACT_PATHS = [".gitignore"]
 
 
 TASK = """
@@ -55,6 +59,9 @@ metrics_path = "outputs/backtests/{{run_id}}/metrics.json"
 [evaluation]
 mode = "fixed"
 objective = "sortino"
+
+[evaluation.contract]
+paths = [".gitignore"]
 
 [evaluation.constraints]
 max_drawdown = {{ operator = "abs<=", threshold = 0.20 }}
@@ -220,7 +227,7 @@ def test_rebuilding_development_runtime_preserves_valid_champion_metrics(
         evaluation_environment_sha256=ENVIRONMENT_SHA256,
     )
     state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
-    applicability = manager.metrics_applicability(state, "metrics-key")
+    applicability = manager.metrics_applicability(state, "metrics-key", CONTRACT_PATHS)
     state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.5}},
         applicability,
@@ -230,7 +237,7 @@ def test_rebuilding_development_runtime_preserves_valid_champion_metrics(
 
     manager.cleanup_transient(remove_development_cache=True)
     rebuilt = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
-    manager.refresh_champion_metrics_status(rebuilt, "metrics-key")
+    manager.refresh_champion_metrics_status(rebuilt, "metrics-key", CONTRACT_PATHS)
 
     assert rebuilt["champion_metrics_record"]["status"] == "valid"
     assert rebuilt["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.5
@@ -254,7 +261,7 @@ def test_changed_fixed_inputs_or_evaluator_marks_metrics_stale_without_deleting_
     state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.5}},
-        manager.metrics_applicability(state, "metrics-key"),
+        manager.metrics_applicability(state, "metrics-key", ["evaluator.py"]),
         "001/001",
     )
     manager.record_state(state, "001/001")
@@ -263,7 +270,7 @@ def test_changed_fixed_inputs_or_evaluator_marks_metrics_stale_without_deleting_
         "date,value\n2021-12-31,2\n",
         encoding="utf-8",
     )
-    manager.refresh_champion_metrics_status(state, "metrics-key")
+    manager.refresh_champion_metrics_status(state, "metrics-key", ["evaluator.py"])
     assert state["champion_metrics_record"]["status"] == "stale"
     assert "gate_inputs_sha256_changed" in state["champion_metrics_record"]["stale_reasons"]
     assert state["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.5
@@ -273,9 +280,110 @@ def test_changed_fixed_inputs_or_evaluator_marks_metrics_stale_without_deleting_
         encoding="utf-8",
     )
     (tmp_path / "evaluator.py").write_text("VERSION = 2\n", encoding="utf-8")
-    manager.refresh_champion_metrics_status(state, "metrics-key")
+    manager.refresh_champion_metrics_status(state, "metrics-key", ["evaluator.py"])
     assert state["champion_metrics_record"]["status"] == "stale"
     assert "evaluator_contract_sha256_changed" in state["champion_metrics_record"]["stale_reasons"]
+
+
+def test_evaluator_contract_hashes_only_declared_worktree_paths(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    evaluator = tmp_path / "evaluator"
+    evaluator.mkdir()
+    (evaluator / "core.py").write_text("VERSION = 1\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "explicit-contract",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    ).for_run(1)
+    paths = ["evaluator"]
+    cached_before = _git_text(tmp_path, "diff", "--cached")
+
+    initial = manager.evaluator_contract_sha256(paths, strategy_path="strategy.py")
+    (tmp_path / "README.md").write_text("unrelated documentation\n", encoding="utf-8")
+    (tmp_path / "ISSUES.md").write_text("untracked issue\n", encoding="utf-8")
+    skill = tmp_path / ".agents/skills/unrelated"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("unrelated skill\n", encoding="utf-8")
+
+    assert manager.evaluator_contract_sha256(paths, strategy_path="strategy.py") == initial
+    assert _git_text(tmp_path, "diff", "--cached") == cached_before
+
+    (evaluator / "core.py").write_text("VERSION = 2\n", encoding="utf-8")
+    modified = manager.evaluator_contract_sha256(paths, strategy_path="strategy.py")
+    assert modified != initial
+
+    (evaluator / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    with_untracked_dependency = manager.evaluator_contract_sha256(
+        paths,
+        strategy_path="strategy.py",
+    )
+    assert with_untracked_dependency != modified
+
+    candidate, state = manager.prepare_candidate("001", strategy_path="strategy.py")
+    try:
+        assert evaluator_contract_sha256_for_commit(
+            candidate,
+            paths,
+            "strategy.py",
+        ) == with_untracked_dependency
+    finally:
+        manager.reject(candidate, state, "001/001")
+
+    (evaluator / "core.py").unlink()
+    assert manager.evaluator_contract_sha256(
+        paths,
+        strategy_path="strategy.py",
+    ) != with_untracked_dependency
+
+
+def test_evaluator_contract_rejects_missing_or_empty_paths(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    (tmp_path / "empty").mkdir()
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "invalid-contract",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        manager.evaluator_contract_sha256(["missing.py"], strategy_path="strategy.py")
+    with pytest.raises((RuntimeError, ValueError), match="pathspec|hashable"):
+        manager.evaluator_contract_sha256(["empty"], strategy_path="strategy.py")
+
+
+def test_evaluator_contract_hashes_tracked_file_ignored_after_commit(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    evaluator = tmp_path / "evaluator.py"
+    evaluator.write_text("VERSION = 1\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        ".research/\ndata/\noutputs/\nevaluator.py\n",
+        encoding="utf-8",
+    )
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "tracked-ignored-contract",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
+
+    initial = manager.evaluator_contract_sha256(
+        ["evaluator.py"],
+        strategy_path="strategy.py",
+    )
+    evaluator.write_text("VERSION = 2\n", encoding="utf-8")
+
+    assert manager.evaluator_contract_sha256(
+        ["evaluator.py"],
+        strategy_path="strategy.py",
+    ) != initial
 
 
 def test_changed_evaluation_environment_marks_metrics_stale(
@@ -292,7 +400,7 @@ def test_changed_evaluation_environment_marks_metrics_stale(
     state = first.initialize(strategy_path="strategy.py")
     state["champion_metrics_record"] = first.metrics_record(
         {"gate": {"sortino": 1.5}},
-        first.metrics_applicability(state, "metrics-key"),
+        first.metrics_applicability(state, "metrics-key", CONTRACT_PATHS),
         "001/001",
     )
     first.record_state(state, "001/001")
@@ -304,7 +412,7 @@ def test_changed_evaluation_environment_marks_metrics_stale(
         evaluation_environment_sha256="b" * 64,
     )
     loaded = second.load_state(strategy_path="strategy.py")
-    second.refresh_champion_metrics_status(loaded, "metrics-key")
+    second.refresh_champion_metrics_status(loaded, "metrics-key", CONTRACT_PATHS)
 
     assert loaded["champion_metrics_record"]["status"] == "stale"
     assert loaded["champion_metrics_record"]["stale_reasons"] == [
@@ -334,7 +442,11 @@ def test_schema_five_metrics_migrate_to_stale_without_losing_values(
         "evaluated_at": "2026-01-01T00:00:00+00:00",
         "applicability": {
             key: value
-            for key, value in manager.metrics_applicability(state, "metrics-key").items()
+            for key, value in manager.metrics_applicability(
+                state,
+                "metrics-key",
+                CONTRACT_PATHS,
+            ).items()
             if key != "evaluation_environment_sha256"
         },
     }
@@ -576,8 +688,9 @@ def test_consecutive_candidate_worktrees_mount_in_real_agent_container(
                 {"development": {"sortino": 1.0}, "gate": {"sortino": 1.0}},
                 ["strategy.py"],
                 "test-metrics-key",
+                CONTRACT_PATHS,
                 manager.evaluator_contract_sha256(
-                    state.get("baseline_exclude", []),
+                    CONTRACT_PATHS,
                     strategy_path="strategy.py",
                 ),
             )
@@ -821,6 +934,64 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert _git_text(tmp_path, "for-each-ref", "refs/quant-research") == ""
 
 
+def test_unrelated_document_does_not_re_evaluate_champion(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task = _task(tmp_path)
+    evaluation_run_ids: list[str] = []
+
+    def recording_command(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        if "--run-id" in command:
+            evaluation_run_ids.append(command[command.index("--run-id") + 1])
+        return _command(command, cwd, log_path, timeout)
+
+    accepted = run_managed_once(
+        task,
+        "001",
+        run_number=1,
+        workspace=tmp_path,
+        command_runner=recording_command,
+        opencode_runner=_opencode_with_signal(1.2),
+    )
+    assert json.loads(
+        (accepted.parent / "decision.json").read_text(encoding="utf-8")
+    )["decision"] == "accepted"
+
+    (tmp_path / "ISSUES.md").write_text("runtime observation\n", encoding="utf-8")
+    evaluation_run_ids.clear()
+    unrelated = run_managed_once(
+        task,
+        "001",
+        run_number=2,
+        workspace=tmp_path,
+        command_runner=recording_command,
+        opencode_runner=_opencode_with_signal(1.1),
+    )
+    assert json.loads(
+        (unrelated.parent / "decision.json").read_text(encoding="utf-8")
+    )["decision"] == "rejected"
+    assert not any("-champion-" in run_id for run_id in evaluation_run_ids)
+
+    (tmp_path / ".gitignore").write_text(
+        ".research/\ndata/\noutputs/\n# evaluator contract changed\n",
+        encoding="utf-8",
+    )
+    evaluator_changed = run_managed_once(
+        task,
+        "001",
+        run_number=3,
+        workspace=tmp_path,
+        command_runner=recording_command,
+        opencode_runner=_opencode_with_signal(1.1),
+    )
+    assert any(run_id.endswith("-champion-development") for run_id in evaluation_run_ids)
+    assert any(run_id.endswith("-champion-gate") for run_id in evaluation_run_ids)
+
+
 def test_managed_run_can_promote_checkpoint_restored_after_timeout(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     task = _task(tmp_path)
@@ -1025,7 +1196,11 @@ def test_failed_candidate_does_not_change_champion(tmp_path: Path) -> None:
     initial_state = manager.initialize(date(2021, 12, 31), strategy_path="strategy.py")
     initial_state["champion_metrics_record"] = manager.metrics_record(
         {"gate": {"sortino": 1.0, "max_drawdown": -0.10}},
-        manager.metrics_applicability(initial_state, _metrics_key(loaded_task)),
+        manager.metrics_applicability(
+            initial_state,
+            _metrics_key(loaded_task),
+            loaded_task.evaluator_contract_paths,
+        ),
         "000/001",
     )
     manager.record_state(initial_state, "000/001")
@@ -1146,6 +1321,7 @@ def test_recovery_finishes_a_file_promotion_after_state_write_was_interrupted(
         manager.metrics_applicability(
             state,
             "metrics-key",
+            CONTRACT_PATHS,
             champion_sha256=sha256,
         ),
         "001/001",

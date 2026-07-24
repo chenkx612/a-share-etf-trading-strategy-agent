@@ -2448,6 +2448,10 @@ def run_managed_once(
         evaluation_environment_sha256=environment.sha256,
     )
     if prepared_candidate is None:
+        manager.evaluator_contract_sha256(
+            task.evaluator_contract_paths,
+            strategy_path=task.strategy_path,
+        )
         candidate, experiment, state = manager.create_candidate(
             round_id,
             date.fromisoformat(development_end),
@@ -2467,11 +2471,13 @@ def run_managed_once(
     metrics_key = _metrics_key(task)
     evaluator_contract_sha256 = evaluator_contract_sha256_for_commit(
         candidate,
+        task.evaluator_contract_paths,
         str(state["strategy_path"]),
     )
     applicability = manager.refresh_champion_metrics_status(
         state,
         metrics_key,
+        task.evaluator_contract_paths,
         evaluator_contract_sha256=evaluator_contract_sha256,
     )
     research_history = _load_managed_history(manager)
@@ -2621,6 +2627,7 @@ def run_managed_once(
             result["metrics"],
             task.raw["scope"]["editable"],
             metrics_key,
+            task.evaluator_contract_paths,
             evaluator_contract_sha256,
         )
     else:

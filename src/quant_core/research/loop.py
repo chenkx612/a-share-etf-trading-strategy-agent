@@ -259,6 +259,10 @@ def run_loop(
         task.task_id,
         evaluation_environment_sha256=environment.sha256,
     )
+    evaluator_contract_sha256 = base_manager.evaluator_contract_sha256(
+        task.evaluator_contract_paths,
+        strategy_path=task.strategy_path,
+    )
     persist_evaluation_environment(base_manager.root, environment)
     development_end = task.development_period["end"]
     base_manager.initialize(
@@ -269,7 +273,12 @@ def run_loop(
     )
     metrics_key = _metrics_key(task)
     task_state = base_manager.load_state(task.strategy_path)
-    base_manager.refresh_champion_metrics_status(task_state, metrics_key)
+    base_manager.refresh_champion_metrics_status(
+        task_state,
+        metrics_key,
+        task.evaluator_contract_paths,
+        evaluator_contract_sha256=evaluator_contract_sha256,
+    )
     base_manager.migrate_legacy_loop()
     fingerprint = _task_fingerprint(task_file)
     active_runs: list[tuple[int, dict[str, Any]]] = []
@@ -393,7 +402,11 @@ def run_loop(
 
     while True:
         task_state = manager.load_state(task.strategy_path)
-        manager.refresh_champion_metrics_status(task_state, metrics_key)
+        manager.refresh_champion_metrics_status(
+            task_state,
+            metrics_key,
+            task.evaluator_contract_paths,
+        )
         champion_metrics = manager.valid_champion_metrics(task_state)
         reason = _stop_reason(
             state,

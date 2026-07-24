@@ -54,6 +54,9 @@ metrics_path = "outputs/backtests/{run_id}/metrics.json"
 mode = "fixed"
 objective = "sortino"
 
+[evaluation.contract]
+paths = ["fixed_evaluator.py"]
+
 [evaluation.constraints]
 max_drawdown = { operator = "abs<=", threshold = 0.15 }
 
@@ -115,6 +118,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         "applicability": base.metrics_applicability(
             task_state,
             _metrics_key(ResearchTask.load(task_path)),
+            ResearchTask.load(task_path).evaluator_contract_paths,
         ),
     }
     write_json_atomic(manager.state_path, task_state)
