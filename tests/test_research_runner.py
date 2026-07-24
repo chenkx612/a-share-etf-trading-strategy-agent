@@ -19,6 +19,7 @@ from quant_core.research.runner import (
     CandidateBindPreflightError,
     _agent_read_only_paths,
     _docker_opencode_command,
+    _development_finalization_reserve,
     _metrics_key,
     _load_research_history,
     _RoundClock,
@@ -178,7 +179,24 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
     ) -> int:
         config_path = cwd / ".quant-research-development.json"
         observed_config.update(json.loads(config_path.read_text(encoding="utf-8")))
-        assert ".quant-research-development.json" in prompt
+        assert ".quant-research-agent-development.json" in prompt
+        agent_config = json.loads(
+            (cwd / ".quant-research-agent-development.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert agent_config["execution"] == {
+            "round_clock_path": ".quant-research-round.json",
+            "checkpoint_status_path": (
+                ".quant-research-checkpoint-trusted/status.json"
+            ),
+            "strategy_path": "strategy.py",
+            "progress_path": (
+                "outputs/backtests/experiment-walk-forward-development/progress.json"
+            ),
+            "finalization_reserve_seconds": 300,
+            "safety_factor": 1.25,
+        }
         log_path.write_text(json.dumps({
             "type": "text",
             "part": {"text": json.dumps({
@@ -310,6 +328,12 @@ def test_opencode_timeout_kills_ordinary_child_processes(tmp_path: Path) -> None
     assert not marker.exists()
 
 
+def test_development_finalization_reserve_scales_for_short_rounds() -> None:
+    assert _development_finalization_reserve(5 * 60) == 75
+    assert _development_finalization_reserve(30 * 60) == 300
+    assert _development_finalization_reserve(60 * 60) == 300
+
+
 def test_docker_opencode_command_mounts_only_candidate_and_read_only_inputs(
     tmp_path: Path,
     monkeypatch,
@@ -345,6 +369,7 @@ def test_docker_opencode_command_mounts_only_candidate_and_read_only_inputs(
         [(mask, hidden)],
         runtime_home,
         "quant-agent-test",
+        1_800_000,
     )
 
     rendered = "\n".join(command)
@@ -364,6 +389,10 @@ def test_docker_opencode_command_mounts_only_candidate_and_read_only_inputs(
         if "src=" in part
     ]
     assert "--dir\n/workspace" in rendered
+    assert (
+        "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000"
+        in command
+    )
     assert command[-2:] == ["--dir", "/workspace"]
     assert "test-agent:local" in command
 
@@ -1619,6 +1648,8 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
         assert "heuristic guidance, not hard quotas" in prompt
         assert "do not perform local threshold mining" in prompt
         assert "Candidate research deadline (UTC):" in prompt
+        assert "Agent Shell default timeout: 3600 seconds" in prompt
+        assert "reserves the final 300 seconds" in prompt
         assert "Live Round clock: .quant-research-round.json" in prompt
         assert timeout == 60 * 60
         clock = json.loads((cwd / ".quant-research-round.json").read_text(encoding="utf-8"))
@@ -1727,6 +1758,13 @@ def test_run_once_classifies_container_initialization_failure(
         *,
         read_only_paths: Sequence[Path] = (),
     ) -> int:
+        trusted = [
+            path
+            for path in read_only_paths
+            if path.name == ".quant-research-checkpoint-trusted"
+        ]
+        assert len(trusted) == 1
+        assert (trusted[0] / "status.json").is_file()
         log_path.write_text(
             "docker: Error response from daemon: OCI runtime create failed",
             encoding="utf-8",
@@ -1817,7 +1855,7 @@ def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> 
         TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
         encoding="utf-8",
     )
-    events: list[str] = []
+    events: list[tuple[str, dict[str, object]]] = []
 
     def timed_out_opencode(
         command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
@@ -1826,6 +1864,13 @@ def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> 
         assert '"timeout_seconds":420' in (
             cwd / ".quant-research-round.json"
         ).read_text(encoding="utf-8").replace(" ", "")
+        progress = cwd / "outputs/backtests/experiment-timeout-development/progress.json"
+        progress.parent.mkdir(parents=True, exist_ok=True)
+        progress.write_text(json.dumps({
+            "status": "running",
+            "completed_evaluations": 4,
+            "remaining_round_seconds": 2,
+        }), encoding="utf-8")
         return 124
 
     result_path = run_once(
@@ -1834,7 +1879,7 @@ def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> 
         tmp_path / "experiment-timeout",
         workspace=tmp_path,
         opencode_runner=timed_out_opencode,
-        event_sink=lambda event, **details: events.append(event),
+        event_sink=lambda event, **details: events.append((event, details)),
         round_id="001",
     )
 
@@ -1842,7 +1887,12 @@ def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> 
     assert result["status"] == "failed"
     assert result["error"] == "Candidate research deadline exceeded"
     assert result["round_timing"]["timeout_seconds"] == 7 * 60
-    assert events == ["agent_started", "round_deadline_exceeded"]
+    assert [event for event, _ in events] == ["agent_started", "round_deadline_exceeded"]
+    assert events[-1][1]["development_progress"] == {
+        "status": "running",
+        "completed_evaluations": 4,
+        "remaining_round_seconds": 2,
+    }
     assert not (tmp_path / ".quant-research-round.json").exists()
 
 

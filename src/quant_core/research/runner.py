@@ -40,6 +40,8 @@ AgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 EventSink = Callable[..., None]
 _RESEARCH_HISTORY_LIMIT = 12
 _ROUND_CLOCK_FILE = ".quant-research-round.json"
+_DEVELOPMENT_FINALIZATION_RESERVE_SECONDS = 300
+_DEVELOPMENT_ESTIMATE_SAFETY_FACTOR = 1.25
 _AGENT_CONTAINER_IMAGE = "quant-agent-research:latest"
 _CONTAINER_WORKSPACE = "/workspace"
 _NO_TOOL_PERMISSIONS = {
@@ -66,6 +68,15 @@ class CandidateBindPreflightError(AgentContainerInfrastructureError):
         super().__init__(message)
         self.code = code
         self.evidence_path = evidence_path
+
+
+def _development_finalization_reserve(round_timeout: int) -> int:
+    if round_timeout < 1:
+        raise ValueError("Round timeout must be positive")
+    return min(
+        _DEVELOPMENT_FINALIZATION_RESERVE_SECONDS,
+        max(1, round_timeout // 4),
+    )
 
 
 @dataclass(frozen=True)
@@ -612,6 +623,7 @@ def _docker_opencode_command(
     hidden_mounts: Sequence[tuple[Path, Path]] = (),
     runtime_home: Path | None = None,
     container_name: str | None = None,
+    bash_timeout_ms: int | None = None,
 ) -> list[str]:
     workspace = cwd.resolve()
     translated = [
@@ -630,8 +642,15 @@ def _docker_opencode_command(
         f"OPENCODE_PERMISSION={json.dumps(dict(permissions), separators=(',', ':'))}",
         "--env",
         "PYTHONPATH=/workspace/src",
-        *_container_mount(workspace, _CONTAINER_WORKSPACE),
     ]
+    if bash_timeout_ms is not None:
+        if bash_timeout_ms < 1:
+            raise ValueError("OpenCode bash timeout must be positive")
+        docker.extend([
+            "--env",
+            f"OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS={bash_timeout_ms}",
+        ])
+    docker.extend(_container_mount(workspace, _CONTAINER_WORKSPACE))
     if container_name is None:
         docker.append("--rm")
     else:
@@ -973,6 +992,7 @@ def _run_opencode_container(
                             hidden_mounts,
                             runtime_home,
                             container_name,
+                            max(1, int(float(timeout) * 1000)),
                         )
                         container_stopped = False
                         try:
@@ -1397,6 +1417,8 @@ def _prompt(
     has_champion: bool,
     round_deadline: str,
     round_clock_path: str,
+    shell_timeout_seconds: int,
+    finalization_reserve_seconds: int,
 ) -> str:
     raw = task.raw
     evaluation = raw["evaluation"]
@@ -1436,12 +1458,19 @@ def _prompt(
         "Stop development search as soon as a candidate passes the stated constraints and reaches "
         "the configured objective improvement; additional optimization is out of scope.",
         f"Candidate research deadline (UTC): {round_deadline}. This is a Harness-enforced hard stop.",
+        f"Agent Shell default timeout: {shell_timeout_seconds} seconds. The Harness configures "
+        "this explicitly; every command is still capped by the live Round remaining time. Do not "
+        "set a shorter timeout when running the provided Development backtest command.",
         f"Live Round clock: {round_clock_path}. Read it before evaluations and during finalization; "
         "remaining_seconds and phase are refreshed by the Harness.",
+        f"The Development evaluator reserves the final {finalization_reserve_seconds} seconds "
+        "for focused tests and submission. It will reject a projected over-budget grid instead "
+        "of silently truncating or automatically changing the parameter set.",
         "When the clock phase becomes converge, stop expanding the search. In finalize, preserve "
         "the best candidate, run focused tests, and prepare the required JSON. In submit_now, "
         "return immediately. Harness-owned validation after submission is outside this deadline.",
-        "As soon as a candidate is importable and has passed a focused test, write "
+        "Before every Development backtest, ensure the current candidate is importable, run a "
+        "focused test, then write "
         ".quant-research-checkpoint/metadata.json with string fields previous_feedback, hypothesis, attempts, "
         "development_effect, and candidate, then run `python3 -m "
         "quant_core.research.checkpoint submit .quant-research-checkpoint/metadata.json`. Repeat this whenever the best "
@@ -1720,7 +1749,11 @@ def _run_once_impl(
     round_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> Path:
-    from quant_core.research.checkpoint import CheckpointReceiver
+    from quant_core.research.checkpoint import (
+        CheckpointReceiver,
+        TRUSTED_RUNTIME_DIR,
+        TRUSTED_STATUS_FILE,
+    )
 
     task = ResearchTask.load(task_path)
     root = Path(workspace).resolve()
@@ -1736,10 +1769,16 @@ def _run_once_impl(
     raw = task.raw
     fixed = task.evaluation_periods
     development_values = _values(task, fixed["development"], f"{experiment_id}-development", root)
+    development_metrics_path = str(raw["commands"]["metrics_path"]).format_map(development_values)
+    test_command = _format_command(raw["commands"]["test"], development_values)
+    opencode = raw["opencode"]
+    command_timeout = int(opencode["timeout_minutes"]) * 60
+    round_timeout = int(raw["budget"].get("round_minutes", opencode["timeout_minutes"])) * 60
+    finalization_reserve = _development_finalization_reserve(round_timeout)
     development_config: Path | None = None
+    agent_development_config: Path | None = None
     if task.evaluation_mode == "walk_forward":
-        development_config = root / ".quant-research-development.json"
-        write_json_atomic(development_config, {
+        base_development_config = {
             "period": dict(task.development_period),
             "walk_forward": {
                 key: task.evaluation_periods[key]
@@ -1750,14 +1789,35 @@ def _run_once_impl(
                     "max_parameter_sets",
                 )
             },
-            "constraints": task.raw["evaluation"]["constraints"], "objective": task.raw["evaluation"]["objective"],
+            "constraints": task.raw["evaluation"]["constraints"],
+            "objective": task.raw["evaluation"]["objective"],
+        }
+        development_config = root / ".quant-research-development.json"
+        write_json_atomic(development_config, base_development_config)
+        agent_development_config = root / ".quant-research-agent-development.json"
+        write_json_atomic(agent_development_config, {
+            **base_development_config,
+            "execution": {
+                "round_clock_path": _ROUND_CLOCK_FILE,
+                "checkpoint_status_path": (
+                    f"{TRUSTED_RUNTIME_DIR}/{TRUSTED_STATUS_FILE}"
+                ),
+                "strategy_path": task.strategy_path,
+                "progress_path": str(
+                    Path(development_metrics_path).parent / "progress.json"
+                ),
+                "finalization_reserve_seconds": finalization_reserve,
+                "safety_factor": _DEVELOPMENT_ESTIMATE_SAFETY_FACTOR,
+            },
         })
     development_command = _evaluation_command(task, task_path, "development", development_values, development_config)
-    development_metrics_path = str(raw["commands"]["metrics_path"]).format_map(development_values)
-    test_command = _format_command(raw["commands"]["test"], development_values)
-    opencode = raw["opencode"]
-    command_timeout = int(opencode["timeout_minutes"]) * 60
-    round_timeout = int(raw["budget"].get("round_minutes", opencode["timeout_minutes"])) * 60
+    agent_development_command = _evaluation_command(
+        task,
+        task_path,
+        "development",
+        development_values,
+        agent_development_config,
+    )
     before = _snapshot(root, out)
     event_details = {"round": round_id} if round_id is not None else {}
     round_clock = _RoundClock(
@@ -1777,7 +1837,9 @@ def _run_once_impl(
         event_sink=event_sink,
         event_details=event_details,
     )
-    agent_development_command = _containerize_prompt_command(development_command, root)
+    agent_development_command = _containerize_prompt_command(
+        agent_development_command, root
+    )
     agent_metrics_path = _containerize_prompt_command([development_metrics_path], root)[0]
     agent_test_command = _containerize_prompt_command(test_command, root)
     prompt = _prompt(
@@ -1789,6 +1851,8 @@ def _run_once_impl(
         task.baseline_mode != "none" if has_champion is None else has_champion,
         round_clock.deadline_text,
         _ROUND_CLOCK_FILE,
+        round_timeout,
+        finalization_reserve,
     )
     opencode_command = [
         "opencode", "run", "--auto", "--format", "json",
@@ -1816,6 +1880,7 @@ def _run_once_impl(
                 raw["scope"].get("forbidden", []),
                 generated_dir,
             )
+            agent_read_only_paths.append(checkpoint_receiver.trusted_runtime)
             if out != root and root in out.parents:
                 agent_read_only_paths.append(out)
             exit_code = _run_opencode_container(
@@ -1862,10 +1927,19 @@ def _run_once_impl(
             failure_code=infrastructure_failure.code,
         )
     if deadline_exceeded:
+        development_progress: dict[str, Any] | None = None
+        progress_path = root / Path(development_metrics_path).parent / "progress.json"
+        try:
+            progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            if isinstance(progress_payload, dict):
+                development_progress = progress_payload
+        except (OSError, json.JSONDecodeError):
+            pass
         _emit(
             event_sink,
             "round_deadline_exceeded",
             message="candidate research deadline exceeded",
+            development_progress=development_progress,
             **event_details,
         )
         checkpoint = checkpoint_receiver.latest_valid()

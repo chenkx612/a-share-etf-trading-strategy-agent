@@ -104,10 +104,15 @@ conda run --no-capture-output -n quant python -m quant_core.cli research loop \
 - `budget.round_minutes` 是每轮候选研发的硬时限；未配置时兼容使用
   `opencode.timeout_minutes`。Harness 会向 Agent 提供绝对截止时间，并在候选工作区刷新
   `.quant-research-round.json`，其中包含剩余秒数和 `research`、`converge`、`finalize`、
-`submit_now` 阶段。Agent 可用 `python3 -m quant_core.research.checkpoint submit <metadata.json>`
-  冻结当前策略；超时时 Harness 只恢复截止前最近的有效 checkpoint，随后照常执行固定测试、
-  Development 和 Gate。`research run-once --output` 必须与候选 workspace 不同，以保持
-  checkpoint 对 Agent 不可写。
+  `submit_now` 阶段。候选容器的 OpenCode Bash 默认超时由 Harness 显式设为同一 Round
+  时限，实际仍受实时剩余 Round 时间约束，不会再隐含使用较短的工具默认值。对
+  walk-forward Development，Agent 必须先提交与当前策略哈希一致的 checkpoint；evaluator
+  通过容器内只读的 Harness 状态验证冻结副本，并用首尾折的基准耗时估算完整网格。评测预算会
+  扣除 Round 时长的四分之一、最多 300 秒作为 finalization 预留；若预计超预算则提前拒绝，并把
+  进度和估算写入本次 backtest 输出目录的 `progress.json`。Agent 可用
+  `python3 -m quant_core.research.checkpoint submit <metadata.json>` 冻结当前策略；超时时
+  Harness 只恢复截止前最近的有效 checkpoint，随后照常执行固定测试、Development 和 Gate。
+  `research run-once --output` 必须与候选 workspace 不同，以保持 checkpoint 对 Agent 不可写。
 - 固定 evaluator 要求策略实现 `select(daily, universe, start, end)`，返回包含 `date`、
   `symbol`、`target_weight` 的 pandas DataFrame。权重必须有限且非负，每日总和不超过 1。
 - Harness 控制器、固定测试和 Development/Gate/Test 评测必须从 Conda `quant` 启动。Harness 会

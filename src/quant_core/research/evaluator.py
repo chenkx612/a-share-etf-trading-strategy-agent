@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
-from datetime import timedelta
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,11 +18,130 @@ from quant_core.backtest.engine import BacktestResult, compute_metrics, run_back
 from quant_core.config import BacktestConfig
 from quant_core.data.market_data import ProjectPaths, load_universe, read_daily
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.workspace import write_json_atomic
 
 
 Selector = Callable[[pd.DataFrame, pd.DataFrame, pd.Timestamp, pd.Timestamp], pd.DataFrame]
 ParameterizedSelector = Callable[[pd.DataFrame, pd.DataFrame, pd.Timestamp, pd.Timestamp, dict[str, object]], pd.DataFrame]
 REQUIRED_SELECTION_COLUMNS = {"date", "symbol", "target_weight"}
+
+
+class DevelopmentBudgetExceeded(RuntimeError):
+    """Raised before an Agent development search can consume the Round."""
+
+
+@dataclass
+class WalkForwardExecutionControl:
+    progress_path: Path
+    round_clock_path: Path
+    checkpoint_status_path: Path
+    strategy_path: Path
+    finalization_reserve_seconds: int = 300
+    safety_factor: float = 1.25
+    monotonic: Callable[[], float] = time.monotonic
+    started_monotonic: float = field(init=False)
+    started_at: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.started_monotonic = self.monotonic()
+        self.started_at = datetime.now(timezone.utc).isoformat()
+
+    def remaining_round_seconds(self) -> int:
+        try:
+            payload = json.loads(self.round_clock_path.read_text(encoding="utf-8"))
+            remaining = payload["remaining_seconds"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            raise DevelopmentBudgetExceeded(
+                "Development evaluation cannot read the live Round clock"
+            ) from None
+        if not isinstance(remaining, int) or isinstance(remaining, bool) or remaining < 0:
+            raise DevelopmentBudgetExceeded(
+                "Development evaluation found an invalid live Round clock"
+            )
+        return remaining
+
+    def write_progress(self, status: str, **details: object) -> None:
+        elapsed = max(0.0, self.monotonic() - self.started_monotonic)
+        try:
+            remaining: int | None = self.remaining_round_seconds()
+        except DevelopmentBudgetExceeded:
+            remaining = None
+        self.progress_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(self.progress_path, {
+            "schema_version": 1,
+            "status": status,
+            "started_at": self.started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "elapsed_seconds": elapsed,
+            "remaining_round_seconds": remaining,
+            **details,
+        })
+
+
+def _require_current_checkpoint(control: WalkForwardExecutionControl) -> None:
+    try:
+        status = json.loads(
+            control.checkpoint_status_path.read_text(encoding="utf-8")
+        )
+        strategy_path = status["strategy_path"]
+        checkpoint = status["latest_checkpoint"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        control.write_progress(
+            "rejected",
+            reason="checkpoint_required",
+            message="Submit an accepted checkpoint before Development evaluation",
+        )
+        raise DevelopmentBudgetExceeded(
+            "Submit an accepted checkpoint before Development evaluation"
+        ) from None
+    if (
+        not isinstance(strategy_path, str)
+        or Path(strategy_path) != control.strategy_path
+    ):
+        control.write_progress(
+            "rejected",
+            reason="checkpoint_required",
+            message="Checkpoint status does not match the configured strategy",
+        )
+        raise DevelopmentBudgetExceeded(
+            "Checkpoint status does not match the configured strategy"
+        )
+    if (
+        not isinstance(checkpoint, dict)
+        or not isinstance(checkpoint.get("checkpoint_id"), str)
+        or not isinstance(checkpoint.get("strategy_sha256"), str)
+    ):
+        control.write_progress(
+            "rejected",
+            reason="checkpoint_required",
+            message="Submit an accepted checkpoint before Development evaluation",
+        )
+        raise DevelopmentBudgetExceeded(
+            "Submit an accepted checkpoint before Development evaluation"
+        )
+    strategy_file = control.round_clock_path.parent / control.strategy_path
+    try:
+        digest = hashlib.sha256(strategy_file.read_bytes()).hexdigest()
+    except OSError:
+        control.write_progress(
+            "rejected",
+            reason="checkpoint_required",
+            message="Configured strategy is unavailable for checkpoint verification",
+        )
+        raise DevelopmentBudgetExceeded(
+            "Configured strategy is unavailable for checkpoint verification"
+        ) from None
+    if checkpoint["strategy_sha256"] == digest:
+        return
+    control.write_progress(
+        "rejected",
+        reason="checkpoint_required",
+        strategy_sha256=digest,
+        message="Current strategy does not have an accepted checkpoint",
+    )
+    raise DevelopmentBudgetExceeded(
+        "Current strategy does not have an accepted checkpoint"
+    )
 
 
 def evaluate_candidate(
@@ -138,6 +261,8 @@ def evaluate_walk_forward(
     objective: str,
     grid: list[dict[str, object]],
     selector: ParameterizedSelector,
+    *,
+    execution: WalkForwardExecutionControl | None = None,
 ) -> tuple[pd.DataFrame, BacktestResult, list[dict[str, object]]]:
     if len(grid) > int(walk_forward["max_parameter_sets"]):
         raise ValueError("parameter_grid() exceeds walk_forward.max_parameter_sets")
@@ -146,47 +271,150 @@ def evaluate_walk_forward(
     history["date"] = pd.to_datetime(history["date"])
     folds: list[dict[str, object]] = []
     selections: list[pd.DataFrame] = []
-    fold_start = start
     train_months = int(walk_forward["train_months"])
     validation_months = int(walk_forward["validation_months"])
     symbols = set(universe["symbol"].astype(str))
     all_signal_dates = sorted(history.loc[history["date"].between(start, end), "date"].unique())
+    fold_specs: list[dict[str, pd.Timestamp]] = []
+    fold_start = start
     while fold_start <= end:
         next_start = fold_start + pd.DateOffset(months=validation_months)
         fold_end = min(end, next_start - timedelta(days=1))
         train_start = fold_start - pd.DateOffset(months=train_months)
         train_end = fold_start - timedelta(days=1)
+        fold_specs.append({
+            "train_start": train_start,
+            "train_end": train_end,
+            "validation_start": fold_start,
+            "validation_end": fold_end,
+        })
+        fold_start = next_start
+
+    cached: dict[tuple[int, int], tuple[pd.DataFrame, BacktestResult]] = {}
+    completed_evaluations = 0
+    projected_total_seconds: float | None = None
+    available_seconds: int | None = None
+
+    def training_evaluation(
+        fold_index: int,
+        parameter_index: int,
+    ) -> tuple[pd.DataFrame, BacktestResult]:
+        nonlocal completed_evaluations
+        key = (fold_index, parameter_index)
+        if key in cached:
+            return cached[key]
+        spec = fold_specs[fold_index]
+        train_end = spec["train_end"]
+        train_history = history[history["date"] <= train_end]
+        started = execution.monotonic() if execution is not None else 0.0
+        params = grid[parameter_index]
+        evaluated = evaluate_candidate(
+            train_history,
+            universe,
+            spec["train_start"],
+            train_end,
+            lambda d, u, s, e, p=params: selector(d, u, s, e, p),
+        )
+        completed_evaluations += 1
+        cached[key] = evaluated
+        if execution is not None:
+            execution.write_progress(
+                "running",
+                reason=None,
+                fold_index=fold_index + 1,
+                fold_count=len(fold_specs),
+                parameter_index=parameter_index + 1,
+                parameter_count=len(grid),
+                completed_evaluations=completed_evaluations,
+                last_evaluation_seconds=max(0.0, execution.monotonic() - started),
+                projected_total_seconds=projected_total_seconds,
+                available_seconds=available_seconds,
+            )
+        return evaluated
+
+    if execution is not None:
+        _require_current_checkpoint(execution)
+        remaining = execution.remaining_round_seconds()
+        available_seconds = remaining - execution.finalization_reserve_seconds
+        if available_seconds <= 0:
+            execution.write_progress(
+                "rejected",
+                reason="finalization_reserve_reached",
+                completed_evaluations=0,
+                projected_total_seconds=None,
+                available_seconds=max(0, available_seconds),
+                message="Round has entered the finalization reserve",
+            )
+            raise DevelopmentBudgetExceeded(
+                "Round has entered the finalization reserve; submit the checkpoint now"
+            )
+        calibration_durations: list[float] = []
+        for fold_index in sorted({0, len(fold_specs) - 1}):
+            calibration_started = execution.monotonic()
+            training_evaluation(fold_index, 0)
+            calibration_durations.append(
+                max(0.0, execution.monotonic() - calibration_started)
+            )
+        total_evaluations = len(fold_specs) * (len(grid) + 1)
+        projected_total_seconds = (
+            max(calibration_durations) * total_evaluations * execution.safety_factor
+        )
+        available_seconds = (
+            execution.remaining_round_seconds()
+            - execution.finalization_reserve_seconds
+        )
+        if projected_total_seconds > available_seconds:
+            execution.write_progress(
+                "rejected",
+                reason="projected_budget_exceeded",
+                fold_count=len(fold_specs),
+                parameter_count=len(grid),
+                completed_evaluations=completed_evaluations,
+                projected_total_seconds=projected_total_seconds,
+                available_seconds=max(0, available_seconds),
+                message="Projected Development evaluation exceeds the remaining budget",
+            )
+            raise DevelopmentBudgetExceeded(
+                "Projected Development evaluation exceeds the remaining budget: "
+                f"{projected_total_seconds:.1f}s required, "
+                f"{max(0, available_seconds)}s available; shrink the parameter grid "
+                "or optimize the selector"
+            )
+
+    for fold_index, spec in enumerate(fold_specs):
+        train_start = spec["train_start"]
+        train_end = spec["train_end"]
         train_history = history[history["date"] <= train_end]
         training_window = train_history[train_history["date"].between(train_start, train_end)]
         if training_window.empty:
             raise ValueError(f"insufficient data for walk-forward training ending {train_end.date()}")
         ranked: list[tuple[float, str, dict[str, object], dict[str, float]]] = []
-        for params in grid:
-            selected, result = evaluate_candidate(
-                train_history, universe, train_start, train_end,
-                lambda d, u, s, e, p=params: selector(d, u, s, e, p),
-            )
+        for parameter_index, params in enumerate(grid):
+            selected, result = training_evaluation(fold_index, parameter_index)
             metrics = result.metrics
             value = metrics.get(objective)
             if _passes(metrics, constraints) and isinstance(value, (int, float)) and np.isfinite(value):
                 ranked.append((-float(value), json.dumps(params, sort_keys=True, separators=(",", ":")), params, metrics))
         record: dict[str, object] = {
             "train_start": train_start.date().isoformat(), "train_end": train_end.date().isoformat(),
-            "validation_start": fold_start.date().isoformat(), "validation_end": fold_end.date().isoformat(),
+            "validation_start": spec["validation_start"].date().isoformat(),
+            "validation_end": spec["validation_end"].date().isoformat(),
         }
         if ranked:
             _, _, params, train_metrics = sorted(ranked)[0]
+            fold_start = spec["validation_start"]
+            fold_end = spec["validation_end"]
             validation_history = history[history["date"] <= fold_end]
             selected, _ = evaluate_candidate(
                 validation_history, universe, fold_start, fold_end,
                 lambda d, u, s, e, p=params: selector(d, u, s, e, p),
             )
+            completed_evaluations += 1
             selections.append(selected)
             record.update({"status": "selected", "parameters": params, "training_metrics": train_metrics})
         else:
             record["status"] = "no_feasible_parameters"
         folds.append(record)
-        fold_start = next_start
     selected_all = pd.concat(selections, ignore_index=True) if selections else pd.DataFrame(columns=["date", "symbol", "target_weight"])
     selected_all.attrs["signal_dates"] = all_signal_dates
     selected_all.attrs["universe_symbols"] = sorted(symbols)
@@ -195,6 +423,18 @@ def evaluate_walk_forward(
     for record in folds:
         left, right = pd.Timestamp(record["validation_start"]), pd.Timestamp(record["validation_end"])
         record["oos_metrics"] = compute_metrics(result.daily_returns[result.daily_returns["date"].between(left, right)])
+    if execution is not None:
+        execution.write_progress(
+            "completed",
+            reason=None,
+            fold_index=len(fold_specs),
+            fold_count=len(fold_specs),
+            parameter_index=len(grid),
+            parameter_count=len(grid),
+            completed_evaluations=completed_evaluations,
+            projected_total_seconds=projected_total_seconds,
+            available_seconds=available_seconds,
+        )
     return selected_all, result, folds
 
 
@@ -234,9 +474,34 @@ def main() -> None:
         constraints = dict(task.raw["evaluation"]["constraints"]) if task is not None else dict(config["constraints"])
         objective = str(task.raw["evaluation"]["objective"]) if task is not None else str(config["objective"])
         grid, selector = _parameterized_contract(args.candidate_module)
+        execution: WalkForwardExecutionControl | None = None
+        if config is not None and isinstance(config.get("execution"), dict):
+            root = Path(args.root)
+            execution_config: dict[str, Any] = config["execution"]
+
+            def execution_path(key: str) -> Path:
+                value = execution_config.get(key)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(f"walk-forward execution.{key} must be a path")
+                path = Path(value)
+                return path if path.is_absolute() else root / path
+
+            strategy_path = execution_config.get("strategy_path")
+            if not isinstance(strategy_path, str) or not strategy_path:
+                raise ValueError("walk-forward execution.strategy_path must be a path")
+            execution = WalkForwardExecutionControl(
+                progress_path=execution_path("progress_path"),
+                round_clock_path=execution_path("round_clock_path"),
+                checkpoint_status_path=execution_path("checkpoint_status_path"),
+                strategy_path=Path(strategy_path),
+                finalization_reserve_seconds=int(
+                    execution_config.get("finalization_reserve_seconds", 300)
+                ),
+                safety_factor=float(execution_config.get("safety_factor", 1.25)),
+            )
         selected, result, folds = evaluate_walk_forward(
             read_daily(paths), load_universe(Path(args.universe)), period, walk_forward,
-            constraints, objective, grid, selector,
+            constraints, objective, grid, selector, execution=execution,
         )
         metrics_payload: dict[str, object] = {
             "aggregate": result.metrics, "folds": folds,

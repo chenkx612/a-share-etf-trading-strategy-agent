@@ -21,6 +21,8 @@ from quant_core.research.workspace import write_json_atomic
 
 CONTROL_FILE = ".quant-research-checkpoint.json"
 RUNTIME_DIR = ".quant-research-checkpoint"
+TRUSTED_RUNTIME_DIR = ".quant-research-checkpoint-trusted"
+TRUSTED_STATUS_FILE = "status.json"
 _METADATA_FIELDS = {
     "previous_feedback",
     "hypothesis",
@@ -78,6 +80,8 @@ class CheckpointReceiver:
         self.runtime = workspace / RUNTIME_DIR
         self.requests = self.runtime / "requests"
         self.acks = self.runtime / "acks"
+        self.trusted_runtime = workspace / TRUSTED_RUNTIME_DIR
+        self.trusted_status = self.trusted_runtime / TRUSTED_STATUS_FILE
         self.checkpoint_root = output_dir / "checkpoints"
         self.checkpoints = self.checkpoint_root / uuid.uuid4().hex
         self._stop = threading.Event()
@@ -90,9 +94,16 @@ class CheckpointReceiver:
             self.event_sink(event, **details, **self.event_details)
 
     def start(self) -> None:
+        shutil.rmtree(self.trusted_runtime, ignore_errors=True)
         self.requests.mkdir(parents=True, exist_ok=True)
         self.acks.mkdir(parents=True, exist_ok=True)
+        self.trusted_runtime.mkdir(parents=True)
         self.checkpoints.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(self.trusted_status, {
+            "schema_version": 1,
+            "strategy_path": self.strategy_path,
+            "latest_checkpoint": None,
+        })
         write_json_atomic(self.workspace / CONTROL_FILE, {
             "schema_version": 1,
             "strategy_path": self.strategy_path,
@@ -173,6 +184,15 @@ class CheckpointReceiver:
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
+        write_json_atomic(self.trusted_status, {
+            "schema_version": 1,
+            "strategy_path": self.strategy_path,
+            "latest_checkpoint": {
+                "checkpoint_id": checkpoint_id,
+                "submitted_at": submitted_at,
+                "strategy_sha256": digest,
+            },
+        })
         self._ack(request_id, {
             "status": "accepted",
             "checkpoint_id": checkpoint_id,
@@ -215,6 +235,7 @@ class CheckpointReceiver:
         self._process_requests()
         (self.workspace / CONTROL_FILE).unlink(missing_ok=True)
         shutil.rmtree(self.runtime, ignore_errors=True)
+        shutil.rmtree(self.trusted_runtime, ignore_errors=True)
         try:
             self.checkpoints.rmdir()
         except OSError:

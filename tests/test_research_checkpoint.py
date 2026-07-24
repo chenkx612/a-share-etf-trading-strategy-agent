@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from quant_core.research.checkpoint import CheckpointReceiver, RUNTIME_DIR, submit
+from quant_core.research.checkpoint import (
+    CheckpointReceiver,
+    RUNTIME_DIR,
+    TRUSTED_STATUS_FILE,
+    submit,
+)
 
 
 def _metadata(label: str) -> dict[str, str]:
@@ -131,3 +136,33 @@ def test_checkpoint_receiver_rejects_invalid_python(tmp_path: Path) -> None:
         receiver.stop()
 
     assert receiver.latest_valid() is None
+
+
+def test_checkpoint_receiver_publishes_trusted_latest_status(tmp_path: Path) -> None:
+    output = tmp_path / "round"
+    output.mkdir()
+    receiver = CheckpointReceiver(
+        tmp_path,
+        output,
+        "strategy.py",
+        None,
+        10.0,
+        monotonic=lambda: 0.0,
+    )
+    receiver.start()
+    trusted_status = receiver.trusted_runtime / TRUSTED_STATUS_FILE
+    try:
+        initial = json.loads(trusted_status.read_text(encoding="utf-8"))
+        assert initial["latest_checkpoint"] is None
+        (tmp_path / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
+        accepted = _submit(tmp_path, "trusted")
+        status = json.loads(trusted_status.read_text(encoding="utf-8"))
+        assert status["latest_checkpoint"]["checkpoint_id"] == "001"
+        assert (
+            status["latest_checkpoint"]["strategy_sha256"]
+            == accepted["strategy_sha256"]
+        )
+    finally:
+        receiver.stop()
+
+    assert not receiver.trusted_runtime.exists()

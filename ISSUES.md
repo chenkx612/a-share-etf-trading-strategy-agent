@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Agent 单次 Shell 时限与 Round 评测预算不一致 |
 | P1 | Evaluator 契约包含无关文档并触发 Champion 重评 |
 | P1 | 终局报告 Prompt 通过 argv 传递会超过系统上限 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
@@ -45,23 +44,6 @@
 ## 一、待解决问题
 
 ### P1：推荐优先解决
-
-#### Agent 单次 Shell 时限与 Round 评测预算不一致
-
-- **问题**：Harness 为候选声明并强制 `budget.round_minutes = 30`，但 OpenCode `bash` 工具会在
-  600 秒终止单条命令。任务允许最多 128 组参数，Prompt 只给出 Harness Round 截止时间，没有声明
-  这一更短的命令时限。本次 Run 003 Round 001 的 36 组参数 Development walk-forward 持续占用
-  单核正常计算，却在 600 秒被工具终止；此前已通过的策略尚未来得及 checkpoint，浪费约三分之一
-  Round 预算并迫使 Agent 临时改写和缩网格。
-- **方案**：把候选可依赖的单命令硬时限纳入任务/Prompt 契约，并在 Harness 校验参数网格时结合
-  折数与一次选择基准给出可执行性预警；更稳妥的做法是由 Harness 提供可取消、可观测、时限不超过
-  Round 剩余预算的 Development 评测接口。Agent 仍应先提交通过 focused test 的 checkpoint，
-  再启动可能接近时限的完整评测。
-- **验证**：构造评测耗时超过 600 秒但小于 Round 预算的假 evaluator，确认不会被未声明的工具时限
-  静默截断；或确认 Prompt 明确暴露限制且 Agent 在长评测前已冻结 checkpoint。记录终止原因、实际
-  运行时间和剩余 Round 预算。
-- **风险**：中。候选可通过缩小网格或优化策略绕开，但失败可能耗尽研发轮次，且
-  `max_parameter_sets` 当前不能代表实际可执行搜索预算。
 
 #### Evaluator 契约包含无关文档并触发 Champion 重评
 
@@ -265,6 +247,26 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
+
+#### Agent 单次 Shell 时限与 Round 评测预算不一致
+
+- **问题**：候选 Round 有 30 分钟研发预算，但 OpenCode Bash 工具曾以未声明的 600 秒时限
+  截断完整 Development walk-forward；`max_parameter_sets` 只限制结构大小，不能代表实际可完成的
+  搜索预算。
+- **解决**：研究镜像固定升级到 OpenCode 1.18.3；Harness 启动候选容器时显式设置
+  `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` 为 Round 时限，并在 Prompt 中声明该契约。
+  Agent 专用 Development 配置通过嵌套只读挂载读取 Harness-owned checkpoint 状态，要求当前策略
+  已有真实冻结副本；随后按首尾折首组参数的耗时估算
+  `folds × (parameters + 1) × 1.25`，从实时剩余 Round 时间扣除 Round 时长四分之一、最多
+  300 秒的 finalization 预留后，预计超预算即提前拒绝而不裁剪网格。进度、实际耗时、剩余预算和
+  终止原因原子写入对应 backtest 输出的 `progress.json`；Round 超时时 Harness 将最后进度附加到
+  stage event。Harness-owned
+  Development/Gate 复评仍使用不含这些研发控制项的固定 evaluator 配置。
+- **验证**：测试覆盖 Docker 环境变量及 checkpoint 状态只读挂载、伪造 workspace ack 无效、Prompt
+  时限声明、缺失或哈希不匹配 checkpoint、短 Round 预留、超预算提前拒绝、首尾折校准结果复用、
+  完成进度和 Round 超时事件；Conda `quant` 回归测试通过。
+- **风险**：耗时估算基于两个折的保守采样，极端非均匀策略仍可能在外层 Round 截止处被终止；
+  `max_parameter_sets` 仍是结构上限，不能替代运行时估算。
 
 #### Champion 指标值与适用性必须独立于 disposable runtime
 

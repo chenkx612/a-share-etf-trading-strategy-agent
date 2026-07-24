@@ -1,4 +1,4 @@
-ARG OPENCODE_VERSION=1.17.13
+ARG OPENCODE_VERSION=1.18.3
 FROM ghcr.io/anomalyco/opencode:${OPENCODE_VERSION} AS opencode
 
 FROM python:3.11-slim-bookworm
