@@ -218,6 +218,7 @@ class ResearchWorkspace:
     task_id: str
     run_number: int | None = None
     evaluation_environment_sha256: str | None = None
+    diagnostics_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.source = self.source.resolve()
@@ -297,6 +298,16 @@ class ResearchWorkspace:
         return self.run_temp / "events.jsonl"
 
     @property
+    def diagnostics_root(self) -> Path:
+        if self.run_number is None:
+            raise RuntimeError("research workspace is not bound to a run")
+        return self.root / ".cache" / "diagnostics" / self.run_id
+
+    @property
+    def diagnostics_event_path(self) -> Path:
+        return self.diagnostics_root / "events.jsonl"
+
+    @property
     def candidates(self) -> Path:
         return self.root / ".tmp" / "worktrees" / self.run_id / "candidates"
 
@@ -335,6 +346,7 @@ class ResearchWorkspace:
             self.task_id,
             run_number=run_number,
             evaluation_environment_sha256=self.evaluation_environment_sha256,
+            diagnostics_enabled=self.diagnostics_enabled,
         )
 
     def next_run_number(self) -> int:
@@ -930,6 +942,146 @@ class ResearchWorkspace:
 
         return {"removed_files": removed_files, "removed_bytes": removed_bytes}
 
+    def clear_diagnostics(self) -> None:
+        """Remove opt-in, disposable diagnostics for this task."""
+        shutil.rmtree(self.root / ".cache" / "diagnostics", ignore_errors=True)
+
+    def finalize_diagnostics(self, state: Mapping[str, Any]) -> Path | None:
+        """Freeze a deterministic post-run diagnostic index."""
+        if not self.diagnostics_enabled or self.run_number is None:
+            return None
+        self.diagnostics_root.mkdir(parents=True, exist_ok=True)
+        events: list[dict[str, Any]] = []
+        try:
+            for line in self.diagnostics_event_path.read_text(encoding="utf-8").splitlines():
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    events.append(value)
+        except (OSError, json.JSONDecodeError):
+            events = []
+
+        findings: list[dict[str, Any]] = []
+        round_records: list[dict[str, Any]] = []
+        raw_round_ids = state.get("round_ids")
+        round_ids = raw_round_ids if isinstance(raw_round_ids, list) else []
+        diagnostic_round_ids = list(round_ids)
+        current_round = state.get("current_round")
+        if (
+            isinstance(current_round, str)
+            and current_round.isdigit()
+            and int(current_round) > 0
+            and current_round not in diagnostic_round_ids
+        ):
+            diagnostic_round_ids.append(current_round)
+        for round_id in diagnostic_round_ids:
+            if not isinstance(round_id, str):
+                continue
+            experiment = self.rounds / round_id
+            result: dict[str, Any] = {}
+            decision: dict[str, Any] = {}
+            for name, destination in (("result.json", result), ("decision.json", decision)):
+                try:
+                    value = json.loads((experiment / name).read_text(encoding="utf-8"))
+                    if isinstance(value, dict):
+                        destination.update(value)
+                    else:
+                        findings.append({"code": "invalid_round_artifact", "round": round_id, "path": f"rounds/{round_id}/{name}"})
+                except FileNotFoundError:
+                    findings.append({"code": "missing_round_artifact", "round": round_id, "path": f"rounds/{round_id}/{name}"})
+                except (OSError, json.JSONDecodeError):
+                    findings.append({"code": "invalid_round_artifact", "round": round_id, "path": f"rounds/{round_id}/{name}"})
+            timing = result.get("round_timing")
+            duration = timing.get("duration_seconds") if isinstance(timing, dict) else None
+            attempts = result.get("development_attempts")
+            round_records.append({
+                "round": round_id,
+                "status": result.get("status"),
+                "decision": decision.get("decision"),
+                "duration_seconds": duration,
+                "development_attempts": len(attempts) if isinstance(attempts, list) else 0,
+                "failure_kind": result.get("failure_kind"),
+                "failure_code": result.get("failure_code"),
+            })
+            if result.get("status") == "completed" and decision.get("decision") == "failed":
+                findings.append({"code": "completed_result_failed_decision", "round": round_id})
+
+        try:
+            counted = sum(int(state.get(key, 0)) for key in ("accepted", "rejected", "failed"))
+            completed = int(state.get("rounds_completed", 0))
+        except (TypeError, ValueError):
+            findings.append({"code": "invalid_decision_counters"})
+        else:
+            if counted != completed:
+                findings.append({"code": "decision_counter_mismatch"})
+            if len(round_ids) != completed:
+                findings.append({"code": "round_id_count_mismatch"})
+
+        gaps: list[dict[str, Any]] = []
+        timestamped_events: list[tuple[datetime, dict[str, Any]]] = []
+        for event in events:
+            try:
+                timestamp = datetime.fromisoformat(str(event.get("timestamp")).replace("Z", "+00:00"))
+            except ValueError:
+                findings.append({"code": "invalid_event_timestamp"})
+                continue
+            timestamped_events.append((timestamp, event))
+        timestamped_events.sort(key=lambda item: item[0])
+        for previous, current in zip(timestamped_events, timestamped_events[1:]):
+            seconds = (current[0] - previous[0]).total_seconds()
+            if seconds < 60:
+                continue
+            previous_round = previous[1].get("round")
+            current_round = current[1].get("round")
+            gaps.append({
+                "round": current_round if current_round == previous_round else None,
+                "seconds": seconds,
+                "after": previous[1].get("event"),
+                "before": current[1].get("event"),
+            })
+        gaps.sort(key=lambda item: float(item["seconds"]), reverse=True)
+        findings.extend({"code": "long_event_gap", **gap} for gap in gaps[:10])
+
+        artifacts: list[dict[str, Any]] = []
+        for round_id in diagnostic_round_ids:
+            if not isinstance(round_id, str):
+                continue
+            experiment = self.rounds / round_id
+            for name in (
+                "tests.log", "development.log", "gate.log",
+                "champion-development.log", "champion-gate.log",
+            ):
+                source = experiment / name
+                if not source.is_file():
+                    continue
+                content = source.read_bytes()
+                tail = content[-65536:]
+                target = self.diagnostics_root / "logs" / round_id / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(tail)
+                artifacts.append({
+                    "path": target.relative_to(self.diagnostics_root).as_posix(),
+                    "source": source.relative_to(self.run_root).as_posix(),
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "truncated": len(tail) != len(content),
+                })
+
+        path = self.diagnostics_root / "diagnostic-summary.json"
+        write_json_atomic(path, {
+            "schema_version": 1,
+            "task_id": self.task_id,
+            "run": self.run_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "stop_reason": state.get("stop_reason"),
+            "status": state.get("status"),
+            "report_status": state.get("report_status"),
+            "event_count": len(events),
+            "rounds": round_records,
+            "findings": findings,
+            "artifacts": artifacts,
+        })
+        return path
+
     def emit_event(self, event: str, **details: Any) -> None:
         if self.run_number is None:
             return
@@ -942,6 +1094,12 @@ class ResearchWorkspace:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
         with self.event_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
+        if self.diagnostics_enabled:
+            self.diagnostics_event_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.diagnostics_event_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                handle.flush()
         round_id = details.get("round")
         scope = f"{self.run_id}/{round_id}" if isinstance(round_id, str) else self.run_id
         message = str(details.get("message") or event.replace("_", " "))

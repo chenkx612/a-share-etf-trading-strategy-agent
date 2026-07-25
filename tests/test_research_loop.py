@@ -203,6 +203,37 @@ def test_loop_stops_after_consecutive_failed_rounds(
     assert "[001/003] completed: failed" in output
 
 
+def test_loop_retain_diagnostics_preserves_event_timeline_and_summary(tmp_path: Path) -> None:
+    task = _task(tmp_path, max_rounds=1)
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=_reporter,
+        retain_diagnostics=True,
+    )
+
+    diagnostics = tmp_path / ".research/loop-test/.cache/diagnostics/001"
+    events = [json.loads(line) for line in (diagnostics / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    summary = json.loads((diagnostics / "diagnostic-summary.json").read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert state["diagnostics_enabled"] is True
+    assert not (tmp_path / ".research/loop-test/.tmp/runs/001/events.jsonl").exists()
+    assert [event["event"] for event in events][-2:] == ["report_completed", "run_completed"]
+    assert summary["event_count"] == len(events)
+    assert summary["rounds"] == [{
+        "round": "001",
+        "status": "completed",
+        "decision": "rejected",
+        "duration_seconds": None,
+        "development_attempts": 0,
+        "failure_kind": None,
+        "failure_code": None,
+    }]
+
+
 def test_container_preflight_failure_does_not_allocate_a_run(tmp_path: Path) -> None:
     task = _task(tmp_path)
 
@@ -916,6 +947,12 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
         run_number: int,
         event_sink,
     ) -> Path:
+        experiment = (
+            research_root / "loop-test" / "runs" / f"{run_number:03d}"
+            / "rounds" / experiment_id
+        )
+        experiment.mkdir(parents=True)
+        (experiment / "tests.log").write_text("runner detail\n", encoding="utf-8")
         raise RuntimeError("runner bug")
 
     with pytest.raises(RuntimeError, match="runner bug"):
@@ -925,6 +962,7 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
             managed_runner=fail,
             reporter=_reporter,
             monotonic=lambda: next(times),
+            retain_diagnostics=True,
         )
 
     state = json.loads(
@@ -933,6 +971,20 @@ def test_loop_records_elapsed_time_before_reraising_runner_error(tmp_path: Path)
     assert state["status"] == "interrupted"
     assert state["stop_reason"] == "runner_error"
     assert state["elapsed_seconds"] == 120.0
+    diagnostics = tmp_path / ".research/loop-test/.cache/diagnostics/001"
+    summary = json.loads(
+        (diagnostics / "diagnostic-summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["rounds"] == [{
+        "round": "001",
+        "status": None,
+        "decision": None,
+        "duration_seconds": None,
+        "development_attempts": 0,
+        "failure_kind": None,
+        "failure_code": None,
+    }]
+    assert summary["artifacts"][0]["source"] == "rounds/001/tests.log"
 
 
 def test_report_failure_does_not_change_loop_result(tmp_path: Path) -> None:

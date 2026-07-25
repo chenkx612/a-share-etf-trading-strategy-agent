@@ -2353,11 +2353,18 @@ def _evaluate_existing(
     experiment_id: str,
     output_dir: Path,
     command_runner: CommandRunner,
+    event_sink: EventSink | None = None,
+    round_id: str | None = None,
+    stale_reasons: Sequence[str] = (),
 ) -> dict[str, Any]:
     raw = task.raw
     timeout = int(raw["opencode"]["timeout_minutes"]) * 60
     metrics: dict[str, Any] = {}
     copy_runtime_inputs(runtime_source, workspace)
+    details: dict[str, Any] = {"round": round_id} if round_id is not None else {}
+    if stale_reasons:
+        details["stale_reasons"] = list(stale_reasons)
+    _emit(event_sink, "champion_reevaluation_started", message="champion reevaluation started", **details)
     for label in ("development", "gate"):
         values = _values(
             task,
@@ -2366,6 +2373,7 @@ def _evaluate_existing(
             workspace,
         )
         command = _evaluation_command(task, task_path, label, values)
+        _emit(event_sink, f"champion_{label}_started", message=f"champion {label} started", **details)
         if _run_with_failure_log(
             command_runner,
             command,
@@ -2373,12 +2381,16 @@ def _evaluate_existing(
             output_dir / f"champion-{label}.log",
             timeout,
         ) != 0:
+            _emit(event_sink, f"champion_{label}_failed", message=f"champion {label} failed", **details)
             raise RuntimeError(f"champion {label} backtest failed")
         metrics_path = workspace / str(raw["commands"]["metrics_path"]).format_map(values)
         try:
             metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
+            _emit(event_sink, f"champion_{label}_failed", message=f"invalid champion {label} metrics", **details)
             raise RuntimeError(f"invalid champion {label} metrics") from exc
+        _emit(event_sink, f"champion_{label}_completed", message=f"champion {label} completed", **details)
+    _emit(event_sink, "champion_reevaluation_completed", message="champion reevaluation completed", **details)
     return metrics
 
 
@@ -2727,6 +2739,12 @@ def run_managed_once(
     evaluated_champion_record: dict[str, Any] | None = None
     if has_champion and not isinstance(champion_metrics, dict):
         evaluator = manager.create_champion_evaluator(round_id, state)
+        metrics_record = state.get("champion_metrics_record")
+        stale_reasons = (
+            metrics_record.get("stale_reasons", [])
+            if isinstance(metrics_record, Mapping)
+            else ["missing_champion_metrics"]
+        )
         try:
             champion_metrics = _evaluate_existing(
                 task,
@@ -2736,6 +2754,9 @@ def run_managed_once(
                 round_id,
                 experiment,
                 command_runner,
+                event_sink=event_sink,
+                round_id=round_id,
+                stale_reasons=stale_reasons if isinstance(stale_reasons, list) else (),
             )
             evaluated_champion_record = manager.metrics_record(
                 champion_metrics,
@@ -2743,6 +2764,12 @@ def run_managed_once(
                 record_id,
             )
         except RuntimeError as exc:
+            _emit(
+                event_sink,
+                "champion_reevaluation_failed",
+                round=round_id,
+                message="champion reevaluation failed",
+            )
             decision = {
                 "experiment_id": result["experiment_id"],
                 "decision": "failed",

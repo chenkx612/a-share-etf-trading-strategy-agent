@@ -75,6 +75,10 @@ docker build \
 ```bash
 conda run --no-capture-output -n quant python -m quant_core.cli research loop \
   --task path/to/task.toml
+
+# 为事后 Codex 复盘保留可清理的诊断证据包
+conda run --no-capture-output -n quant python -m quant_core.cli research loop \
+  --task path/to/task.toml --retain-diagnostics
 ```
 
 启动新的 Loop Run 前，先检查
@@ -215,6 +219,10 @@ conda run --no-capture-output -n quant python -m quant_core.cli research clean \
 不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop
 的阶段事件会同时输出到终端和
 `.research/<task-id>/.tmp/runs/<run>/events.jsonl`，正常结束后清理临时事件与 worktree。
+使用 `--retain-diagnostics` 时，Harness 还会将不含精确 Gate 指标的事件时间线、阶段日志尾部和
+确定性 `diagnostic-summary.json` 保存到 `.research/<task-id>/.cache/diagnostics/<run>/`。该开关对
+同一活动 Run 的恢复保持有效，适合在 Loop 停止后让 Codex 只检查摘要和异常 Round；这些缓存可由
+`research clean` 删除，不参与晋级或后续候选 Prompt。
 
 Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止；`rejected` 是正常研究结果，
 不增加连续失败计数。总时长预算只阻止启动下一 Round；`budget.round_minutes` 会硬终止超时的
@@ -223,7 +231,7 @@ Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止
 Run，没有完整决策的当前 Round 会作为失败证据
 落盘；已经正常停止的 Run 不会恢复，而是分配下一个编号。
 
-`research clean` 不会删除结构化 Round 结果、Decision、候选 checkpoint、patch、首次 0→1
+`research clean` 会删除可选诊断缓存，但不会删除结构化 Round 结果、Decision、候选 checkpoint、patch、首次 0→1
 候选源码、Champion、冻结的 Evaluation 数据或终局报告，也不会清理仍在运行的 Loop。
 
 ## Quant framework

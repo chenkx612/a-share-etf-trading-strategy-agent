@@ -510,6 +510,7 @@ def command_research_loop(args: argparse.Namespace) -> None:
             args.task,
             workspace=args.root,
             research_root=args.research_root,
+            retain_diagnostics=args.retain_diagnostics,
         )
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
@@ -563,6 +564,7 @@ def command_research_clean(args: argparse.Namespace) -> None:
         manager.load_state(task.strategy_path if task is not None else None)
     manager.migrate_legacy_loop()
     manager.cleanup_transient(remove_development_cache=True)
+    manager.clear_diagnostics()
     summary = manager.compact_artifacts()
     print(
         f"removed {summary['removed_files']} redundant files "
@@ -725,6 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
     research_loop = research_sub.add_parser("loop")
     research_loop.add_argument("--task", required=True)
     research_loop.add_argument("--research-root", default=".research")
+    research_loop.add_argument(
+        "--retain-diagnostics",
+        action="store_true",
+        help="retain disposable post-run diagnostics under the research cache",
+    )
     research_loop.set_defaults(func=command_research_loop)
     research_report = research_sub.add_parser("report")
     research_report.add_argument("--task", required=True)

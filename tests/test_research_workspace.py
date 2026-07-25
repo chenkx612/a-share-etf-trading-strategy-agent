@@ -1388,6 +1388,67 @@ def test_compact_artifacts_removes_success_diagnostics_but_keeps_failure_logs(
     assert (failed / "tests.log").exists()
 
 
+def test_clear_diagnostics_removes_only_diagnostic_cache(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "diagnostic-clean").for_run(1)
+    manager.diagnostics_root.mkdir(parents=True)
+    (manager.diagnostics_root / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    durable = manager.rounds / "001" / "result.json"
+    durable.parent.mkdir(parents=True)
+    durable.write_text("{}", encoding="utf-8")
+
+    manager.clear_diagnostics()
+
+    assert not manager.diagnostics_root.exists()
+    assert durable.is_file()
+
+
+def test_diagnostic_gaps_use_adjacent_events_across_the_full_timeline(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "diagnostic-gaps",
+        run_number=1,
+        diagnostics_enabled=True,
+    )
+    events = [
+        {"timestamp": "2026-01-01T00:00:00+00:00", "event": "run_started"},
+        {"timestamp": "2026-01-01T00:00:30+00:00", "event": "round_started", "round": "001"},
+        {"timestamp": "2026-01-01T00:00:50+00:00", "event": "round_completed", "round": "001"},
+        {"timestamp": "2026-01-01T00:02:00+00:00", "event": "round_started", "round": "002"},
+        {"timestamp": "2026-01-01T00:02:10+00:00", "event": "run_stopping"},
+    ]
+    manager.diagnostics_event_path.parent.mkdir(parents=True)
+    manager.diagnostics_event_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    summary_path = manager.finalize_diagnostics({
+        "round_ids": [],
+        "rounds_completed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "failed": 0,
+    })
+
+    assert summary_path is not None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    gaps = [finding for finding in summary["findings"] if finding["code"] == "long_event_gap"]
+    assert gaps == [{
+        "code": "long_event_gap",
+        "round": None,
+        "seconds": 70.0,
+        "after": "round_completed",
+        "before": "round_started",
+    }]
+
+
 def test_round_id_cannot_escape_task_workspace(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     _init_repo(tmp_path)

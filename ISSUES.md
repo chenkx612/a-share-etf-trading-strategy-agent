@@ -33,32 +33,11 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P2 | Champion 初评与重评缺少阶段事件 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 
 ## 一、待解决问题
 
 ### P2：有时间时优化
-
-#### Champion 初评与重评缺少阶段事件
-
-- **问题**：新任务以 `baseline.mode = "workspace"` 初始化 Champion #0 时，
-  `champion_metrics_record` 为空；首个候选完成 Development 和 Gate 后，Harness 会先为基线
-  Champion 补做 Development/Gate 初评再生成 Decision。已有任务中，Run 004 Round 001 的候选
-  Development 和 Gate 均已完成并发出事件后，Harness 也会因
-  `evaluator_contract_sha256_changed` 在隔离 evaluator worktree 中重新评测现有 Champion。
-  Champion 初评或重评期间 stdout 与
-  `.research/<task-id>/.tmp/runs/<run>/events.jsonl` 均没有开始、完成或进度事件，外部监督者只能通过
-  临时 evaluator 输出目录反推进度；两种路径都会形成数分钟无可观测状态，容易被误判为 Gate 后卡死。
-- **方案**：在 `_evaluate_existing()` 调用边界为 Champion 重评增加
-  `champion_reevaluation_started`、逐阶段 started/completed、failed 和最终 completed 事件，并包含
-  stale 原因但不输出精确 Gate 指标；同一事件协议应覆盖 `champion_metrics_record` 为空的首次初评。
-  若固定 evaluator 能提供安全的进度文件，可只转发折号、总折数和 elapsed 等非 Gate 内容；事件仍写入
-  现有活动 Run 临时流，不新增永久成功轨迹。
-- **验证**：分别构造 workspace Champion 首次评估，以及 evaluator 契约、数据指纹或评测环境变化使
-  Champion 指标 stale 的重评，确认候选 Gate 完成后到 Decision 落盘前持续存在可审计阶段事件；覆盖
-  初评/重评成功、命令失败和中断恢复，且事件不得向后续候选泄露 Champion 或候选的精确 Gate 指标。
-- **风险**：低。缺口不改变固定评测、约束或晋级结果，但降低长时间运行的外部可观测性和故障定位效率。
 
 #### 中断或基础设施失败仍会消耗研发轮次
 
@@ -74,6 +53,18 @@
 
 本节只保留会影响信任边界、评测语义、恢复一致性或长时间运行可靠性的经验。一次性的字段遗漏、
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
+
+### P2：诊断可观测性
+
+#### Champion 初评与重评缺少阶段事件
+
+- **问题**：Champion 初评或因 evaluator/data/environment 变化而重评时，外部观察者会在候选 Gate
+  后看到数分钟无事件，难以区分正常重评与卡死。
+- **解决**：`_evaluate_existing()` 现在发出 Champion 重评及 Development/Gate 子阶段的 started、completed、
+  failed 事件，携带 stale 原因但不携带精确 Gate 指标。`research loop --retain-diagnostics` 可将该时间线和
+  确定性摘要保留到可清理缓存，供终局离线复盘。
+- **验证**：Loop 与 runner 测试覆盖诊断时间线和终局摘要；事件仍经原有候选隔离边界写入，不进入后续候选 Prompt。
+- **风险**：事件仅描述阶段状态；精确 Gate 指标仍只存在于冻结 Round 评测产物中。
 
 ### P1：曾影响终局复盘完整性
 

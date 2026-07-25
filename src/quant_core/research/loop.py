@@ -51,6 +51,7 @@ def _new_state(
     fingerprint: str,
     run_number: int,
     evaluation_environment_sha256: str,
+    diagnostics_enabled: bool,
 ) -> dict[str, Any]:
     now = _timestamp()
     return {
@@ -77,6 +78,7 @@ def _new_state(
         "report_error": None,
         "report_failure_kind": None,
         "report_failure_code": None,
+        "diagnostics_enabled": diagnostics_enabled,
     }
 
 
@@ -204,6 +206,8 @@ def _finish_with_report(
     except KeyboardInterrupt:
         state["report_status"] = "interrupted"
         state["report_error"] = "Report generation was interrupted"
+        manager.emit_event("report_interrupted", message="report interrupted")
+        manager.finalize_diagnostics(state)
         manager.cleanup_transient(remove_development_cache=True)
         _save(loop_state_path, state)
         raise
@@ -212,12 +216,16 @@ def _finish_with_report(
         state["report_error"] = str(exc)
         state["report_failure_kind"] = getattr(exc, "failure_kind", None)
         state["report_failure_code"] = getattr(exc, "failure_code", None)
+        manager.emit_event("report_failed", message="report failed")
     else:
         state["report_status"] = "completed"
         try:
             state["report_path"] = report_path.relative_to(manager.run_root).as_posix()
         except ValueError:
             state["report_path"] = str(report_path)
+        manager.emit_event("report_completed", message="report completed")
+    manager.emit_event("run_completed", message=f"stopped: {reason}")
+    manager.finalize_diagnostics(state)
     manager.compact_artifacts()
     manager.cleanup_transient(remove_development_cache=True)
     _save(loop_state_path, state)
@@ -235,6 +243,7 @@ def run_loop(
     container_preflight: ContainerPreflight | None = None,
     provider_preflight: ProviderPreflight | None = None,
     environment_probe: EnvironmentProbe | None = None,
+    retain_diagnostics: bool = False,
 ) -> Path:
     """Run managed research rounds until one of the configured budgets is exhausted."""
     task_file = Path(task_path).resolve()
@@ -298,9 +307,14 @@ def run_loop(
         if state.get("task_fingerprint") != fingerprint:
             raise ValueError("task.toml changed while a research loop was running")
         manager = base_manager.for_run(run_number)
+        diagnostics_enabled = bool(state.get("diagnostics_enabled", False) or retain_diagnostics)
+        state["diagnostics_enabled"] = diagnostics_enabled
+        manager.diagnostics_enabled = diagnostics_enabled
     else:
         run_number = base_manager.next_run_number()
         manager = base_manager.for_run(run_number)
+        diagnostics_enabled = retain_diagnostics
+        manager.diagnostics_enabled = diagnostics_enabled
 
     if active_runs and state.get("evaluation_environment_sha256") != environment.sha256:
         current = state.get("current_round")
@@ -369,7 +383,7 @@ def run_loop(
         lifecycle_event = ("run_resumed", "resumed")
     else:
         manager.rounds.mkdir(parents=True, exist_ok=False)
-        state = _new_state(task, fingerprint, run_number, environment.sha256)
+        state = _new_state(task, fingerprint, run_number, environment.sha256, diagnostics_enabled)
         lifecycle_event = ("run_started", "started")
     loop_state_path = manager.loop_state_path
     _save(loop_state_path, state)
@@ -492,11 +506,12 @@ def run_loop(
                     manager.discard_prepared_candidate(candidate)
                 state["status"] = "interrupted"
                 state["stop_reason"] = "interrupted"
-                manager.cleanup_transient(preserve_worktree_parents=True)
                 manager.emit_event(
                     "run_interrupted",
                     message="interrupted before Round allocation",
                 )
+                manager.finalize_diagnostics(state)
+                manager.cleanup_transient(preserve_worktree_parents=True)
                 _save(loop_state_path, state)
                 return loop_state_path
             except Exception:
@@ -522,16 +537,18 @@ def run_loop(
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"
             state["stop_reason"] = "interrupted"
-            manager.cleanup_transient(preserve_worktree_parents=True)
             manager.emit_event("run_interrupted", round=round_id, message="interrupted")
+            manager.finalize_diagnostics(state)
+            manager.cleanup_transient(preserve_worktree_parents=True)
             _save(loop_state_path, state)
             return loop_state_path
         except Exception:
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"
             state["stop_reason"] = "runner_error"
-            manager.cleanup_transient(preserve_worktree_parents=True)
             manager.emit_event("runner_error", round=round_id, message="runner error")
+            manager.finalize_diagnostics(state)
+            manager.cleanup_transient(preserve_worktree_parents=True)
             _save(loop_state_path, state)
             raise
 
