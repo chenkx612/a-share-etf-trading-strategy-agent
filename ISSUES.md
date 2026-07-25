@@ -33,15 +33,63 @@
 
 | 优先级 | 问题 |
 | --- | --- |
+| P1 | Agent 可在同一 Round 内切换主要研究机制 |
+| P1 | 终局报告未从 Parent—Patch—Champion 事实链核验机制演进 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | Harness 风险登记文件名在仓库说明中不一致 |
 | P2 | Evaluator 指纹计算依赖可写 Git 对象库 |
-| P2 | Stale Champion 重评缺少阶段事件 |
+| P2 | Champion 初评与重评缺少阶段事件 |
 | P2 | 报告解析因标题前说明文字误判有效 Markdown |
 
 ## 一、待解决问题
+
+### P1：推荐优先解决
+
+#### Agent 可在同一 Round 内切换主要研究机制
+
+- **问题**：任务 Goal 明确要求“每轮只验证一个主要机制”，但 active-etf-rerank-topk Run 001
+  Round 002 在完整评估“防御袖套跳过动量持仓”后，因 Development 结果较弱，又在同一 Round
+  切换到 `rank_buffer` 迟滞并继续修改、评估和提交候选。当前 Prompt 只用自然语言约束单机制，
+  Checkpoint 和 Result 合同也只描述最终保留的候选，无法阻止或结构化记录同轮已经完整验证后放弃的
+  其他机制。这会混用 Round 时间和参数搜索预算，削弱“一次一个候选”的失败归因，并可能让永久
+  `result.json` 与候选补丁无法完整解释本轮实际研究路径。该 Round 最终晋级的迟滞 Champion 还保留
+  了被放弃的 `sleeve_dedup` 参数和分支（网格固定为 `false`）；下一轮 Agent 因此误判此前被拒绝的
+  截面百分位信号也属于当前 Champion，说明同轮切换会进一步污染父版本可读性和后续历史理解。
+  Run 001 Round 006 最终又把该被拒绝的截面百分位与 Kaufman 效率缩放组合提交并晋级，而
+  `result.json.hypothesis` 只把效率缩放表述为新增主机制；固定指标足以支持 Promotion，却无法证明
+  改善来自哪一个增量机制。
+- **方案**：把 Round 的主假设变成提交首个 Development 评估前必须冻结的结构化字段，并在后续
+  checkpoint 中保持机制标识不变；允许同一机制内的实现修正和小范围收敛，但检测到参数/行为契约之外
+  的机制切换时，应要求结束当前 Round，由下一 Round 继承脱敏结论。Result 应记录本轮所有已执行的
+  完整 Development 评估及其机制标识，避免只保留最终候选摘要。
+- **验证**：用假 Agent 先完整评估 sleeve dedup、再切换 rank buffer，确认第二种机制不能在同一
+  Round 继续提交；同时覆盖同一机制的 bug 修正、邻近参数收敛和截止前 checkpoint 更新，确保这些
+  合理迭代不会被误拦截。
+- **风险**：中。固定 Evaluator、Gate 隔离和 Promotion 仍可信，但研究预算、机制归因与审计完整性
+  会受影响，死配置还可能诱发后续候选重新组合被拒绝机制并晋级；修复前需要外部监督者检查 Agent
+  事件和 Parent—Candidate 行为差异，不能仅凭 Result 的单一主假设做机制归因，并应在复盘时把同轮
+  被放弃的机制及残留代码人工补入结论。
+
+#### 终局报告未从 Parent—Patch—Champion 事实链核验机制演进
+
+- **问题**：active-etf-rerank-topk Run 001 的终局报告正确抄录了固定 Decision 和指标，但错误声称
+  Round 002 是“分位数相对动量 + rank_buffer”并在关键启发中把迟滞和效率缩放列为唯二晋级机制。
+  实际 Round 001 的分位数候选已被拒绝；Round 002 的 `candidate.patch` 只在中位数残差父版本上
+  增加迟滞和固定关闭的 `sleeve_dedup`。Round 006 才同时把中位数残差替换为分位数并增加效率缩放，
+  因而最终晋级不能从现有证据归因为“只在 r002 分位数基线上增加效率缩放”。报告生成器主要信任
+  Agent 的 `hypothesis`/`development_effect` 叙述，没有把冻结 Parent、Candidate Patch、Decision
+  和最终 Champion 做机器可验证的机制演进对账；`integrity_warnings` 仍为空。
+- **方案**：报告输入应为每轮提供父 Champion 哈希、父源码、候选补丁、候选源码哈希和 Promotion 后
+  Champion 哈希，并先由确定性代码生成结构化变更事实（参数增删、默认/网格变化、函数与分支增删）。
+  报告模型只能在该事实链上解释机制；若 Agent 叙述与补丁不一致，必须输出 integrity warning，并将
+  不可唯一归因的晋级标记为组合变更，不能自动写成单机制结论。
+- **验证**：构造“Round A 候选被拒绝、Round B Agent 误称 A 已进入 Champion、Round B 同时重新加入
+  A 和新机制后晋级”的历史，确认报告能识别真实 Parent 差异、列出组合变更并产生 warning；同时覆盖
+  单机制正常晋级，确保指标、Decision 和来源 Round 仍准确。
+- **风险**：中。Champion、固定指标和 Promotion 决策不受影响，但终局研究记忆会形成错误机制归因，
+  后续 Agent 可能据此把被拒绝机制当作已接受基线，持续污染候选设计与研究边界。
 
 ### P2：有时间时优化
 
@@ -102,20 +150,24 @@
 - **风险**：低。当前可在明确授权后于具有 Git 对象库写权限的宿主环境启动，不影响评测语义；
   但未授权提升权限时无法运行 Harness。
 
-#### Stale Champion 重评缺少阶段事件
+#### Champion 初评与重评缺少阶段事件
 
-- **问题**：Run 004 Round 001 的候选 Development 和 Gate 均已完成并发出事件后，Harness 因
+- **问题**：新任务以 `baseline.mode = "workspace"` 初始化 Champion #0 时，
+  `champion_metrics_record` 为空；首个候选完成 Development 和 Gate 后，Harness 会先为基线
+  Champion 补做 Development/Gate 初评再生成 Decision。已有任务中，Run 004 Round 001 的候选
+  Development 和 Gate 均已完成并发出事件后，Harness 也会因
   `evaluator_contract_sha256_changed` 在隔离 evaluator worktree 中重新评测现有 Champion。
-  Champion Development/Gate 重评期间 stdout 与
+  Champion 初评或重评期间 stdout 与
   `.research/<task-id>/.tmp/runs/<run>/events.jsonl` 均没有开始、完成或进度事件，外部监督者只能通过
-  临时 evaluator 输出目录反推进度；本次形成数分钟无可观测状态，容易被误判为 Gate 后卡死。
+  临时 evaluator 输出目录反推进度；两种路径都会形成数分钟无可观测状态，容易被误判为 Gate 后卡死。
 - **方案**：在 `_evaluate_existing()` 调用边界为 Champion 重评增加
   `champion_reevaluation_started`、逐阶段 started/completed、failed 和最终 completed 事件，并包含
-  stale 原因但不输出精确 Gate 指标。若固定 evaluator 能提供安全的进度文件，可只转发折号、总折数和
-  elapsed 等非 Gate 内容；事件仍写入现有活动 Run 临时流，不新增永久成功轨迹。
-- **验证**：构造 evaluator 契约、数据指纹或评测环境变化使 Champion 指标 stale，确认候选 Gate
-  完成后到 Decision 落盘前持续存在可审计阶段事件；覆盖重评成功、命令失败和中断恢复，且事件不得向
-  后续候选泄露 Champion 或候选的精确 Gate 指标。
+  stale 原因但不输出精确 Gate 指标；同一事件协议应覆盖 `champion_metrics_record` 为空的首次初评。
+  若固定 evaluator 能提供安全的进度文件，可只转发折号、总折数和 elapsed 等非 Gate 内容；事件仍写入
+  现有活动 Run 临时流，不新增永久成功轨迹。
+- **验证**：分别构造 workspace Champion 首次评估，以及 evaluator 契约、数据指纹或评测环境变化使
+  Champion 指标 stale 的重评，确认候选 Gate 完成后到 Decision 落盘前持续存在可审计阶段事件；覆盖
+  初评/重评成功、命令失败和中断恢复，且事件不得向后续候选泄露 Champion 或候选的精确 Gate 指标。
 - **风险**：低。缺口不改变固定评测、约束或晋级结果，但降低长时间运行的外部可观测性和故障定位效率。
 
 #### 报告解析因标题前说明文字误判有效 Markdown
