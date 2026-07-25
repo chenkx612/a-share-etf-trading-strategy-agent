@@ -13,6 +13,7 @@ import pytest
 
 import quant_core.research.report as research_report
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.environment import EvaluationEnvironment
 from quant_core.research.report import generate_loop_report, regenerate_loop_report
 from quant_core.research.report_facts import build_report_facts
 from quant_core.research.runner import _metrics_key
@@ -170,7 +171,13 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         captured.update(command=list(command), prompt=prompt, cwd=cwd, timeout=timeout)
         log_path.write_text(json.dumps({
             "type": "text",
-            "part": {"text": "# Research Loop 总结\n\n## 最终 Champion\n\nPARAMETER = 1"},
+            "part": {
+                "text": (
+                    "已掌握足够信息，生成完整复盘报告。\n\n"
+                    "# Research Loop 总结\n\n"
+                    "## 最终 Champion\n\nPARAMETER = 1"
+                ),
+            },
         }) + "\n", encoding="utf-8")
         return 0
 
@@ -210,6 +217,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert '"schema_version": 1' in facts
     assert "accepted Round lacks replayable Candidate evidence" in facts
     assert "Use a faster risk filter" not in prompt
+    assert "第一条非空行必须精确为 `# Research Loop 总结`" in prompt
     assert command[command.index("--file") + 1] == "/workspace/report-input.json"
     second_file = command.index("--file", command.index("--file") + 1)
     assert command[second_file + 1] == "/workspace/report-facts.json"
@@ -218,6 +226,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert captured["cwd"] == manager.run_root
     assert captured["timeout"] == 600
     assert report_path.read_text(encoding="utf-8").startswith("# Research Loop 总结")
+    assert "已掌握足够信息" not in report_path.read_text(encoding="utf-8")
     assert not (manager.run_root / "report-events.jsonl").exists()
     frozen_input = report_input.read_bytes()
     frozen_facts = report_facts.read_bytes()
@@ -588,6 +597,163 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
             {"rounds_completed": 0, "round_ids": []},
             agent_runner=fake_agent,
         )
+    assert (manager.run_root / "report-input.json").is_file()
+    assert manager.report_facts_path.is_file()
+    assert (manager.run_root / "report-events.jsonl").is_file()
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "# Research Loop 总结\n\n正文。",
+            "# Research Loop 总结\n\n正文。",
+        ),
+        (
+            "\n\n# Research Loop 总结  \n\n正文。\n",
+            "# Research Loop 总结\n\n正文。",
+        ),
+        (
+            "已掌握足够信息。\n继续生成报告。\n\n# Research Loop 总结\n\n正文。",
+            "# Research Loop 总结\n\n正文。",
+        ),
+    ],
+)
+def test_extract_markdown_report_accepts_unambiguous_plain_text_preamble(
+    text: str,
+    expected: str,
+) -> None:
+    assert research_report._extract_markdown_report(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "只有说明，没有标题。",
+        "# Research Loop 总结",
+        "# Research Loop 总结\n\n   ",
+        "# Research Loop 总结补充版\n\n正文。",
+        "# Research Loop 总结\n\n正文。\n\n# Research Loop 总结\n\n重复。",
+        "```markdown\n# Research Loop 总结\n\n正文。\n```",
+        '{"report":"# Research Loop 总结\\n\\n正文。"}',
+        "## 生成说明\n\n# Research Loop 总结\n\n正文。",
+        "状态说明\n-\n\n# Research Loop 总结\n\n正文。",
+        "状态说明\n--\n\n# Research Loop 总结\n\n正文。",
+        "- 已准备完成\n\n# Research Loop 总结\n\n正文。",
+        "> 已准备完成\n\n# Research Loop 总结\n\n正文。",
+        "```text\n准备完成\n```\n\n# Research Loop 总结\n\n正文。",
+        "| 状态 | 结果 |\n| --- | --- |\n\n# Research Loop 总结\n\n正文。",
+    ],
+)
+def test_extract_markdown_report_rejects_ambiguous_or_incomplete_output(
+    text: str,
+) -> None:
+    assert research_report._extract_markdown_report(text) is None
+
+
+def test_report_parse_failure_retry_preserves_decision_and_champion(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK, encoding="utf-8")
+    _repo(tmp_path)
+    environment = EvaluationEnvironment.from_manifest({"schema_version": 1})
+    base = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "report-test",
+        evaluation_environment_sha256=environment.sha256,
+    )
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
+    manager = base.for_run(1)
+    experiment = manager.rounds / "001"
+    experiment.mkdir(parents=True)
+    write_json_atomic(experiment / "result.json", {
+        "status": "completed",
+        "hypothesis": "No accepted change",
+    })
+    write_json_atomic(experiment / "decision.json", {
+        "experiment_id": "001/001",
+        "decision": "rejected",
+    })
+    write_json_atomic(manager.loop_state_path, {
+        "status": "stopped",
+        "stop_reason": "max_rounds",
+        "rounds_completed": 1,
+        "accepted": 0,
+        "rejected": 1,
+        "failed": 0,
+        "elapsed_seconds": 1.0,
+        "round_ids": ["001"],
+    })
+    champion_before = json.loads(base.state_path.read_text(encoding="utf-8"))
+    champion_source_before = base.champion_path.read_bytes()
+    decision_before = (experiment / "decision.json").read_bytes()
+
+    def ambiguous(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {
+                "text": "## 状态说明\n\n# Research Loop 总结\n\n正文。",
+            },
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    with pytest.raises(RuntimeError, match="no valid Markdown report"):
+        regenerate_loop_report(
+            task_path,
+            workspace=tmp_path,
+            run_number=1,
+            agent_runner=ambiguous,
+            evaluation_environment=environment,
+        )
+    frozen_input = (manager.run_root / "report-input.json").read_bytes()
+    frozen_facts = manager.report_facts_path.read_bytes()
+
+    def succeed(
+        command: Sequence[str],
+        prompt: str,
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": "# Research Loop 总结\n\n重试成功。"},
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    regenerate_loop_report(
+        task_path,
+        workspace=tmp_path,
+        run_number=1,
+        agent_runner=succeed,
+        evaluation_environment=environment,
+    )
+
+    champion_after = json.loads(base.state_path.read_text(encoding="utf-8"))
+    assert champion_after["champion_number"] == champion_before["champion_number"]
+    assert champion_after["champion_sha256"] == champion_before["champion_sha256"]
+    assert base.champion_path.read_bytes() == champion_source_before
+    assert (experiment / "decision.json").read_bytes() == decision_before
+    assert (manager.run_root / "report-input.json").read_bytes() == frozen_input
+    assert manager.report_facts_path.read_bytes() == frozen_facts
+    final_loop_state = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
+    assert final_loop_state["stop_reason"] == "max_rounds"
+    assert final_loop_state["rounds_completed"] == 1
+    assert final_loop_state["accepted"] == 0
+    assert final_loop_state["rejected"] == 1
+    assert final_loop_state["failed"] == 0
+    assert final_loop_state["report_status"] == "completed"
 
 
 def test_report_authentication_failure_is_retryable_with_frozen_input(

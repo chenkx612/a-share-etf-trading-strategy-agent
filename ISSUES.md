@@ -33,30 +33,10 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 报告解析因标题前说明文字误判有效 Markdown |
 | P2 | Champion 初评与重评缺少阶段事件 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 
 ## 一、待解决问题
-
-### P1：推荐解决
-
-#### 报告解析因标题前说明文字误判有效 Markdown
-
-- **问题**：Run 004 的报告会话以退出码 0 完成，并在最终 text event 中生成了完整的
-  `# Research Loop 总结` 报告，但在标题前附加一句“已掌握足够信息，生成完整复盘报告。”。
-  `generate_loop_report()` 使用
-  `report.lstrip().startswith("# Research Loop 总结")` 做严格前缀校验，因而把有效报告误判为
-  `OpenCode report session produced no valid Markdown report`，将 Run 的 `report_status` 记为
-  failed 并保留约 270 KiB 的冻结输入与完整事件。
-- **方案**：保持一级标题契约，但从最后 text event 中定位首个独占行
-  `# Research Loop 总结`，只在该行之前全部属于非 Markdown 前言时截取并保存其后的报告；仍拒绝缺少
-  标题、标题嵌在代码块/JSON 字符串、多个冲突标题或标题后为空的输出。Prompt 同时明确禁止标题前
-  前言，但不能只依赖 Prompt 保证解析可靠性。
-- **验证**：覆盖纯报告、前置空白、单句前言、代码块内伪标题、缺失标题、多个标题及标题后空内容；
-  确认成功时删除临时事件，失败时保留冻结输入和事件供相同输入重试，且报告重试不改变 Loop Decision
-  或 Champion。
-- **风险**：低。问题不影响研究评测和晋级，但会让成功 Run 缺少终局报告，并产生不必要的人工重试。
 
 ### P2：有时间时优化
 

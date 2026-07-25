@@ -35,6 +35,21 @@ _ROUND_ID = re.compile(r"^\d+$")
 _REPORT_INPUT_CONTAINER_PATH = "/workspace/report-input.json"
 _REPORT_FACTS_CONTAINER_PATH = "/workspace/report-facts.json"
 _REPORT_INSTRUCTION_MAX_BYTES = 64 * 1024
+_REPORT_TITLE = "# Research Loop 总结"
+_FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_MARKDOWN_PREAMBLE_BLOCK = re.compile(
+    r"^ {0,3}(?:"
+    r"#{1,6}(?:\s|$)|"
+    r">|"
+    r"[-+*]\s+|"
+    r"\d+[.)]\s+|"
+    r"<[/!?A-Za-z]|"
+    r"\[[^\]]+\]:"
+    r")"
+)
+_MARKDOWN_THEMATIC_OR_SETEXT = re.compile(
+    r"^ {0,3}(?:(?:\*\s*){3,}|-+|(?:-\s*){3,}|(?:_\s*){3,}|=+)\s*$"
+)
 
 
 class ReportInfrastructureError(RuntimeError):
@@ -186,6 +201,56 @@ def _last_text_event(events_path: Path) -> str | None:
     return text
 
 
+def _extract_markdown_report(text: str) -> str | None:
+    lines = text.splitlines()
+    title_indexes: list[int] = []
+    fence: tuple[str, int] | None = None
+
+    for index, line in enumerate(lines):
+        if fence is not None:
+            marker, minimum_length = fence
+            if re.fullmatch(
+                rf" {{0,3}}{re.escape(marker)}{{{minimum_length},}}\s*",
+                line,
+            ):
+                fence = None
+            continue
+
+        fence_match = _FENCE_START.match(line)
+        if fence_match is not None:
+            delimiter = fence_match.group(1)
+            fence = (delimiter[0], len(delimiter))
+            continue
+        if line.rstrip() == _REPORT_TITLE:
+            title_indexes.append(index)
+
+    if len(title_indexes) != 1:
+        return None
+    title_index = title_indexes[0]
+    if not any(line.strip() for line in lines[title_index + 1:]):
+        return None
+
+    for line in lines[:title_index]:
+        if not line.strip():
+            continue
+        if line.startswith(("\t", "    ")):
+            return None
+        stripped = line.lstrip()
+        if stripped.startswith(("{", "[", "|")):
+            return None
+        if _FENCE_START.match(line):
+            return None
+        if _MARKDOWN_PREAMBLE_BLOCK.match(line):
+            return None
+        if _MARKDOWN_THEMATIC_OR_SETEXT.fullmatch(line):
+            return None
+        if "|" in line and re.search(r":?-{3,}:?", line):
+            return None
+
+    report_lines = [_REPORT_TITLE, *lines[title_index + 1:]]
+    return "\n".join(report_lines).rstrip()
+
+
 def _report_prompt(champion_applicability: Mapping[str, Any]) -> str:
     lines = [
         "你是量化研发复盘员。根据所附 report-input.json 和 report-facts.json 中的 Harness 记录，"
@@ -224,7 +289,8 @@ def _report_prompt(champion_applicability: Mapping[str, Any]) -> str:
         "## 遗留风险与下一步",
         "只列最重要的 2 至 4 项。",
         "指标优先展示 objective 和硬约束相关项，避免堆砌所有数字。",
-        "最终回复必须只有 Markdown 正文，不要代码围栏、前言、致谢或 JSON。",
+        "最终回复的第一条非空行必须精确为 `# Research Loop 总结`；"
+        "此前不得输出分析、状态说明、代码围栏、前言、致谢或 JSON。",
     ]
     if champion_applicability:
         lines.extend([
@@ -429,8 +495,9 @@ def generate_loop_report(
             raise ReportInfrastructureError(failure.message, failure.code)
         reason = "timed out" if exit_code == 124 else f"exited with code {exit_code}"
         raise RuntimeError(f"OpenCode report session {reason}")
-    report = _last_text_event(events_path)
-    if report is None or not report.lstrip().startswith("# Research Loop 总结"):
+    event_text = _last_text_event(events_path)
+    report = _extract_markdown_report(event_text) if event_text is not None else None
+    if report is None:
         failed_events = manager.run_root / "report-events.jsonl"
         if events_path.exists():
             events_path.replace(failed_events)
