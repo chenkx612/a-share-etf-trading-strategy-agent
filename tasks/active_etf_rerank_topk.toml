@@ -1,0 +1,108 @@
+id = "active-etf-rerank-topk"
+goal = """
+以原 liquid-etf-rerank-topk 任务冻结的 Champion 为代码基线，在 universes/active_etf_rotation.csv 上重新建立并继续研发纯多头 ETF 横截面精排策略。基线仍是“中期趋势 Top-N + 逆波动 Top-N”的双袖套组合，并允许在原始区间动量与逐日截面处理中性化的趋势信号之间 walk-forward 选参。新任务只继承策略结构和参数网格，不继承旧股票池上的指标、参数优劣或晋级结论；Harness 必须先在新池和固定区间上独立评估基线，所有候选仅与本任务管理的当前 Champion 比较。
+
+active_etf_rotation.csv 是当前时点筛出的高活跃、低同质化 ETF 快照，包含境内宽基、风格、行业主题、港股、美股和黄金等异质风险暴露，并有较多较新上市品种。候选池只能由该 CSV 决定，按每只 ETF 在信号日真实可用的历史动态准入。fund_size 只用于池成员身份审计，不得进入历史特征、打分、权重或阈值。不得借用上市前数据，不得对缺失行情前向或后向填充；当日无有效收盘或必要窗口不足的资产必须排除。该现时点池存在幸存者偏差，本任务不声称恢复历史成分或消除该偏差。
+
+迁移后的首要工作是用 Development 输入审计基线在新池上的实际行为，包括逐折选参分布、有效资产数、空仓或不满仓日、袖套重合率、持仓集中度、不同持仓日和平均换手率。旧池的 Gate 指标、月份和持仓不得用于新任务的假设、调试或取舍；新任务 Gate 的精确反馈同样不得进入后续候选研发。只有 Development 诊断和 Harness 给出的接受/拒绝结论可以指导下一轮。
+
+研究按以下优先级推进，每轮只验证一个主要机制，不得把多个方向捆绑成一个候选：
+
+1. 先校准新池下的趋势排序语义。当前 use_relative_mom 实现把每日简单收益减去当日截面中位数后求和；对于拥有相同完整窗口的资产，中位数累计项是共同常数，行为差异还可能来自简单收益求和与复合区间收益的差别以及更严格的完整窗口准入。候选必须先量化它是否真正改变截面次序和持仓。若继续研究相对趋势，应使用因果、按日独立且确实产生资产特异排序信息的简洁变换，例如每日截面分位数或稳健标准化后再滚动聚合；必须明确处理每日缺失资产和动态上市，不得把共同常数平移包装成新信号。
+2. 若趋势语义修正没有跨多个 Development 折的稳健改善，研究异质资产类别下的双袖套集中与冗余。比较允许袖套重合与防御袖套选择下一只合格非动量 ETF 的透明规则，或使用仅基于历史窗口的轻量边际相关性判据。始终保持纯多头；有效资产充足时保持既定总暴露，不得靠长期降仓或空仓制造风险指标改善，也不得大范围搜索相关性阈值。
+3. 若集中控制无效，再研究轻量入选/保留迟滞，只作用于动量袖套并保留无缓冲邻近对照。目标是减少新池主题 ETF 在临界名次附近的无效换手，同时允许信号显著恶化时立即退出。提交前必须报告不同持仓日、动量袖套换名次数、平均换手率和风险响应延迟。
+4. 只有前三项均缺乏 Development 证据时，才可提出一个与新池异质性直接相关的单一风险质量修正。机制必须简单、因果、有经济含义，并持续改变资产选择而不是仅在极少日期触发；不得重新堆叠已在旧任务中失败的路径质量、复杂门控或多因子组合。
+
+所有特征和组合决策必须在交易日 t 收盘后仅使用 t 及此前可获得的 OHLCV/amount/turnover，输出 t 的目标权重，由 Harness 在 t+1 开盘成交。禁止使用未来收益、全样本统计量、Gate 信息、做空、杠杆、未来成分回填或盘中不可得信息。截面变换必须在每个历史信号日独立完成，或只用此前滚动窗口拟合；并列按 symbol 升序确定性打破。
+
+策略模块必须实现 select(daily, universe, start, end)、parameter_grid() 和 select_with_params(daily, universe, start, end, params)，返回至少包含 date、symbol、target_weight 的 DataFrame。每日权重必须有限、非负、总和不超过 1；有效资产不足时允许保留剩余现金。无持仓日仍须通过 attrs 中的 signal_dates 和 universe_symbols 表达完整状态，避免回测延续旧仓位。生产默认参数必须明确、因果并可每日复算。
+
+参数必须少、有经济含义、网格确定且不超过 Harness 上限。每轮应固定与主要机制无关且已稳定的维度，只加入少量邻近值；不得重新搜索整套参数来掩盖机制贡献。Development 内必须检查无未来函数、边界窗口、动态上市日期、缺失值、确定性、网格唯一性、纯多头权重、信号日至次日开盘时序，以及相对当前 Champion 的真实行为差异。只有改善来自多个预先存在的滚动折、不是单一阶段或持续降低暴露，才值得提交。
+
+固定评测按 18 个月训练窗口逐折选参，在随后 1 个月验证折计算样本外表现；Development 与 Gate 不重叠。候选必须先满足所有 Gate 折训练可行性及 Gate 汇总年化收益、最大回撤、平均换手率硬约束，再以 Sortino 相对本任务当前 Champion 达到最小改善门槛。Promotion 完全由 Harness 决定；不得修改 active_etf_rotation.csv、市场数据、回测器、评测区间、指标、约束、晋级逻辑或测试来配合候选。
+"""
+
+[budget]
+max_rounds = 6
+max_hours = 6
+max_consecutive_failures = 3
+round_minutes = 30
+
+[opencode]
+model = "xai/grok-4.5"
+variant = "high"
+timeout_minutes = 30
+
+[strategy]
+name = "active-etf-rerank-topk"
+module = "quant_core.strategy.etf_rerank_topk"
+
+[baseline]
+mode = "workspace"
+
+[data]
+universe = "universes/active_etf_rotation.csv"
+
+[scope]
+editable = [
+  "src/quant_core/strategy/etf_rerank_topk.py",
+]
+forbidden = [
+  "src/quant_core/backtest/",
+  "src/quant_core/data/",
+  "src/quant_core/factors/",
+  "src/quant_core/research/",
+  "src/quant_core/cli.py",
+  "src/quant_core/config.py",
+  "tests/",
+  "universes/",
+  "data/",
+  "outputs/",
+  ".agents/",
+  ".research/",
+]
+
+[commands]
+test = ["{python}", "-m", "pytest", "-q", "tests/test_research_evaluator.py"]
+metrics_path = "outputs/backtests/{run_id}/metrics.json"
+
+[evaluation]
+mode = "walk_forward"
+objective = "sortino"
+
+[evaluation.contract]
+paths = [
+  "pyproject.toml",
+  "src/quant_core/__init__.py",
+  "src/quant_core/backtest",
+  "src/quant_core/config.py",
+  "src/quant_core/data",
+  "src/quant_core/factors",
+  "src/quant_core/research",
+  "src/quant_core/strategy/__init__.py",
+  "src/quant_core/strategy/sharpe_corr_threshold.py",
+  "tests/test_research_evaluator.py",
+  "universes/active_etf_rotation.csv",
+]
+
+[evaluation.constraints]
+annual_return = { operator = ">=", threshold = 0.03 }
+max_drawdown = { operator = "abs<=", threshold = 0.20 }
+avg_turnover = { operator = "<=", threshold = 0.35 }
+
+[evaluation.acceptance]
+minimum_improvement = 0.03
+
+[evaluation.walk_forward]
+train_months = 18
+validation_months = 1
+step_months = 1
+max_parameter_sets = 128
+
+[evaluation.walk_forward.development]
+start = "2023-01-22"
+end = "2025-07-21"
+
+[evaluation.walk_forward.gate]
+start = "2025-07-22"
+end = "2026-07-21"
