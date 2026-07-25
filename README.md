@@ -61,6 +61,10 @@ conda run --no-capture-output -n quant python -m pip install -e ".[dev]"
 conda run --no-capture-output -n quant pytest
 ```
 
+仓库开发和测试统一使用已有的 `quant` Conda 环境。不要在仓库中创建
+`.venv/`、`venv/`、`env/` 等项目级或一次性 Python 虚拟环境；若环境或依赖
+缺失，应先报告缺失项，不得为绕过环境约束临时生成虚拟环境。
+
 构建候选 Agent 镜像：
 
 ```bash

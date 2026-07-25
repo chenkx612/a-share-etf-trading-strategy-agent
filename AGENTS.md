@@ -56,8 +56,15 @@ normal framework outputs.
 
 ## Build, Test, and Development Commands
 
-- `python3 -m pip install -e ".[dev]"`: install the package in editable mode with pytest.
-- `pytest`: run the full test suite.
+- `conda run --no-capture-output -n quant python -m pip install -e ".[dev]"`:
+  install the package in the repository's shared Conda environment.
+- `conda run --no-capture-output -n quant pytest`: run the full test suite.
+
+Use the existing `quant` Conda environment for repository development and tests.
+Do not create project-local or disposable Python virtual environments such as
+`.venv/`, `venv/`, or `env/` inside the repository. If the required Conda
+environment or a dependency is unavailable, report the missing prerequisite
+instead of generating a temporary environment.
 
 Use the command examples in `README.md` for framework and Research Harness
 operations instead of maintaining a second command catalog here.
