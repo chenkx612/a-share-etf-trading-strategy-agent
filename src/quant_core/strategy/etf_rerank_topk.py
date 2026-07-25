@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-STRATEGY_NAME = "liquid-etf-rerank-topk"
+STRATEGY_NAME = "active-etf-rerank-topk"
 
 
 @dataclass(frozen=True)
@@ -18,10 +18,13 @@ class EtfRerankTopKParams:
     momentum_window: int = 120
     vol_window: int = 60
     min_history: int = 120
-    mom_sleeve_weight: float = 0.35
+    mom_sleeve_weight: float = 0.30
     use_sharpe: bool = False
-    rank_buffer: int = 0
+    rank_buffer: int = 1
     use_relative_mom: bool = True
+    sleeve_dedup: bool = False
+    use_efficiency_scale: bool = True
+    mom_accel_lag: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.top_n, bool) or not isinstance(self.top_n, int) or self.top_n <= 0:
@@ -48,6 +51,18 @@ class EtfRerankTopKParams:
             raise ValueError("rank_buffer must be a non-negative integer")
         if not isinstance(self.use_relative_mom, bool):
             raise ValueError("use_relative_mom must be a bool")
+        if not isinstance(self.sleeve_dedup, bool):
+            raise ValueError("sleeve_dedup must be a bool")
+        if not isinstance(self.use_efficiency_scale, bool):
+            raise ValueError("use_efficiency_scale must be a bool")
+        if (
+            isinstance(self.mom_accel_lag, bool)
+            or not isinstance(self.mom_accel_lag, int)
+            or self.mom_accel_lag < 0
+        ):
+            raise ValueError("mom_accel_lag must be a non-negative integer")
+        if self.mom_accel_lag > 0 and self.mom_accel_lag < 2:
+            raise ValueError("mom_accel_lag must be 0 (off) or >= 2")
 
 
 def select(
@@ -61,24 +76,29 @@ def select(
 
 def parameter_grid() -> list[dict[str, object]]:
     grid: list[dict[str, object]] = []
+    # Champion baseline: rank_buffer=1, mom_sleeve_weight=0.30, use_relative_mom=True,
+    # sleeve_dedup=False, use_sharpe=False, use_efficiency_scale=True, mom_accel_lag=0.
+    # Primary mechanism: mom_accel_lag {0,10,20}; 0 = level-only control after ER scale.
     for top_n in (1, 2):
         for momentum_window in (90, 120):
-            for mom_sleeve_weight in (0.30, 0.40, 0.50):
-                for use_relative_mom in (False, True):
-                    vol_window = 60
-                    min_history = max(momentum_window, vol_window)
-                    grid.append(
-                        {
-                            "top_n": top_n,
-                            "momentum_window": momentum_window,
-                            "vol_window": vol_window,
-                            "min_history": min_history,
-                            "mom_sleeve_weight": mom_sleeve_weight,
-                            "use_sharpe": False,
-                            "rank_buffer": 0,
-                            "use_relative_mom": use_relative_mom,
-                        }
-                    )
+            for mom_accel_lag in (0, 10, 20):
+                vol_window = 60
+                min_history = max(momentum_window, vol_window)
+                grid.append(
+                    {
+                        "top_n": top_n,
+                        "momentum_window": momentum_window,
+                        "vol_window": vol_window,
+                        "min_history": min_history,
+                        "mom_sleeve_weight": 0.30,
+                        "use_sharpe": False,
+                        "rank_buffer": 1,
+                        "use_relative_mom": True,
+                        "sleeve_dedup": False,
+                        "use_efficiency_scale": True,
+                        "mom_accel_lag": mom_accel_lag,
+                    }
+                )
     return grid
 
 
@@ -99,16 +119,30 @@ def select_with_params(
     )
 
 
-def _cross_sectional_median_residual_returns(ret: np.ndarray) -> np.ndarray:
-    """Subtract each day's finite-name cross-sectional median return."""
+def _cross_sectional_percentile_returns(ret: np.ndarray) -> np.ndarray:
+    """Per-day cross-sectional average-rank percentiles in (0, 1] on finite names."""
     out = np.full_like(ret, np.nan)
-    for i in range(ret.shape[0]):
+    n_rows, _ = ret.shape
+    for i in range(n_rows):
         row = ret[i]
         finite = np.isfinite(row)
-        if not np.any(finite):
+        count = int(np.count_nonzero(finite))
+        if count == 0:
             continue
-        median = float(np.median(row[finite]))
-        out[i] = np.where(finite, row - median, np.nan)
+        vals = row[finite]
+        order = np.argsort(vals, kind="mergesort")
+        ranks = np.empty(count, dtype=float)
+        sorted_vals = vals[order]
+        start = 0
+        while start < count:
+            end = start + 1
+            while end < count and sorted_vals[end] == sorted_vals[start]:
+                end += 1
+            avg_rank = 0.5 * (start + 1 + end)
+            ranks[order[start:end]] = avg_rank
+            start = end
+        percentiles = ranks / float(count)
+        out[i, finite] = percentiles
     return out
 
 
@@ -131,6 +165,33 @@ def _rolling_sum_full_window(values: np.ndarray, window: int) -> np.ndarray:
         sums = cumulative_sum[window:] - cumulative_sum[:-window]
         counts = cumulative_count[window:] - cumulative_count[:-window]
         out[window:] = np.where(counts == window, sums, np.nan)
+    return out
+
+
+def _rolling_efficiency_ratio(values: np.ndarray, window: int) -> np.ndarray:
+    """Causal Kaufman efficiency: sum(r)/sum(|r|) over a full finite window, clipped to [0, 1]."""
+    n_rows, _ = values.shape
+    out = np.full_like(values, np.nan)
+    if window <= 0 or window > n_rows:
+        return out
+    finite = np.isfinite(values)
+    filled = np.where(finite, values, 0.0)
+    abs_filled = np.where(finite, np.abs(values), 0.0)
+    cum_sum = np.cumsum(filled, axis=0)
+    cum_abs = np.cumsum(abs_filled, axis=0)
+    cum_count = np.cumsum(finite.astype(np.int32), axis=0)
+
+    def _er(sum_r: np.ndarray, sum_abs: np.ndarray, count: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = np.where(sum_abs > 0.0, sum_r / sum_abs, np.nan)
+        return np.where(count == window, np.clip(raw, 0.0, 1.0), np.nan)
+
+    out[window - 1] = _er(cum_sum[window - 1], cum_abs[window - 1], cum_count[window - 1])
+    if window < n_rows:
+        sums = cum_sum[window:] - cum_sum[:-window]
+        abs_sums = cum_abs[window:] - cum_abs[:-window]
+        counts = cum_count[window:] - cum_count[:-window]
+        out[window:] = _er(sums, abs_sums, counts)
     return out
 
 
@@ -195,10 +256,29 @@ def select_etf_rerank_topk(
         )
 
     if params.use_relative_mom:
-        residual_returns = _cross_sectional_median_residual_returns(returns)
-        momentum = _rolling_sum_full_window(residual_returns, momentum_window)
+        percentile_returns = _cross_sectional_percentile_returns(returns)
+        momentum = _rolling_sum_full_window(percentile_returns, momentum_window)
     else:
         momentum = raw_momentum
+
+    if params.use_efficiency_scale:
+        efficiency = _rolling_efficiency_ratio(returns, momentum_window)
+        momentum = np.where(
+            np.isfinite(momentum) & np.isfinite(efficiency),
+            momentum * efficiency,
+            np.nan,
+        )
+
+    accel_lag = int(params.mom_accel_lag)
+    if accel_lag >= 2:
+        # Causal acceleration of the already ER-scaled momentum level:
+        # score_t = level_t + (level_t - level_{t-lag}) when both finite; else keep level.
+        accelerated = momentum.copy()
+        level = momentum[accel_lag:]
+        lagged = momentum[:-accel_lag]
+        both = np.isfinite(level) & np.isfinite(lagged)
+        accelerated[accel_lag:] = np.where(both, level + (level - lagged), level)
+        momentum = accelerated
 
     return_frame = pd.DataFrame(returns, index=close.index, columns=close.columns)
     volatility = return_frame.rolling(
@@ -281,7 +361,15 @@ def select_etf_rerank_topk(
                 if len(momentum_selected) >= top_n:
                     break
 
-        defensive_selected = [int(index) for index in defensive_order[:top_n]]
+        momentum_set = set(momentum_selected)
+        if params.sleeve_dedup:
+            defensive_selected = [
+                int(index)
+                for index in defensive_order
+                if int(index) not in momentum_set
+            ][:top_n]
+        else:
+            defensive_selected = [int(index) for index in defensive_order[:top_n]]
         weights: dict[int, float] = {}
         if momentum_selected and momentum_weight > 0.0:
             sleeve_weight = momentum_weight / float(len(momentum_selected))
@@ -346,4 +434,7 @@ def _params_to_dict(params: EtfRerankTopKParams) -> dict[str, object]:
         "use_sharpe": params.use_sharpe,
         "rank_buffer": params.rank_buffer,
         "use_relative_mom": params.use_relative_mom,
+        "sleeve_dedup": params.sleeve_dedup,
+        "use_efficiency_scale": params.use_efficiency_scale,
+        "mom_accel_lag": params.mom_accel_lag,
     }
