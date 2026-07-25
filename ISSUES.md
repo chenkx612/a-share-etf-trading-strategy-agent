@@ -38,6 +38,8 @@
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | Harness 风险登记文件名在仓库说明中不一致 |
 | P2 | Evaluator 指纹计算依赖可写 Git 对象库 |
+| P2 | Stale Champion 重评缺少阶段事件 |
+| P2 | 报告解析因标题前说明文字误判有效 Markdown |
 
 ## 一、待解决问题
 
@@ -99,6 +101,39 @@
   删除、排除目录及相同内容的稳定哈希，并确认主仓库 index 和对象库均无变化。
 - **风险**：低。当前可在明确授权后于具有 Git 对象库写权限的宿主环境启动，不影响评测语义；
   但未授权提升权限时无法运行 Harness。
+
+#### Stale Champion 重评缺少阶段事件
+
+- **问题**：Run 004 Round 001 的候选 Development 和 Gate 均已完成并发出事件后，Harness 因
+  `evaluator_contract_sha256_changed` 在隔离 evaluator worktree 中重新评测现有 Champion。
+  Champion Development/Gate 重评期间 stdout 与
+  `.research/<task-id>/.tmp/runs/<run>/events.jsonl` 均没有开始、完成或进度事件，外部监督者只能通过
+  临时 evaluator 输出目录反推进度；本次形成数分钟无可观测状态，容易被误判为 Gate 后卡死。
+- **方案**：在 `_evaluate_existing()` 调用边界为 Champion 重评增加
+  `champion_reevaluation_started`、逐阶段 started/completed、failed 和最终 completed 事件，并包含
+  stale 原因但不输出精确 Gate 指标。若固定 evaluator 能提供安全的进度文件，可只转发折号、总折数和
+  elapsed 等非 Gate 内容；事件仍写入现有活动 Run 临时流，不新增永久成功轨迹。
+- **验证**：构造 evaluator 契约、数据指纹或评测环境变化使 Champion 指标 stale，确认候选 Gate
+  完成后到 Decision 落盘前持续存在可审计阶段事件；覆盖重评成功、命令失败和中断恢复，且事件不得向
+  后续候选泄露 Champion 或候选的精确 Gate 指标。
+- **风险**：低。缺口不改变固定评测、约束或晋级结果，但降低长时间运行的外部可观测性和故障定位效率。
+
+#### 报告解析因标题前说明文字误判有效 Markdown
+
+- **问题**：Run 004 的报告会话以退出码 0 完成，并在最终 text event 中生成了完整的
+  `# Research Loop 总结` 报告，但在标题前附加一句“已掌握足够信息，生成完整复盘报告。”。
+  `generate_loop_report()` 使用
+  `report.lstrip().startswith("# Research Loop 总结")` 做严格前缀校验，因而把有效报告误判为
+  `OpenCode report session produced no valid Markdown report`，将 Run 的 `report_status` 记为
+  failed 并保留约 270 KiB 的冻结输入与完整事件。
+- **方案**：保持一级标题契约，但从最后 text event 中定位首个独占行
+  `# Research Loop 总结`，只在该行之前全部属于非 Markdown 前言时截取并保存其后的报告；仍拒绝缺少
+  标题、标题嵌在代码块/JSON 字符串、多个冲突标题或标题后为空的输出。Prompt 同时明确禁止标题前
+  前言，但不能只依赖 Prompt 保证解析可靠性。
+- **验证**：覆盖纯报告、前置空白、单句前言、代码块内伪标题、缺失标题、多个标题及标题后空内容；
+  确认成功时删除临时事件，失败时保留冻结输入和事件供相同输入重试，且报告重试不改变 Loop Decision
+  或 Champion。
+- **风险**：低。问题不影响研究评测和晋级，但会让成功 Run 缺少终局报告，并产生不必要的人工重试。
 
 ## 二、已解决问题
 
