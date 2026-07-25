@@ -209,7 +209,9 @@ conda run --no-capture-output -n quant python -m quant_core.cli research clean \
 `result.json`、`decision.json` 和可从冻结 Parent 重放的 `candidate.patch` 保存在
 `runs/<run>/rounds/<round>/`。`baseline.mode = "none"` 的首次 0→1 晋级还会保留完整
 `candidate.py`，其内容哈希与 Round submission 一致。终局复盘
-保存在 `runs/<run>/report.md`，冻结的报告输入保存在 `runs/<run>/report-input.json`。报告认证失败
+保存在 `runs/<run>/report.md`；冻结的叙述与指标输入保存在 `report-input.json`，由最终 Champion
+反向重放 Accepted Patch、再正向核验所有 Candidate 得到的版本事实链保存在
+`report-facts.json`。报告只能基于事实链解释机制演进，组合变更不得自动归因为单一机制。报告认证失败
 不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop
 的阶段事件会同时输出到终端和
 `.research/<task-id>/.tmp/runs/<run>/events.jsonl`，正常结束后清理临时事件与 worktree。

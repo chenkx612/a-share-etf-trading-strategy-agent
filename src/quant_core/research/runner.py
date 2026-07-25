@@ -1303,7 +1303,10 @@ def _run_opencode_report_read_only(
         cwd,
         log_path,
         timeout,
-        read_only_paths=(cwd / "report-input.json",),
+        read_only_paths=(
+            cwd / "report-input.json",
+            cwd / "report-facts.json",
+        ),
         permissions=_NO_TOOL_PERMISSIONS,
     )
 

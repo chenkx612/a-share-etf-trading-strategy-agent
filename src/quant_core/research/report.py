@@ -23,12 +23,17 @@ from quant_core.research.runner import (
     _run_opencode_report_read_only,
     preflight_provider_authentication,
 )
+from quant_core.research.report_facts import (
+    build_report_facts,
+    validate_report_facts,
+)
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
 
 ReportAgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
 _ROUND_ID = re.compile(r"^\d+$")
 _REPORT_INPUT_CONTAINER_PATH = "/workspace/report-input.json"
+_REPORT_FACTS_CONTAINER_PATH = "/workspace/report-facts.json"
 _REPORT_INSTRUCTION_MAX_BYTES = 64 * 1024
 
 
@@ -183,9 +188,17 @@ def _last_text_event(events_path: Path) -> str | None:
 
 def _report_prompt(champion_applicability: Mapping[str, Any]) -> str:
     lines = [
-        "你是量化研发复盘员。根据所附 report-input.json 中完整、可信的 Harness 记录，"
+        "你是量化研发复盘员。根据所附 report-input.json 和 report-facts.json 中的 Harness 记录，"
         "生成一份简洁清晰的中文 Markdown 报告。",
         "只总结给定记录，不搜索外部信息，不运行工具，不修改文件，不虚构指标或因果关系。",
+        "版本演进只能以 report-facts.json 为准；Agent 的 hypothesis、attempts、"
+        "development_effect 和 candidate 只是未经核验的研究叙述，发生冲突时不得采信。",
+        "不得把 rejected Candidate 的变化描述为后续 Parent Champion 已有机制。",
+        "如果已接受 Round 的 changes.attribution 是 combined_change，必须列出结构化组合变化，"
+        "明确说明不能把晋级唯一归因于其中单一机制。",
+        "single_structural_change 只表示一个明确的代码结构事实，不构成该变化导致指标改善的因果证明。",
+        "如果 report-facts.json 的 integrity_warnings 非空，必须在总览和对应 Round 明确列出；"
+        "不得对无法重放的版本链作机制归因。",
         "开发集和 gate 的结果必须明确区分；失败或中断轮次也必须如实说明。",
         "如果 loop.integrity_warnings 非空，必须在总览中明确标为 Harness 状态一致性问题；"
         "不得为缺失的轮次或工件虚构研究内容。",
@@ -346,6 +359,25 @@ def generate_loop_report(
             "Frozen report input is unavailable",
             "report_input_unavailable",
         )
+    report_facts_path = manager.report_facts_path
+    frozen_facts = _read_json(report_facts_path)
+    if report_facts_path.exists() and frozen_facts is None:
+        raise RuntimeError("Frozen report facts are missing or invalid")
+    if frozen_facts is None:
+        frozen_facts = build_report_facts(
+            manager.rounds,
+            round_ids,
+            payload,
+        )
+        validate_report_facts(frozen_facts)
+        write_json_atomic(report_facts_path, frozen_facts)
+    else:
+        validate_report_facts(frozen_facts)
+    if not report_facts_path.is_file():
+        raise ReportInfrastructureError(
+            "Frozen report facts are unavailable",
+            "report_facts_unavailable",
+        )
     prompt = _report_prompt(champion_applicability)
     if len(prompt.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
         raise ReportInfrastructureError(
@@ -357,10 +389,16 @@ def generate_loop_report(
             "Report attachment path exceeds the safe process argument budget",
             "invocation_argument_too_long",
         )
+    if len(_REPORT_FACTS_CONTAINER_PATH.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
+        raise ReportInfrastructureError(
+            "Report facts attachment path exceeds the safe process argument budget",
+            "invocation_argument_too_long",
+        )
     opencode = task.raw["opencode"]
     command = [
         "opencode", "run", "--auto", "--format", "json",
         "--file", _REPORT_INPUT_CONTAINER_PATH,
+        "--file", _REPORT_FACTS_CONTAINER_PATH,
         "--model", str(opencode["model"]), "--dir", str(manager.run_root),
     ]
     if variant := opencode.get("variant"):

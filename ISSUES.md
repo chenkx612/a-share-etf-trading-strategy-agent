@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 终局报告未从 Parent—Patch—Champion 事实链核验机制演进 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -43,27 +42,6 @@
 | P2 | 报告解析因标题前说明文字误判有效 Markdown |
 
 ## 一、待解决问题
-
-### P1：推荐优先解决
-
-#### 终局报告未从 Parent—Patch—Champion 事实链核验机制演进
-
-- **问题**：active-etf-rerank-topk Run 001 的终局报告正确抄录了固定 Decision 和指标，但错误声称
-  Round 002 是“分位数相对动量 + rank_buffer”并在关键启发中把迟滞和效率缩放列为唯二晋级机制。
-  实际 Round 001 的分位数候选已被拒绝；Round 002 的 `candidate.patch` 只在中位数残差父版本上
-  增加迟滞和固定关闭的 `sleeve_dedup`。Round 006 才同时把中位数残差替换为分位数并增加效率缩放，
-  因而最终晋级不能从现有证据归因为“只在 r002 分位数基线上增加效率缩放”。报告生成器主要信任
-  Agent 的 `hypothesis`/`development_effect` 叙述，没有把冻结 Parent、Candidate Patch、Decision
-  和最终 Champion 做机器可验证的机制演进对账；`integrity_warnings` 仍为空。
-- **方案**：报告输入应为每轮提供父 Champion 哈希、父源码、候选补丁、候选源码哈希和 Promotion 后
-  Champion 哈希，并先由确定性代码生成结构化变更事实（参数增删、默认/网格变化、函数与分支增删）。
-  报告模型只能在该事实链上解释机制；若 Agent 叙述与补丁不一致，必须输出 integrity warning，并将
-  不可唯一归因的晋级标记为组合变更，不能自动写成单机制结论。
-- **验证**：构造“Round A 候选被拒绝、Round B Agent 误称 A 已进入 Champion、Round B 同时重新加入
-  A 和新机制后晋级”的历史，确认报告能识别真实 Parent 差异、列出组合变更并产生 warning；同时覆盖
-  单机制正常晋级，确保指标、Decision 和来源 Round 仍准确。
-- **风险**：中。Champion、固定指标和 Promotion 决策不受影响，但终局研究记忆会形成错误机制归因，
-  后续 Agent 可能据此把被拒绝机制当作已接受基线，持续污染候选设计与研究边界。
 
 ### P2：有时间时优化
 
@@ -167,6 +145,22 @@
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
 
 ### P1：曾影响终局复盘完整性
+
+#### 终局报告必须从 Parent—Patch—Champion 事实链核验机制演进
+
+- **问题**：active-etf-rerank-topk Run 001 的报告把 Round 001 已拒绝的分位数相对动量误当作
+  Round 002 Parent 的既有机制，又把 Round 006 的组合变化错误归因为单独增加效率缩放。旧报告输入
+  主要依赖 Agent 叙述，`integrity_warnings` 只检查轮次计数和文件存在性。
+- **解决**：新增写一次的 `report-facts.json`。Harness 从冻结的最终 Champion 逆序应用 Accepted
+  Patch 恢复每轮 Parent，再正向应用 Rejected Patch 重建 Candidate，核对 Parent、Candidate、Patch、
+  Decision 和 Champion-after 哈希；同时用 AST 保守提取参数、grid、函数和分支变化。多个或不透明
+  的结构变化禁止单机制归因；单一明确参数变化也只表示代码事实，不作为指标改善的因果证明。报告容器
+  只读挂载叙述输入与事实链，事实优先于 Agent 叙述。
+- **验证**：覆盖“被拒绝机制被误称为 Parent、随后与新机制共同加入并晋级”、单一正常变化、缺失或
+  损坏 Patch、哈希不符、首次 0→1、冻结附件重试和双附件只读挂载；并用真实 Run 001 确认 Round 002
+  Parent 仍为中位数残差版本、Round 006 被标为组合变化。
+- **风险**：结构化差异刻意保守，可能把相关修改归为组合变化，但不会把未经证据支持的因果解释写成
+  事实。该机制不改变评测、Gate、Promotion 或停止条件。
 
 #### Round 内被放弃的 Development 尝试必须进入研究记忆
 

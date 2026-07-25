@@ -258,6 +258,10 @@ class ResearchWorkspace:
         return self.run_root / "report.md"
 
     @property
+    def report_facts_path(self) -> Path:
+        return self.run_root / "report-facts.json"
+
+    @property
     def run_temp(self) -> Path:
         return self.root / ".tmp" / "runs" / self.run_id
 

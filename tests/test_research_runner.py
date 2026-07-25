@@ -655,6 +655,8 @@ def test_report_container_runner_mounts_frozen_input_read_only(
 ) -> None:
     report_input = tmp_path / "report-input.json"
     report_input.write_text('{"rounds": []}', encoding="utf-8")
+    report_facts = tmp_path / "report-facts.json"
+    report_facts.write_text('{"schema_version": 1}', encoding="utf-8")
     captured: dict[str, object] = {}
 
     def capture_container(
@@ -680,7 +682,7 @@ def test_report_container_runner_mounts_frozen_input_read_only(
     )
 
     assert exit_code == 0
-    assert captured["read_only_paths"] == (report_input,)
+    assert captured["read_only_paths"] == (report_input, report_facts)
     assert captured["permissions"] == research_runner._NO_TOOL_PERMISSIONS
 
 

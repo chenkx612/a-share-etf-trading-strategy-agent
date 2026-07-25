@@ -14,6 +14,7 @@ import pytest
 import quant_core.research.report as research_report
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.report import generate_loop_report, regenerate_loop_report
+from quant_core.research.report_facts import build_report_facts
 from quant_core.research.runner import _metrics_key
 from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
 
@@ -192,7 +193,9 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     prompt = str(captured["prompt"])
     command = list(captured["command"])
     report_input = manager.run_root / "report-input.json"
+    report_facts = manager.run_root / "report-facts.json"
     attached = report_input.read_text(encoding="utf-8")
+    facts = report_facts.read_text(encoding="utf-8")
     assert "Use a faster risk filter" in attached
     assert "Historical hypothesis from an earlier loop" not in attached
     assert '"decision": "accepted"' in attached
@@ -204,8 +207,12 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert '"sortino": 1.2' in attached
     assert '"integrity_warnings": []' in attached
     assert "PARAMETER = 1" in attached
+    assert '"schema_version": 1' in facts
+    assert "accepted Round lacks replayable Candidate evidence" in facts
     assert "Use a faster risk filter" not in prompt
     assert command[command.index("--file") + 1] == "/workspace/report-input.json"
+    second_file = command.index("--file", command.index("--file") + 1)
+    assert command[second_file + 1] == "/workspace/report-facts.json"
     assert command[command.index("--model") + 1] == "xai/grok-4.5"
     assert command[command.index("--variant") + 1] == "high"
     assert captured["cwd"] == manager.run_root
@@ -213,6 +220,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert report_path.read_text(encoding="utf-8").startswith("# Research Loop 总结")
     assert not (manager.run_root / "report-events.jsonl").exists()
     frozen_input = report_input.read_bytes()
+    frozen_facts = report_facts.read_bytes()
 
     loop_state_path = manager.loop_state_path
     write_json_atomic(loop_state_path, {
@@ -240,6 +248,7 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert saved_state["report_failure_kind"] is None
     assert saved_state["report_failure_code"] is None
     assert report_input.read_bytes() == frozen_input
+    assert report_facts.read_bytes() == frozen_facts
     assert '"metrics_status": "stale"' in str(captured["prompt"])
     assert '"evaluator_contract_sha256_changed"' in str(captured["prompt"])
     assert "updated_at" in saved_state
@@ -259,6 +268,287 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     )
     assert "以下 Champion 指标适用性状态" not in str(captured["prompt"])
     assert report_input.read_bytes() == frozen_input
+    assert report_facts.read_bytes() == frozen_facts
+
+
+def _candidate_patch(
+    tmp_path: Path,
+    name: str,
+    parent: str,
+    candidate: str,
+) -> bytes:
+    repository = tmp_path / name
+    repository.mkdir()
+    strategy = repository / "strategy.py"
+    strategy.write_text(parent, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "strategy.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(repository), "-c", "user.name=Test", "-c",
+        "user.email=test@example.invalid", "commit", "-q", "-m", "parent",
+    ], check=True)
+    strategy.write_text(candidate, encoding="utf-8")
+    completed = subprocess.run(
+        ["git", "-C", str(repository), "diff", "--binary", "HEAD", "--", "strategy.py"],
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return completed.stdout
+
+
+def test_report_facts_uses_real_parent_and_marks_combined_promotion(
+    tmp_path: Path,
+) -> None:
+    baseline = """\
+class Params:
+    relative: bool = True
+    buffer: int = 0
+
+def median_score(value):
+    return value
+"""
+    rejected = """\
+class Params:
+    relative: bool = True
+    buffer: int = 0
+
+def percentile_score(value):
+    return value
+"""
+    accepted = """\
+class Params:
+    relative: bool = True
+    buffer: int = 1
+    efficiency: bool = True
+
+def percentile_score(value):
+    return value
+
+def efficiency_score(value):
+    if value > 0:
+        return value
+    return 0
+"""
+    rounds = tmp_path / "rounds"
+    rounds.mkdir()
+    for round_id, candidate, decision_value in (
+        ("001", rejected, "rejected"),
+        ("002", accepted, "accepted"),
+    ):
+        experiment = rounds / round_id
+        experiment.mkdir()
+        patch = _candidate_patch(
+            tmp_path,
+            f"patch-{round_id}",
+            baseline,
+            candidate,
+        )
+        (experiment / "candidate.patch").write_bytes(patch)
+        candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        submission = {"strategy_sha256": candidate_sha256}
+        write_json_atomic(experiment / "result.json", {
+            "status": "completed",
+            "submission": submission,
+        })
+        write_json_atomic(experiment / "decision.json", {
+            "decision": decision_value,
+            "submission": submission,
+            "candidate_patch_sha256": hashlib.sha256(patch).hexdigest(),
+        })
+
+    final_sha256 = hashlib.sha256(accepted.encode("utf-8")).hexdigest()
+    facts = build_report_facts(
+        rounds,
+        ["001", "002"],
+        {
+            "champion": {
+                "strategy_path": "strategy.py",
+                "strategy_source": accepted,
+                "sha256": final_sha256,
+            },
+        },
+    )
+
+    first, second = facts["rounds"]
+    baseline_sha256 = hashlib.sha256(baseline.encode("utf-8")).hexdigest()
+    assert first["parent_champion_sha256"] == baseline_sha256
+    assert first["champion_after_sha256"] == baseline_sha256
+    assert second["parent_champion_sha256"] == baseline_sha256
+    assert second["parent_champion_sha256"] != first["candidate_sha256"]
+    assert second["candidate_sha256"] == final_sha256
+    assert second["changes"]["attribution"] == "combined_change"
+    assert "parameters" in second["changes"]["changed_categories"]
+    assert "definitions" in second["changes"]["changed_categories"]
+    assert any(
+        "round 002" in warning and "single-mechanism attribution is prohibited" in warning
+        for warning in facts["integrity_warnings"]
+    )
+
+
+def test_report_facts_preserves_single_change_attribution(tmp_path: Path) -> None:
+    baseline = "THRESHOLD: float = 1.0\n"
+    candidate = "THRESHOLD: float = 2.0\n"
+    rounds = tmp_path / "rounds"
+    experiment = rounds / "001"
+    experiment.mkdir(parents=True)
+    patch = _candidate_patch(tmp_path, "single-patch", baseline, candidate)
+    (experiment / "candidate.patch").write_bytes(patch)
+    candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    submission = {"strategy_sha256": candidate_sha256}
+    write_json_atomic(experiment / "result.json", {
+        "status": "completed",
+        "submission": submission,
+    })
+    write_json_atomic(experiment / "decision.json", {
+        "decision": "accepted",
+        "submission": submission,
+        "candidate_patch_sha256": hashlib.sha256(patch).hexdigest(),
+    })
+
+    facts = build_report_facts(
+        rounds,
+        ["001"],
+        {
+            "champion": {
+                "strategy_path": "strategy.py",
+                "strategy_source": candidate,
+                "sha256": candidate_sha256,
+            },
+        },
+    )
+
+    changes = facts["rounds"][0]["changes"]
+    assert changes["attribution"] == "single_structural_change"
+    assert changes["changed_categories"] == ["parameters"]
+    assert facts["integrity_warnings"] == []
+
+
+def test_report_facts_warns_when_recorded_patch_hash_is_wrong(tmp_path: Path) -> None:
+    baseline = "THRESHOLD: float = 1.0\n"
+    candidate = "THRESHOLD: float = 2.0\n"
+    rounds = tmp_path / "rounds"
+    experiment = rounds / "001"
+    experiment.mkdir(parents=True)
+    patch = _candidate_patch(tmp_path, "wrong-hash-patch", baseline, candidate)
+    (experiment / "candidate.patch").write_bytes(patch)
+    candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    submission = {"strategy_sha256": candidate_sha256}
+    write_json_atomic(experiment / "result.json", {
+        "status": "completed",
+        "submission": submission,
+    })
+    write_json_atomic(experiment / "decision.json", {
+        "decision": "accepted",
+        "submission": submission,
+        "candidate_patch_sha256": "0" * 64,
+    })
+
+    facts = build_report_facts(
+        rounds,
+        ["001"],
+        {
+            "champion": {
+                "strategy_path": "strategy.py",
+                "strategy_source": candidate,
+                "sha256": candidate_sha256,
+            },
+        },
+    )
+
+    assert facts["rounds"][0]["patch_replay_verified"] is False
+    assert facts["rounds"][0]["parent_champion_sha256"] is None
+    assert facts["rounds"][0]["changes"]["status"] == "unavailable"
+    assert any(
+        "candidate.patch hash does not match" in warning
+        for warning in facts["integrity_warnings"]
+    )
+
+
+def test_report_facts_stops_before_accepted_champion_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    baseline = "THRESHOLD: float = 1.0\n"
+    candidate = "THRESHOLD: float = 2.0\n"
+    rounds = tmp_path / "rounds"
+    experiment = rounds / "001"
+    experiment.mkdir(parents=True)
+    patch = _candidate_patch(tmp_path, "champion-mismatch-patch", baseline, candidate)
+    (experiment / "candidate.patch").write_bytes(patch)
+    wrong_submission = {"strategy_sha256": hashlib.sha256(b"wrong").hexdigest()}
+    write_json_atomic(experiment / "result.json", {
+        "status": "completed",
+        "submission": wrong_submission,
+    })
+    write_json_atomic(experiment / "decision.json", {
+        "decision": "accepted",
+        "submission": wrong_submission,
+        "candidate_patch_sha256": hashlib.sha256(patch).hexdigest(),
+    })
+    candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+
+    facts = build_report_facts(
+        rounds,
+        ["001"],
+        {
+            "champion": {
+                "strategy_path": "strategy.py",
+                "strategy_source": candidate,
+                "sha256": candidate_sha256,
+            },
+        },
+    )
+
+    round_facts = facts["rounds"][0]
+    assert round_facts["patch_replay_verified"] is False
+    assert round_facts["parent_champion_sha256"] is None
+    assert round_facts["candidate_sha256"] is None
+    assert any(
+        "accepted Champion hash does not match" in warning
+        for warning in facts["integrity_warnings"]
+    )
+
+
+def test_report_facts_treats_multiple_parameters_as_combined_change(
+    tmp_path: Path,
+) -> None:
+    baseline = "FIRST: int = 1\nSECOND: int = 2\n"
+    candidate = "FIRST: int = 3\nSECOND: int = 4\n"
+    rounds = tmp_path / "rounds"
+    experiment = rounds / "001"
+    experiment.mkdir(parents=True)
+    patch = _candidate_patch(tmp_path, "multiple-parameters-patch", baseline, candidate)
+    (experiment / "candidate.patch").write_bytes(patch)
+    candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    submission = {"strategy_sha256": candidate_sha256}
+    write_json_atomic(experiment / "result.json", {
+        "status": "completed",
+        "submission": submission,
+    })
+    write_json_atomic(experiment / "decision.json", {
+        "decision": "accepted",
+        "submission": submission,
+        "candidate_patch_sha256": hashlib.sha256(patch).hexdigest(),
+    })
+
+    facts = build_report_facts(
+        rounds,
+        ["001"],
+        {
+            "champion": {
+                "strategy_path": "strategy.py",
+                "strategy_source": candidate,
+                "sha256": candidate_sha256,
+            },
+        },
+    )
+
+    changes = facts["rounds"][0]["changes"]
+    assert changes["changed_categories"] == ["parameters"]
+    assert changes["attribution"] == "combined_change"
+    assert any(
+        "single-mechanism attribution is prohibited" in warning
+        for warning in facts["integrity_warnings"]
+    )
 
 
 def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> None:
