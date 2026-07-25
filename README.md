@@ -73,13 +73,16 @@ docker build \
 运行自动化策略研究循环：
 
 ```bash
-conda run --no-capture-output -n quant python -m quant_core.cli research loop \
-  --task path/to/task.toml
+conda activate quant
+quant-agent loop active_etf_rerank_topk
 
 # 为事后 Codex 复盘保留可清理的诊断证据包
-conda run --no-capture-output -n quant python -m quant_core.cli research loop \
-  --task path/to/task.toml --retain-diagnostics
+quant-agent loop active_etf_rerank_topk -d
 ```
+
+`loop` 的任务参数可使用 `tasks/` 下的文件名、任务 ID 或 TOML 路径。原有
+`quant-agent research loop --task path/to/task.toml --retain-diagnostics`
+接口继续兼容已有脚本。
 
 启动新的 Loop Run 前，先检查
 [Research Harness Issues](ISSUES.md)；存在开放 P0 时不应启动新 Run。

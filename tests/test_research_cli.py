@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import quant_core.cli as cli
 from quant_core.research.workspace import copy_runtime_inputs
 
@@ -56,6 +58,94 @@ end = "2024-12-31"
 start = "2025-01-01"
 end = "2025-12-31"
 """
+
+
+def test_loop_shortcut_resolves_task_stem_and_enables_diagnostics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    task_path = tasks / "sample_task.toml"
+    task_path.write_text('id = "sample-task"\n', encoding="utf-8")
+    received: list[argparse.Namespace] = []
+    monkeypatch.setattr(cli, "command_research_loop", received.append)
+
+    args = cli.build_parser().parse_args([
+        "--root",
+        str(tmp_path),
+        "loop",
+        "sample_task",
+        "-d",
+    ])
+    args.func(args)
+
+    assert len(received) == 1
+    assert received[0].task == str(task_path.resolve())
+    assert received[0].retain_diagnostics is True
+    assert received[0].research_root == ".research"
+
+
+def test_loop_shortcut_accepts_task_id_and_explicit_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    task_path = tasks / "sample_task.toml"
+    task_path.write_text('id = "sample-task"\n', encoding="utf-8")
+    received: list[argparse.Namespace] = []
+    monkeypatch.setattr(cli, "command_research_loop", received.append)
+
+    for reference in ("sample-task", "sample_task.toml", str(task_path)):
+        args = cli.build_parser().parse_args([
+            "--root",
+            str(tmp_path),
+            "loop",
+            reference,
+        ])
+        args.func(args)
+
+    assert [args.task for args in received] == [str(task_path.resolve())] * 3
+    assert all(args.retain_diagnostics is False for args in received)
+
+
+def test_loop_shortcut_reports_unknown_and_ambiguous_tasks(
+    tmp_path: Path,
+) -> None:
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "first.toml").write_text('id = "shared"\n', encoding="utf-8")
+    (tasks / "second.toml").write_text('id = "shared"\n', encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="unknown task: missing; available tasks: first, second"):
+        cli.command_loop(argparse.Namespace(
+            task="missing",
+            root=str(tmp_path),
+            research_root=".research",
+            retain_diagnostics=False,
+        ))
+    with pytest.raises(SystemExit, match="task reference is ambiguous: shared"):
+        cli.command_loop(argparse.Namespace(
+            task="shared",
+            root=str(tmp_path),
+            research_root=".research",
+            retain_diagnostics=False,
+        ))
+
+
+def test_legacy_research_loop_command_remains_available() -> None:
+    args = cli.build_parser().parse_args([
+        "research",
+        "loop",
+        "--task",
+        "tasks/sample.toml",
+        "--retain-diagnostics",
+    ])
+
+    assert args.func is cli.command_research_loop
+    assert args.task == "tasks/sample.toml"
+    assert args.retain_diagnostics is True
 
 
 def test_research_test_snapshots_current_runtime_inputs(

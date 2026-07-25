@@ -5,6 +5,7 @@ import json
 import signal
 import subprocess
 import sys
+import tomllib
 import uuid
 from datetime import date, datetime
 from pathlib import Path
@@ -529,6 +530,56 @@ def command_research_loop(args: argparse.Namespace) -> None:
         raise SystemExit(130)
 
 
+def resolve_research_task_reference(reference: str, workspace: str | Path = ".") -> Path:
+    """Resolve a task path, tasks/<stem>.toml, or a task id."""
+    explicit = Path(reference).expanduser()
+    workspace_path = Path(workspace).resolve()
+    tasks_dir = workspace_path / "tasks"
+    if explicit.is_absolute() or len(explicit.parts) > 1:
+        path = explicit if explicit.is_absolute() else Path.cwd() / explicit
+        if not path.is_file():
+            raise ValueError(f"task file does not exist: {reference}")
+        return path.resolve()
+    if explicit.suffix == ".toml":
+        for path in (Path.cwd() / explicit, tasks_dir / explicit):
+            if path.is_file():
+                return path.resolve()
+        raise ValueError(f"task file does not exist: {reference}")
+
+    candidates: list[tuple[Path, str]] = []
+    if tasks_dir.is_dir():
+        for path in sorted(tasks_dir.glob("*.toml")):
+            try:
+                with path.open("rb") as handle:
+                    task_id = tomllib.load(handle).get("id")
+            except (OSError, tomllib.TOMLDecodeError):
+                continue
+            if isinstance(task_id, str) and task_id:
+                candidates.append((path.resolve(), task_id))
+
+    matches = {
+        path
+        for path, task_id in candidates
+        if reference == path.stem or reference == task_id
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    if len(matches) > 1:
+        matched = ", ".join(str(path.relative_to(workspace_path)) for path in sorted(matches))
+        raise ValueError(f"task reference is ambiguous: {reference} ({matched})")
+
+    available = ", ".join(path.stem for path, _task_id in candidates) or "none"
+    raise ValueError(f"unknown task: {reference}; available tasks: {available}")
+
+
+def command_loop(args: argparse.Namespace) -> None:
+    try:
+        args.task = str(resolve_research_task_reference(args.task, args.root))
+    except ValueError as exc:
+        raise SystemExit(f"quant-agent loop: error: {exc}") from exc
+    command_research_loop(args)
+
+
 def command_research_report(args: argparse.Namespace) -> None:
     report_path = regenerate_loop_report(
         args.task,
@@ -640,6 +691,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quant-agent")
     parser.add_argument("--root", default=".")
     sub = parser.add_subparsers(dest="group", required=True)
+
+    loop = sub.add_parser(
+        "loop",
+        help="run a managed research loop",
+    )
+    loop.add_argument(
+        "task",
+        help="task file, tasks/<name>.toml stem, or task id",
+    )
+    loop.add_argument("--research-root", default=".research")
+    loop.add_argument(
+        "-d",
+        "--diagnostics",
+        dest="retain_diagnostics",
+        action="store_true",
+        help="retain disposable post-run diagnostics under the research cache",
+    )
+    loop.set_defaults(func=command_loop)
 
     data = sub.add_parser("data")
     data_sub = data.add_subparsers(dest="command", required=True)
