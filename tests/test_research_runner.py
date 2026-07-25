@@ -13,6 +13,8 @@ import pytest
 
 import quant_core.research.runner as research_runner
 from quant_core.research import ResearchTask, run_once
+from quant_core.research.attempt import evaluate as evaluate_attempt
+from quant_core.research.attempt import record_learning
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
@@ -123,6 +125,14 @@ def test_research_history_normalizes_fixed_and_walk_forward_development_metrics(
     }
     (fixed_round / "result.json").write_text(json.dumps({
         **common,
+        "development_attempts": [{
+            "attempt_id": "001",
+            "candidate_sha256": "a" * 64,
+            "hypothesis": "Test a risk filter",
+            "development_metrics": {"sortino": 1.1},
+            "outcome": "abandoned",
+            "learning": "The filter reduced return without enough drawdown benefit.",
+        }],
         "metrics": {
             "development": {"sortino": 1.1, "max_drawdown": -0.2},
             "gate": {"sortino": 9.9},
@@ -156,6 +166,12 @@ def test_research_history_normalizes_fixed_and_walk_forward_development_metrics(
         "sortino": 1.1,
         "max_drawdown": -0.2,
     }
+    assert history[0]["development_attempts"] == [{
+        "attempt_id": "001",
+        "hypothesis": "Test a risk filter",
+        "outcome": "abandoned",
+        "learning": "The filter reduced return without enough drawdown benefit.",
+    }]
     assert history[1]["development_metrics"] == {
         "sortino": 1.2,
         "max_drawdown": -0.15,
@@ -182,7 +198,7 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
     ) -> int:
         config_path = cwd / ".quant-research-development.json"
         observed_config.update(json.loads(config_path.read_text(encoding="utf-8")))
-        assert ".quant-research-agent-development.json" in prompt
+        assert "quant_core.research.attempt evaluate" in prompt
         agent_config = json.loads(
             (cwd / ".quant-research-agent-development.json").read_text(
                 encoding="utf-8"
@@ -200,6 +216,22 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
             "finalization_reserve_seconds": 300,
             "safety_factor": 1.25,
         }
+        (cwd / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
+        metadata_path = cwd / RUNTIME_DIR / "metadata.json"
+        metadata_path.write_text(json.dumps({
+            "previous_feedback": "",
+            "hypothesis": "Improve selection",
+            "attempts": "Tested one candidate.",
+            "development_effect": "Development improved.",
+            "candidate": "Retain candidate.",
+        }), encoding="utf-8")
+        submit(metadata_path, workspace=cwd)
+        attempt = evaluate_attempt(workspace=cwd)
+        learning_path = cwd / RUNTIME_DIR / "learning.json"
+        learning_path.write_text(json.dumps({
+            "learning": "The candidate improved Development Sortino.",
+        }), encoding="utf-8")
+        record_learning(str(attempt["attempt_id"]), learning_path, workspace=cwd)
         log_path.write_text(json.dumps({
             "type": "text",
             "part": {"text": json.dumps({
@@ -211,7 +243,6 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
                 "candidate": "Retain candidate.",
             })},
         }) + "\n", encoding="utf-8")
-        (cwd / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
         return 0
 
     def fake_command(
@@ -256,7 +287,21 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
     assert "2025-01-01" not in config_text
     assert '"gate"' not in config_text
     assert '"test"' not in config_text
-    assert len(development_commands) == 1
+    assert len(development_commands) == 2
+    assert result["development_attempts"] == [{
+        "attempt_id": "001",
+        "candidate_sha256": research_runner.hashlib.sha256(
+            b"VALUE = 1\n"
+        ).hexdigest(),
+        "hypothesis": "Improve selection",
+        "development_metrics": {
+            "sortino": 1.2,
+            "max_drawdown": -0.1,
+            "no_feasible_parameter_folds": 0,
+        },
+        "outcome": "submitted",
+        "learning": "The candidate improved Development Sortino.",
+    }]
 
 
 def test_workspace_env_prefers_candidate_source_tree(
@@ -1712,6 +1757,24 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
             "development_effect": "Development Sortino improved while drawdown stayed within the limit.",
             "candidate": "Add momentum strategy",
         }
+        (cwd / "strategy.py").write_text("SIGNAL = 'momentum'\n", encoding="utf-8")
+        metadata_path = cwd / RUNTIME_DIR / "metadata.json"
+        metadata_path.write_text(json.dumps({
+            "previous_feedback": "",
+            **{
+                key: agent_output[key]
+                for key in (
+                    "hypothesis", "attempts", "development_effect", "candidate",
+                )
+            },
+        }), encoding="utf-8")
+        submit(metadata_path, workspace=cwd)
+        attempt = evaluate_attempt(workspace=cwd)
+        learning_path = cwd / RUNTIME_DIR / "learning.json"
+        learning_path.write_text(json.dumps({
+            "learning": "Momentum improved Development risk-adjusted return.",
+        }), encoding="utf-8")
+        record_learning(str(attempt["attempt_id"]), learning_path, workspace=cwd)
         log_path.write_text(
             json.dumps({
                 "type": "text",
@@ -1721,7 +1784,6 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
             }) + "\n",
             encoding="utf-8",
         )
-        (cwd / "strategy.py").write_text("SIGNAL = 'momentum'\n", encoding="utf-8")
         return 0
 
     def fake_command(command: Sequence[str], cwd: Path, log_path: Path, timeout: int) -> int:
@@ -1766,10 +1828,18 @@ def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:
     assert "feedback" not in result
     assert result["attempts"].startswith("Added and tested")
     assert result["candidate"] == "Add momentum strategy"
+    assert result["development_attempts"][0]["outcome"] == "submitted"
+    assert result["development_attempts"][0]["learning"].startswith(
+        "Momentum improved"
+    )
     assert result["metrics"]["gate"]["sortino"] == 1.2
     assert result["round_timing"]["timeout_seconds"] == 60 * 60
     assert events == [
         "agent_started",
+        "checkpoint_accepted",
+        "development_attempt_started",
+        "development_attempt_completed",
+        "development_attempt_learning_recorded",
         "agent_completed",
         "tests_started",
         "tests_passed",
@@ -2049,6 +2119,8 @@ def test_run_once_restores_latest_checkpoint_after_deadline(tmp_path: Path) -> N
     assert result["submission"]["mode"] == "checkpoint"
     assert result["submission"]["checkpoint_id"] == "002"
     assert result["submission"]["submitted_by_timeout"] is True
+    assert result["development_attempts"][0]["outcome"] == "submitted"
+    assert result["development_attempts"][0]["learning"] is None
     assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "VALUE = 2\n"
     assert len(commands) == 3
     assert [event for event, _ in events].count("checkpoint_accepted") == 2

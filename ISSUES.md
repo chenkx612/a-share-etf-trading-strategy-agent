@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Agent 可在同一 Round 内切换主要研究机制 |
 | P1 | 终局报告未从 Parent—Patch—Champion 事实链核验机制演进 |
 | P2 | Walk-forward 缺少候选与 Champion 的行为差异摘要 |
 | P2 | 仍依赖 Prompt 阻止加载无关 Skill |
@@ -46,31 +45,6 @@
 ## 一、待解决问题
 
 ### P1：推荐优先解决
-
-#### Agent 可在同一 Round 内切换主要研究机制
-
-- **问题**：任务 Goal 明确要求“每轮只验证一个主要机制”，但 active-etf-rerank-topk Run 001
-  Round 002 在完整评估“防御袖套跳过动量持仓”后，因 Development 结果较弱，又在同一 Round
-  切换到 `rank_buffer` 迟滞并继续修改、评估和提交候选。当前 Prompt 只用自然语言约束单机制，
-  Checkpoint 和 Result 合同也只描述最终保留的候选，无法阻止或结构化记录同轮已经完整验证后放弃的
-  其他机制。这会混用 Round 时间和参数搜索预算，削弱“一次一个候选”的失败归因，并可能让永久
-  `result.json` 与候选补丁无法完整解释本轮实际研究路径。该 Round 最终晋级的迟滞 Champion 还保留
-  了被放弃的 `sleeve_dedup` 参数和分支（网格固定为 `false`）；下一轮 Agent 因此误判此前被拒绝的
-  截面百分位信号也属于当前 Champion，说明同轮切换会进一步污染父版本可读性和后续历史理解。
-  Run 001 Round 006 最终又把该被拒绝的截面百分位与 Kaufman 效率缩放组合提交并晋级，而
-  `result.json.hypothesis` 只把效率缩放表述为新增主机制；固定指标足以支持 Promotion，却无法证明
-  改善来自哪一个增量机制。
-- **方案**：把 Round 的主假设变成提交首个 Development 评估前必须冻结的结构化字段，并在后续
-  checkpoint 中保持机制标识不变；允许同一机制内的实现修正和小范围收敛，但检测到参数/行为契约之外
-  的机制切换时，应要求结束当前 Round，由下一 Round 继承脱敏结论。Result 应记录本轮所有已执行的
-  完整 Development 评估及其机制标识，避免只保留最终候选摘要。
-- **验证**：用假 Agent 先完整评估 sleeve dedup、再切换 rank buffer，确认第二种机制不能在同一
-  Round 继续提交；同时覆盖同一机制的 bug 修正、邻近参数收敛和截止前 checkpoint 更新，确保这些
-  合理迭代不会被误拦截。
-- **风险**：中。固定 Evaluator、Gate 隔离和 Promotion 仍可信，但研究预算、机制归因与审计完整性
-  会受影响，死配置还可能诱发后续候选重新组合被拒绝机制并晋级；修复前需要外部监督者检查 Agent
-  事件和 Parent—Candidate 行为差异，不能仅凭 Result 的单一主假设做机制归因，并应在复盘时把同轮
-  被放弃的机制及残留代码人工补入结论。
 
 #### 终局报告未从 Parent—Patch—Champion 事实链核验机制演进
 
@@ -194,6 +168,21 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 
 ### P1：曾影响终局复盘完整性
 
+#### Round 内被放弃的 Development 尝试必须进入研究记忆
+
+- **问题**：Agent 可在同一 Round 内完成多个 Development 尝试，但旧 Result 只依赖轮末
+  `attempts` 自由文本；active-etf-rerank-topk Run 001 Round 002 最终只沉淀了提交候选，
+  已评估后放弃的 sleeve dedup 经验丢失，后续 Agent 因而误读历史。
+- **解决**：允许同轮调整研究方向。Agent 先冻结 checkpoint，再通过 Harness-owned Attempt
+  接口运行 Development；Harness 按候选哈希去重并自动冻结假设、归一化指标和完成时间。Agent 在
+  每次评估后可立即补写一条 `learning`，但它不是事实留存和 Promotion 的前提。Round Result 新增
+  兼容字段 `development_attempts`，由最终提交哈希确定 `submitted`/`abandoned`；后续 Prompt
+  优先使用 learning，缺失时使用最小事实摘要，旧 Result 继续读取原 `attempts`。
+- **验证**：覆盖 fixed、walk-forward、同哈希重复评估、同轮放弃后提交、learning 缺失、截止后
+  checkpoint 恢复、结构化合同和旧历史兼容。
+- **风险**：Agent 仍可给出错误因果解释，因此 learning 仅作为研究叙述；Harness-owned 指标和
+  Candidate 哈希才是审计事实。底层参数组合与 folds 不作为独立 Attempt，避免低质量信息膨胀。
+
 #### 终局报告大型输入不得通过 argv 传递
 
 - **问题**：逐折 Development/Gate 记录令 Run 003 的冻结 `report-input.json` 达到 258,525
@@ -286,8 +275,9 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **问题**：依赖 Prompt 限制实现或参数尝试次数无法强制核验；反过来永久保留全部中间搜索
   轨迹又会显著增加工件体积，却不增强最终晋级证据。
 - **解决**：Harness 采用协作型 Agent 信任模型：信任 Agent 不会主动攻击或逃逸系统边界，但
-  防范超时、崩溃、错误输出和普通残留子进程。单轮时间是搜索硬限制；耐久证据只保留冻结输入、最终
-  diff、固定 Development/Gate 指标、Decision、Parent Champion 和 Round 时间。
+  防范超时、崩溃、错误输出和普通残留子进程。单轮时间是搜索硬限制；耐久证据保留冻结输入、每个
+  顶层 Development Attempt 的最小事实、最终 diff、固定 Development/Gate 指标、Decision、
+  Parent Champion 和 Round 时间，不保留内部参数组合与 fold 级搜索轨迹。
   `budget.round_minutes` 由单调时钟强制执行；超时终止进程组并记录
   `result.json.round_timing`，截止后返回的成功也不得进入评测。成功轮可压缩重复日志，失败原因仍
   结构化保留。

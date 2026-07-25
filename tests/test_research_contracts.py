@@ -117,6 +117,24 @@ def test_result_validates_round_timing_when_present() -> None:
         ExperimentResult.from_mapping(payload)
 
 
+def test_result_validates_structured_development_attempts() -> None:
+    payload = completed_result()
+    payload["development_attempts"] = [{
+        "attempt_id": "001",
+        "candidate_sha256": "a" * 64,
+        "hypothesis": "Test a volatility filter",
+        "development_metrics": {"sortino": 1.4},
+        "outcome": "submitted",
+        "learning": None,
+    }]
+
+    ExperimentResult.from_mapping(payload)
+
+    payload["development_attempts"][0]["learning"] = ""
+    with pytest.raises(ValueError, match="learning"):
+        ExperimentResult.from_mapping(payload)
+
+
 def test_result_validates_submission_provenance_when_present() -> None:
     payload = completed_result()
     payload["submission"] = {

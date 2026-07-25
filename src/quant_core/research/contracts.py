@@ -431,6 +431,54 @@ class ExperimentResult:
                 raise ValueError(
                     "result.round_timing.duration_seconds must be finite and non-negative"
                 )
+        development_attempts = data.get("development_attempts")
+        if development_attempts is not None:
+            if not isinstance(development_attempts, list):
+                raise ValueError("result.development_attempts must be a list")
+            seen_ids: set[str] = set()
+            seen_hashes: set[str] = set()
+            submitted = 0
+            for index, attempt in enumerate(development_attempts):
+                context = f"result.development_attempts[{index}]"
+                if not isinstance(attempt, dict) or set(attempt) != {
+                    "attempt_id",
+                    "candidate_sha256",
+                    "hypothesis",
+                    "development_metrics",
+                    "outcome",
+                    "learning",
+                }:
+                    raise ValueError(f"{context} has invalid fields")
+                attempt_id = _required(attempt, "attempt_id", str, context)
+                if (
+                    not attempt_id.isdigit()
+                    or int(attempt_id) < 1
+                    or attempt_id in seen_ids
+                ):
+                    raise ValueError(f"{context}.attempt_id must be a unique positive numeric ID")
+                seen_ids.add(attempt_id)
+                digest = _required(attempt, "candidate_sha256", str, context)
+                if (
+                    len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or digest in seen_hashes
+                ):
+                    raise ValueError(f"{context}.candidate_sha256 must be a unique SHA-256 digest")
+                seen_hashes.add(digest)
+                _required(attempt, "hypothesis", str, context)
+                if not isinstance(attempt.get("development_metrics"), dict):
+                    raise ValueError(f"{context}.development_metrics must be an object")
+                outcome = attempt.get("outcome")
+                if outcome not in {"abandoned", "submitted"}:
+                    raise ValueError(f"{context}.outcome is invalid")
+                submitted += outcome == "submitted"
+                learning = attempt.get("learning")
+                if learning is not None and (
+                    not isinstance(learning, str) or not learning.strip()
+                ):
+                    raise ValueError(f"{context}.learning must be null or a non-empty string")
+            if submitted > 1:
+                raise ValueError("result.development_attempts may contain only one submitted attempt")
         if status == "completed":
             _required(data, "hypothesis", str, "result")
             _required(data, "attempts", str, "result")

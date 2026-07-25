@@ -1492,7 +1492,7 @@ def _prompt(
         "When the clock phase becomes converge, stop expanding the search. In finalize, preserve "
         "the best candidate, run focused tests, and prepare the required JSON. In submit_now, "
         "return immediately. Harness-owned validation after submission is outside this deadline.",
-        "Before every Development backtest, ensure the current candidate is importable, run a "
+        "Before every Development evaluation, ensure the current candidate is importable, run a "
         "focused test, then write "
         ".quant-research-checkpoint/metadata.json with string fields previous_feedback, hypothesis, attempts, "
         "development_effect, and candidate, then run `python3 -m "
@@ -1501,6 +1501,12 @@ def _prompt(
         "checkpoint ID. In converge and finalize, checkpoint the best retained candidate early; "
         "in submit_now, prefer an immediate final response if ready, otherwise submit the best "
         "checkpoint immediately.",
+        "Run the provided Development evaluation command only after checkpoint acceptance. Its JSON "
+        "response contains an attempt_id and normalized Development metrics. After reading the "
+        "metrics, immediately write a JSON file containing exactly one non-empty string field "
+        "`learning`, then run `python3 -m quant_core.research.attempt learn ATTEMPT_ID FILE`. "
+        "State the observed result separately from possible causes. Learning is best-effort: do not "
+        "risk the Round deadline to add or revise it.",
         "After a rejected round, prefer a materially different risk mechanism. Reuse the prior "
         "mechanism only when the history supports one specific, pre-declared corrective change; "
         "do not perform local threshold mining around the rejected candidate.",
@@ -1509,7 +1515,7 @@ def _prompt(
         "The universe and cached market data are fixed for this task. Do not load or run ETF "
         "discovery, pool-selection, data-refresh, or recommendation skills/workflows.",
         f"Test command: {' '.join(test_command)}",
-        f"Development backtest command: {' '.join(development_command)}",
+        f"Development evaluation command: {' '.join(development_command)}",
         f"Development metrics path after that command: {development_metrics_path}",
         "The development backtest is silent on success; read the metrics file directly instead "
         "of searching the workspace or treating empty stdout as a failure.",
@@ -1577,6 +1583,112 @@ def _normalize_development_metrics(value: object) -> dict[str, Any]:
     return metrics
 
 
+def _development_attempts(
+    output_dir: Path,
+    result: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    attempts_root = output_dir / "development-attempts"
+    if attempts_root.exists():
+        for directory in sorted(path for path in attempts_root.iterdir() if path.is_dir()):
+            try:
+                manifest = json.loads(
+                    (directory / "attempt.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            learning: str | None = None
+            try:
+                learning_payload = json.loads(
+                    (directory / "learning.json").read_text(encoding="utf-8")
+                )
+                value = learning_payload.get("learning")
+                if isinstance(value, str) and value.strip():
+                    learning = value.strip()
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+            attempts.append({
+                "attempt_id": manifest.get("attempt_id"),
+                "candidate_sha256": manifest.get("candidate_sha256"),
+                "hypothesis": manifest.get("hypothesis"),
+                "development_metrics": manifest.get("development_metrics", {}),
+                "outcome": "abandoned",
+                "learning": learning,
+            })
+
+    submission = result.get("submission")
+    submitted_sha = (
+        submission.get("strategy_sha256")
+        if isinstance(submission, Mapping)
+        else None
+    )
+    matched = False
+    for attempt in attempts:
+        if submitted_sha is not None and attempt["candidate_sha256"] == submitted_sha:
+            attempt["outcome"] = "submitted"
+            matched = True
+
+    metrics = result.get("metrics")
+    if (
+        result.get("status") == "completed"
+        and isinstance(submitted_sha, str)
+        and not matched
+        and isinstance(metrics, Mapping)
+        and isinstance(metrics.get("development"), Mapping)
+    ):
+        next_attempt_id = max(
+            (
+                int(str(attempt["attempt_id"]))
+                for attempt in attempts
+                if str(attempt.get("attempt_id", "")).isdigit()
+            ),
+            default=0,
+        ) + 1
+        attempts.append({
+            "attempt_id": f"{next_attempt_id:03d}",
+            "candidate_sha256": submitted_sha,
+            "hypothesis": result.get("hypothesis"),
+            "development_metrics": _normalize_development_metrics(
+                metrics["development"]
+            ),
+            "outcome": "submitted",
+            "learning": None,
+        })
+    return attempts
+
+
+def _attempt_history(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    history: list[dict[str, str]] = []
+    for attempt in value:
+        if not isinstance(attempt, Mapping):
+            continue
+        attempt_id = attempt.get("attempt_id")
+        hypothesis = attempt.get("hypothesis")
+        outcome = attempt.get("outcome")
+        learning = attempt.get("learning")
+        if not all(isinstance(item, str) for item in (attempt_id, hypothesis, outcome)):
+            continue
+        if not isinstance(learning, str) or not learning.strip():
+            metrics = attempt.get("development_metrics")
+            compact_metrics = (
+                json.dumps(metrics, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(metrics, Mapping)
+                else "{}"
+            )
+            learning = f"{outcome}; Development metrics: {compact_metrics}"
+        history.append({
+            "attempt_id": attempt_id,
+            "hypothesis": hypothesis,
+            "outcome": outcome,
+            "learning": learning.strip(),
+        })
+    return history
+
+
 def _load_research_history(
     experiments: Path,
     *,
@@ -1623,6 +1735,11 @@ def _load_research_history(
             for key in ("hypothesis", "attempts", "development_effect", "candidate"):
                 if result.get(key) is not None:
                     entry[key] = result.get(key)
+        structured_attempts = _attempt_history(
+            result.get("development_attempts")
+        )
+        if structured_attempts:
+            entry["development_attempts"] = structured_attempts
         history.append(entry)
     return history[-_RESEARCH_HISTORY_LIMIT:]
 
@@ -1777,6 +1894,7 @@ def _run_once_impl(
         TRUSTED_RUNTIME_DIR,
         TRUSTED_STATUS_FILE,
     )
+    from quant_core.research.attempt import DevelopmentAttemptReceiver
 
     task = ResearchTask.load(task_path)
     root = Path(workspace).resolve()
@@ -1860,8 +1978,23 @@ def _run_once_impl(
         event_sink=event_sink,
         event_details=event_details,
     )
+    attempt_receiver = DevelopmentAttemptReceiver(
+        root,
+        out,
+        agent_development_command,
+        root / development_metrics_path,
+        checkpoint_receiver.latest_valid,
+        command_runner,
+        command_timeout,
+        round_clock.deadline_monotonic,
+        _normalize_development_metrics,
+        monotonic=monotonic,
+        event_sink=event_sink,
+        event_details=event_details,
+    )
     agent_development_command = _containerize_prompt_command(
-        agent_development_command, root
+        [sys.executable, "-m", "quant_core.research.attempt", "evaluate"],
+        root,
     )
     agent_metrics_path = _containerize_prompt_command([development_metrics_path], root)[0]
     agent_test_command = _containerize_prompt_command(test_command, root)
@@ -1896,6 +2029,7 @@ def _run_once_impl(
     round_clock.start()
     try:
         checkpoint_receiver.start()
+        attempt_receiver.start()
         if opencode_runner is None:
             generated_dir = Path(development_metrics_path).parent.as_posix()
             agent_read_only_paths = _agent_read_only_paths(
@@ -1925,6 +2059,7 @@ def _run_once_impl(
     finally:
         finished_monotonic = monotonic()
         round_timing = round_clock.stop(finished_monotonic)
+        attempt_receiver.stop()
         checkpoint_receiver.stop()
     deadline_exceeded = (
         exit_code == 124
@@ -2197,6 +2332,10 @@ def run_once(
         monotonic=monotonic,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["development_attempts"] = _development_attempts(
+        Path(output_dir).resolve(),
+        result,
+    )
     result["evaluation_environment_sha256"] = environment.sha256
     ExperimentResult.from_mapping(result)
     write_json_atomic(result_path, result)
