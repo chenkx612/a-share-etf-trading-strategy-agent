@@ -42,7 +42,7 @@ parameter defaults. Fixed simulation settings live in `config.py`, and
 lightweight report output lives in the CLI.
 
 `tests/` holds pytest coverage for framework and harness behavior. `README.md`
-is the canonical user-facing command and operations guide. `HARNESS_ISSUES.md`
+is the canonical user-facing command and operations guide. `ISSUES.md`
 is the engineering risk and resolution registry; do not create overview
 documents that repeat this file or the README, and do not put quantitative
 trading business knowledge in framework documentation.
@@ -89,7 +89,7 @@ operations instead of maintaining a second command catalog here.
 - Never create ad-hoc research roots such as `.research/clean-run` to separate
   Loop invocations. Reuse the configured task root; the Harness allocates
   `runs/001`, `runs/002`, and subsequent Run directories automatically.
-- Before starting a new Loop Run, check `HARNESS_ISSUES.md`; any
+- Before starting a new Loop Run, check `ISSUES.md`; any
   open P0 blocks further Loop research.
 - Emit concise stage events to stdout and `.tmp/runs/<run>/events.jsonl` while a
   Loop is active so an external Codex supervisor can observe progress without
