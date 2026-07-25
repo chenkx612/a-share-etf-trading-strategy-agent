@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -97,6 +98,17 @@ def _init_repo(root: Path) -> None:
 
 def _git_text(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+
+def _git_objects_manifest(root: Path) -> dict[str, bytes]:
+    objects = Path(_git_text(root, "rev-parse", "--git-path", "objects"))
+    if not objects.is_absolute():
+        objects = root / objects
+    return {
+        path.relative_to(objects).as_posix(): path.read_bytes()
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
 
 
 def _task(root: Path, task_id: str = "managed-test") -> Path:
@@ -337,6 +349,95 @@ def test_evaluator_contract_hashes_only_declared_worktree_paths(tmp_path: Path) 
         paths,
         strategy_path="strategy.py",
     ) != with_untracked_dependency
+
+
+def test_evaluator_contract_uses_temporary_object_database(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    evaluator = tmp_path / "evaluator"
+    evaluator.mkdir()
+    core = evaluator / "core.py"
+    core.write_text("VERSION = 1\n", encoding="utf-8")
+    obsolete = evaluator / "obsolete.py"
+    obsolete.write_text("OBSOLETE = True\n", encoding="utf-8")
+    _init_repo(tmp_path)
+
+    core.write_text("VERSION = 2\n", encoding="utf-8")
+    (evaluator / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    obsolete.unlink()
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "temporary-contract-objects",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
+    cached_before = _git_text(tmp_path, "diff", "--cached")
+    objects_before = _git_objects_manifest(tmp_path)
+    object_directory = Path(_git_text(tmp_path, "rev-parse", "--git-path", "objects"))
+    if not object_directory.is_absolute():
+        object_directory = tmp_path / object_directory
+    directories = [
+        object_directory,
+        *sorted(
+            (path for path in object_directory.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+        ),
+    ]
+    original_modes = {
+        path: stat.S_IMODE(path.stat().st_mode)
+        for path in directories
+    }
+
+    try:
+        for path in reversed(directories):
+            path.chmod(original_modes[path] & ~0o222)
+        first = manager.evaluator_contract_sha256(
+            ["evaluator"],
+            strategy_path="strategy.py",
+        )
+        second = manager.evaluator_contract_sha256(
+            ["evaluator"],
+            strategy_path="strategy.py",
+        )
+    finally:
+        for path in directories:
+            path.chmod(original_modes[path])
+
+    assert first == second
+    assert _git_text(tmp_path, "diff", "--cached") == cached_before
+    assert _git_objects_manifest(tmp_path) == objects_before
+
+
+def test_evaluator_contract_resolves_quoted_linked_worktree_objects(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / f"source{os.pathsep}repository"
+    source.mkdir()
+    (source / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    (source / "evaluator.py").write_text("VERSION = 1\n", encoding="utf-8")
+    _init_repo(source)
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "-C", str(source), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    (worktree / "evaluator.py").write_text("VERSION = 2\n", encoding="utf-8")
+    objects_before = _git_objects_manifest(worktree)
+    manager = ResearchWorkspace(
+        worktree,
+        tmp_path / ".research",
+        "linked-contract-objects",
+        evaluation_environment_sha256=ENVIRONMENT_SHA256,
+    )
+
+    digest = manager.evaluator_contract_sha256(
+        ["evaluator.py"],
+        strategy_path="strategy.py",
+    )
+
+    assert len(digest) == 64
+    assert _git_objects_manifest(worktree) == objects_before
 
 
 def test_evaluator_contract_rejects_missing_or_empty_paths(tmp_path: Path) -> None:

@@ -33,7 +33,6 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Evaluator 指纹计算依赖可写 Git 对象库 |
 | P1 | 报告解析因标题前说明文字误判有效 Markdown |
 | P2 | Champion 初评与重评缺少阶段事件 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -41,22 +40,6 @@
 ## 一、待解决问题
 
 ### P1：推荐解决
-
-#### Evaluator 指纹计算依赖可写 Git 对象库
-
-- **问题**：`evaluator_contract_sha256()` 虽用临时 `GIT_INDEX_FILE` 隔离 index，仍执行
-  `git add -A` 和 `git write-tree`，需要向仓库 Git 对象库写入 blob/tree。在仅允许读取
-  `.git`、但允许写工作区的受管执行环境中，Loop 会在分配 Run 前以
-  `unable to create temporary file: Operation not permitted` 失败；本次在扫描
-  `.agents/skills/etf-sharpe-topk/SKILL.md` 时复现。
-- **方案**：将临时 object database 一并放入可写临时目录，并通过
-  `GIT_OBJECT_DIRECTORY`/alternate object directories 只读复用原仓库对象；或改为不写 Git 对象库
-  的确定性工作树内容哈希。两种方案都必须保持未提交 evaluator 改动可进入契约、排除规则不变，
-  且不能污染主仓库 index/object database。
-- **验证**：在主 `.git` 只读、工作区可写的测试夹具中计算契约哈希；覆盖 tracked 修改、未跟踪文件、
-  删除、排除目录及相同内容的稳定哈希，并确认主仓库 index 和对象库均无变化。
-- **风险**：低。当前可在明确授权后于具有 Git 对象库写权限的宿主环境启动，不影响评测语义；
-  但未授权提升权限时无法运行 Harness。
 
 #### 报告解析因标题前说明文字误判有效 Markdown
 
@@ -214,6 +197,16 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
+
+#### Evaluator 指纹不得写入主 Git 对象库
+
+- **问题**：临时 `GIT_INDEX_FILE` 只能隔离 index；`git add` 和 `git write-tree` 仍会把新 blob/tree
+  写入主 `.git/objects`，导致主 Git 元数据只读的受管环境在分配 Run 前失败。
+- **解决**：指纹计算同时使用临时 index 和临时 object database，通过 alternate object directory
+  只读复用仓库公共对象库。保留 Git 的工作树、文件模式、删除和路径语义，临时对象随计算结束清理。
+- **验证**：主对象库只读时，tracked 修改、未跟踪新增和删除仍可稳定计算；主 index 和对象库内容
+  均保持不变，工作树与冻结提交的指纹继续一致。
+- **风险**：本修复只覆盖 Evaluator 指纹；候选快照和 worktree 管理仍按设计需要可写 Git 元数据。
 
 #### Evaluator 契约必须显式声明固定评测输入
 

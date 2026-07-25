@@ -7,11 +7,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import pandas as pd
 
@@ -71,6 +72,32 @@ def _git_bytes(
             detail = completed.stdout.decode(errors="replace").strip()
         raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
     return completed.stdout
+
+
+@contextmanager
+def _temporary_git_write_environment(
+    root: Path,
+    *,
+    prefix: str,
+) -> Iterator[dict[str, str]]:
+    """Keep temporary index and object writes outside the source repository."""
+    common_dir = Path(_git(root, "rev-parse", "--git-common-dir"))
+    if not common_dir.is_absolute():
+        common_dir = (root / common_dir).resolve()
+    source_objects = common_dir / "objects"
+    with tempfile.TemporaryDirectory(prefix=prefix) as temporary:
+        temporary_root = Path(temporary)
+        object_directory = temporary_root / "objects"
+        object_directory.mkdir()
+        alternates = json.dumps(str(source_objects), ensure_ascii=False)
+        inherited_alternates = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        if inherited_alternates:
+            alternates = os.pathsep.join((alternates, inherited_alternates))
+        yield {
+            "GIT_INDEX_FILE": str(temporary_root / "index"),
+            "GIT_OBJECT_DIRECTORY": str(object_directory),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates,
+        }
 
 
 def _filter_tables(root: Path, end: date) -> None:
@@ -476,9 +503,11 @@ class ResearchWorkspace:
         for path in contract_paths:
             if not os.path.lexists(self.source / path):
                 raise FileNotFoundError(f"evaluator contract path does not exist: {path}")
-        with tempfile.TemporaryDirectory(prefix="quant-contract-") as temporary:
-            index = Path(temporary) / "index"
-            env = {"GIT_INDEX_FILE": str(index), **_GIT_IDENTITY}
+        with _temporary_git_write_environment(
+            self.source,
+            prefix="quant-contract-",
+        ) as temporary_env:
+            env = {**temporary_env, **_GIT_IDENTITY}
             _git(self.source, "read-tree", "HEAD", env=env)
             _git(self.source, "add", "-A", "--", *contract_paths, env=env)
             tree = _git(self.source, "write-tree", env=env)
@@ -492,6 +521,7 @@ class ResearchWorkspace:
                     tree,
                     "--",
                     path,
+                    env=env,
                 )
                 path_lines = [
                     line
