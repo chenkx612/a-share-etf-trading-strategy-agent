@@ -27,8 +27,8 @@ Run 001 的可继承研究记忆仅限机制和 Harness 结论：动量袖套 `r
 """
 
 [budget]
-max_rounds = 6
-max_hours = 6
+max_rounds = 10
+max_hours = 10
 max_consecutive_failures = 3
 round_minutes = 30
 
