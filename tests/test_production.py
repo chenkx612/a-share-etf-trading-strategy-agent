@@ -24,6 +24,7 @@ from quant_core.production import (
     schedule_bucket,
     search_parameters,
 )
+from quant_core.schedule import schedule_boundaries
 
 
 class FakeStrategy:
@@ -233,7 +234,7 @@ def test_schedule_supports_month_start_week_end_and_stable_trading_day_intervals
         ).date
     )
     monkeypatch.setattr(
-        "quant_core.production._exchange_trade_dates", lambda: exchange_dates
+        "quant_core.schedule.exchange_trade_dates", lambda: exchange_dates
     )
     monthly = {"period": "calendar_month", "interval": 1, "trigger": "start"}
     weekly = {"period": "iso_week", "interval": 1, "trigger": "end"}
@@ -249,12 +250,52 @@ def test_schedule_supports_month_start_week_end_and_stable_trading_day_intervals
     )
 
 
+def test_calendar_end_fallback_requires_a_following_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = pd.DatetimeIndex(
+        ["2026-06-29", "2026-06-30", "2026-07-01", "2026-07-02", "2026-07-10"]
+    )
+    monkeypatch.setattr("quant_core.schedule.exchange_trade_dates", lambda: ())
+    monthly_end = {
+        "period": "calendar_month",
+        "interval": 1,
+        "trigger": "end",
+    }
+
+    assert is_schedule_boundary(pd.Timestamp("2026-06-30"), monthly_end, dates)
+    assert not is_schedule_boundary(pd.Timestamp("2026-07-10"), monthly_end, dates)
+    assert schedule_boundaries(dates, monthly_end) == [
+        pd.Timestamp("2026-06-30")
+    ]
+
+
+def test_schedule_boundaries_scans_normalized_dates_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = pd.bdate_range("2000-01-03", periods=5_000)
+    monkeypatch.setattr("quant_core.schedule.exchange_trade_dates", lambda: ())
+    monkeypatch.setattr(
+        "quant_core.schedule.is_schedule_boundary",
+        lambda *args, **kwargs: pytest.fail(
+            "batch boundary discovery must not rescan through is_schedule_boundary"
+        ),
+    )
+
+    boundaries = schedule_boundaries(
+        dates,
+        {"period": "calendar_month", "interval": 1, "trigger": "start"},
+    )
+
+    assert len(boundaries) > 100
+
+
 def test_curve_uses_last_real_tuning_date_before_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dates = pd.bdate_range("2026-04-01", "2026-07-31")
     monkeypatch.setattr(
-        "quant_core.production._exchange_trade_dates",
+        "quant_core.schedule.exchange_trade_dates",
         lambda: tuple(dates.date),
     )
     schedule = {"period": "calendar_month", "interval": 1, "trigger": "start"}
@@ -275,7 +316,7 @@ def test_next_tuning_date_is_next_schedule_boundary(
 ) -> None:
     dates = pd.bdate_range("2026-07-01", "2026-09-30")
     monkeypatch.setattr(
-        "quant_core.production._exchange_trade_dates",
+        "quant_core.schedule.exchange_trade_dates",
         lambda: tuple(dates.date),
     )
     schedule = {"period": "calendar_month", "interval": 1, "trigger": "start"}
@@ -367,15 +408,14 @@ def test_success_writes_holdings_summary_curve_and_png(
     assert not (tmp_path / "outputs" / "fake-task" / "2026-07-01").exists()
 
 
-def test_end_trigger_reuses_previous_freeze_at_start_of_new_month(
+def test_midmonth_first_run_backfills_the_month_start_search(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ctx = context(tmp_path)
-    ctx.task.production["schedule"]["trigger"] = "end"
     daily = sample_daily()
     exchange_dates = tuple(pd.bdate_range("2024-01-02", "2026-07-31").date)
     monkeypatch.setattr(
-        "quant_core.production._exchange_trade_dates", lambda: exchange_dates
+        "quant_core.schedule.exchange_trade_dates", lambda: exchange_dates
     )
     calls: list[pd.Timestamp] = []
 
@@ -420,20 +460,16 @@ def test_end_trigger_reuses_previous_freeze_at_start_of_new_month(
         "quant_core.production.causal_replay",
         lambda context, daily, signal_date: (curve, metrics, []),
     )
-    run_recommendation(
+    summary_path = run_recommendation(
         tmp_path,
         ctx.task_path,
-        requested_date=pd.Timestamp("2026-06-30").date(),
+        requested_date=pd.Timestamp("2026-07-24").date(),
         skip_refresh=True,
     )
-    july_summary = run_recommendation(
-        tmp_path,
-        ctx.task_path,
-        requested_date=pd.Timestamp("2026-07-01").date(),
-        skip_refresh=True,
-    )
-    assert calls == [pd.Timestamp("2026-06-30")]
-    assert json.loads(july_summary.read_text(encoding="utf-8"))["search_status"] == "reused"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert calls == [pd.Timestamp("2026-07-01")]
+    assert summary["search_status"] == "searched"
+    assert summary["last_tuning_date"] == "2026-07-01"
 
 
 def test_recommendation_reuses_legacy_parameter_freeze(

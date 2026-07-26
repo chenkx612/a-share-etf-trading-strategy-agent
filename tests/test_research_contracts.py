@@ -59,9 +59,12 @@ def walk_forward_task() -> dict:
     payload["evaluation"]["mode"] = "walk_forward"
     payload["evaluation"]["walk_forward"] = {
         "train_months": 36,
-        "validation_months": 12,
-        "step_months": 12,
         "max_parameter_sets": 256,
+        "schedule": {
+            "period": "calendar_month",
+            "interval": 1,
+            "trigger": "start",
+        },
         **fixed,
     }
     return payload
@@ -124,6 +127,30 @@ def test_task_accepts_strict_production_contract() -> None:
     task = ResearchTask.from_mapping(production_task())
     assert task.production is not None
     assert task.production["schedule"]["period"] == "calendar_month"
+
+
+def test_walk_forward_rejects_legacy_start_anchored_frequency_fields() -> None:
+    payload = walk_forward_task()
+    payload["evaluation"]["walk_forward"]["validation_months"] = 1
+
+    with pytest.raises(ValueError, match="must contain exactly"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_walk_forward_requires_month_start_schedule() -> None:
+    payload = walk_forward_task()
+    payload["evaluation"]["walk_forward"]["schedule"]["trigger"] = "end"
+
+    with pytest.raises(ValueError, match="trigger must be start"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_production_schedule_must_match_walk_forward_schedule() -> None:
+    payload = production_task()
+    payload["production"]["schedule"]["interval"] = 2
+
+    with pytest.raises(ValueError, match="must equal"):
+        ResearchTask.from_mapping(payload)
 
 
 @pytest.mark.parametrize(

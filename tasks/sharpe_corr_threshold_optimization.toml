@@ -74,6 +74,7 @@ paths = [
   "src/quant_core/data",
   "src/quant_core/factors",
   "src/quant_core/research",
+  "src/quant_core/schedule.py",
   "src/quant_core/strategy/__init__.py",
   "tests/test_sector_rotation_research.py",
   "universes/sector_rotation.csv",
@@ -89,9 +90,12 @@ minimum_improvement = 0.03
 
 [evaluation.walk_forward]
 train_months = 18
-validation_months = 1
-step_months = 1
 max_parameter_sets = 256
+
+[evaluation.walk_forward.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
 
 [evaluation.walk_forward.development]
 start = "2021-07-19"

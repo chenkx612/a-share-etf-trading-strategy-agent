@@ -26,6 +26,18 @@ def _daily() -> pd.DataFrame:
     ])
 
 
+def _walk_forward(max_parameter_sets: int) -> dict[str, object]:
+    return {
+        "train_months": 3,
+        "max_parameter_sets": max_parameter_sets,
+        "schedule": {
+            "period": "calendar_month",
+            "interval": 1,
+            "trigger": "start",
+        },
+    }
+
+
 def test_evaluator_runs_candidate_through_fixed_backtest() -> None:
     def select(
         daily: pd.DataFrame,
@@ -85,7 +97,7 @@ def test_walk_forward_selects_parameters_and_records_oos_folds() -> None:
     selected, result, folds = evaluate_walk_forward(
         daily, pd.DataFrame({"symbol": ["A", "B"]}),
         {"start": "2024-04-01", "end": "2024-05-31"},
-        {"train_months": 3, "validation_months": 1, "max_parameter_sets": 2},
+        _walk_forward(2),
         {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}}, "sortino",
         [{"symbol": "A"}, {"symbol": "B"}], selector,
     )
@@ -115,16 +127,56 @@ def test_walk_forward_accepts_training_data_starting_on_first_trading_day() -> N
         daily,
         pd.DataFrame({"symbol": ["A"]}),
         {"start": "2024-09-01", "end": "2024-09-30"},
-        {"train_months": 3, "validation_months": 1, "max_parameter_sets": 1},
+        _walk_forward(1),
         {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
         "sortino",
         [{}],
         selector,
     )
 
-    assert folds[0]["train_start"] == "2024-06-01"
+    assert folds[0]["parameter_date"] == "2024-08-01"
+    assert folds[0]["train_start"] == "2024-05-01"
     assert folds[0]["status"] == "selected"
     assert not selected.empty
+
+
+def test_walk_forward_monthly_boundaries_do_not_depend_on_period_start() -> None:
+    dates = pd.date_range("2024-01-01", "2024-05-31", freq="B")
+    daily = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": "A",
+            "open": 10.0 + pd.Series(range(len(dates)), dtype=float),
+        }
+    )
+
+    def selector(daily, universe, start, end, params):
+        signal_dates = daily.loc[daily["date"].between(start, end), "date"]
+        return pd.DataFrame(
+            {
+                "date": signal_dates,
+                "symbol": "A",
+                "target_weight": 1.0,
+            }
+        )
+
+    outputs = []
+    for start in ("2024-04-18", "2024-04-22"):
+        _, result, folds = evaluate_walk_forward(
+            daily,
+            pd.DataFrame({"symbol": ["A"]}),
+            {"start": start, "end": "2024-05-31"},
+            _walk_forward(1),
+            {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
+            "annual_return",
+            [{}],
+            selector,
+        )
+        outputs.append(([fold["parameter_date"] for fold in folds], result))
+
+    assert outputs[0][0] == outputs[1][0] == ["2024-04-01", "2024-05-01"]
+    assert outputs[0][1].daily_returns.iloc[0]["net_return"] > 0.0
+    assert outputs[1][1].daily_returns.iloc[0]["net_return"] > 0.0
 
 
 def test_walk_forward_rejects_an_empty_training_window() -> None:
@@ -138,7 +190,7 @@ def test_walk_forward_rejects_an_empty_training_window() -> None:
             daily,
             pd.DataFrame({"symbol": ["A"]}),
             {"start": "2024-09-01", "end": "2024-09-30"},
-            {"train_months": 3, "validation_months": 1, "max_parameter_sets": 1},
+            _walk_forward(1),
             {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
             "sortino",
             [{}],
@@ -213,7 +265,7 @@ def test_agent_walk_forward_requires_current_checkpoint(tmp_path: Path) -> None:
             _budget_daily(),
             pd.DataFrame({"symbol": ["A"]}),
             {"start": "2024-04-01", "end": "2024-05-31"},
-            {"train_months": 3, "validation_months": 1, "max_parameter_sets": 2},
+            _walk_forward(2),
             {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
             "annual_return",
             [{"value": 1}, {"value": 2}],
@@ -250,7 +302,7 @@ def test_agent_walk_forward_rejects_projected_over_budget_grid(
             _budget_daily(),
             pd.DataFrame({"symbol": ["A"]}),
             {"start": "2024-04-01", "end": "2024-05-31"},
-            {"train_months": 3, "validation_months": 1, "max_parameter_sets": 2},
+            _walk_forward(2),
             {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
             "annual_return",
             [{"value": 1}, {"value": 2}],
@@ -294,7 +346,7 @@ def test_agent_walk_forward_reuses_calibration_and_records_completion(
         _budget_daily(),
         pd.DataFrame({"symbol": ["A"]}),
         {"start": "2024-04-01", "end": "2024-05-31"},
-        {"train_months": 3, "validation_months": 1, "max_parameter_sets": 2},
+        _walk_forward(2),
         {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
         "annual_return",
         [{"value": 1}, {"value": 2}],

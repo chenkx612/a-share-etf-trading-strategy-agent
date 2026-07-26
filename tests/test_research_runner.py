@@ -97,9 +97,12 @@ WALK_FORWARD_TASK_TOML = TASK_TOML.replace(
     "[evaluation.fixed.development]",
     """[evaluation.walk_forward]
 train_months = 36
-validation_months = 12
-step_months = 12
 max_parameter_sets = 64
+
+[evaluation.walk_forward.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
 
 [evaluation.walk_forward.development]""",
 ).replace(
@@ -277,9 +280,12 @@ def test_walk_forward_development_config_excludes_gate_and_test_periods(
     assert observed_config["period"] == {"start": "2018-01-01", "end": "2021-12-31"}
     assert observed_config["walk_forward"] == {
         "train_months": 36,
-        "validation_months": 12,
-        "step_months": 12,
         "max_parameter_sets": 64,
+        "schedule": {
+            "period": "calendar_month",
+            "interval": 1,
+            "trigger": "start",
+        },
     }
     config_text = json.dumps(observed_config)
     assert "2022-01-01" not in config_text

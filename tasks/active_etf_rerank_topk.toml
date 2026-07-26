@@ -102,6 +102,7 @@ paths = [
   "src/quant_core/data",
   "src/quant_core/factors",
   "src/quant_core/research",
+  "src/quant_core/schedule.py",
   "src/quant_core/strategy/__init__.py",
   "src/quant_core/strategy/sharpe_corr_threshold.py",
   "tests/test_research_evaluator.py",
@@ -118,9 +119,12 @@ minimum_improvement = 0.03
 
 [evaluation.walk_forward]
 train_months = 12
-validation_months = 1
-step_months = 1
 max_parameter_sets = 128
+
+[evaluation.walk_forward.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
 
 [evaluation.walk_forward.development]
 start = "2023-01-22"

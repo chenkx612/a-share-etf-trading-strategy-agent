@@ -95,29 +95,29 @@ def data_requirements() -> dict[str, object]:
 
 def parameter_grid() -> list[dict[str, object]]:
     grid: list[dict[str, object]] = []
-    # Champion baseline: rank_buffer=1, mom_sleeve_weight=0.30, use_relative_mom=True,
-    # sleeve_dedup=False, use_sharpe=False, use_efficiency_scale=True, mom_accel_lag=0.
-    # Primary mechanism: mom_accel_lag {0,10,20}; 0 = level-only control after ER scale.
+    # Champion baseline signals unchanged. Grid simplification (priority 3):
+    # remove mom_accel_lag from search (fix 0=level-only); keep top_n and momentum_window.
+    # Rationale: under 12m train, non-zero accel selection is mixed and may add fold jitter
+    # without consistent validation-direction edge versus level-only ER-scaled mom.
     for top_n in (1, 2):
         for momentum_window in (90, 120):
-            for mom_accel_lag in (0, 10, 20):
-                vol_window = 60
-                min_history = max(momentum_window, vol_window)
-                grid.append(
-                    {
-                        "top_n": top_n,
-                        "momentum_window": momentum_window,
-                        "vol_window": vol_window,
-                        "min_history": min_history,
-                        "mom_sleeve_weight": 0.30,
-                        "use_sharpe": False,
-                        "rank_buffer": 1,
-                        "use_relative_mom": True,
-                        "sleeve_dedup": False,
-                        "use_efficiency_scale": True,
-                        "mom_accel_lag": mom_accel_lag,
-                    }
-                )
+            vol_window = 60
+            min_history = max(momentum_window, vol_window)
+            grid.append(
+                {
+                    "top_n": top_n,
+                    "momentum_window": momentum_window,
+                    "vol_window": vol_window,
+                    "min_history": min_history,
+                    "mom_sleeve_weight": 0.30,
+                    "use_sharpe": False,
+                    "rank_buffer": 1,
+                    "use_relative_mom": True,
+                    "sleeve_dedup": False,
+                    "use_efficiency_scale": True,
+                    "mom_accel_lag": 0,
+                }
+            )
     return grid
 
 

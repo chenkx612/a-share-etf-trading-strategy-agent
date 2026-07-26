@@ -8,6 +8,8 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
+from quant_core.schedule import validate_schedule
+
 
 def _required(data: Mapping[str, Any], key: str, expected: type, context: str) -> Any:
     value = data.get(key)
@@ -103,22 +105,10 @@ class ResearchTask:
                     "task.production must contain exactly schedule, train_months, "
                     "objective, constraints, max_parameter_sets, curve_months, and benchmark"
                 )
-            schedule = _required(production, "schedule", dict, "task.production")
-            if set(schedule) != {"period", "interval", "trigger"}:
-                raise ValueError(
-                    "task.production.schedule must contain exactly period, interval, and trigger"
-                )
-            period = _required(schedule, "period", str, "task.production.schedule")
-            if period not in {"trading_day", "iso_week", "calendar_month"}:
-                raise ValueError(
-                    "task.production.schedule.period must be trading_day, iso_week, "
-                    "or calendar_month"
-                )
-            interval = schedule.get("interval")
-            if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
-                raise ValueError("task.production.schedule.interval must be a positive integer")
-            if schedule.get("trigger") not in {"start", "end"}:
-                raise ValueError("task.production.schedule.trigger must be start or end")
+            schedule = validate_schedule(
+                _required(production, "schedule", dict, "task.production"),
+                context="task.production.schedule",
+            )
             for key in ("train_months", "max_parameter_sets", "curve_months"):
                 value = production.get(key)
                 if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -332,12 +322,37 @@ class ResearchTask:
         periods_key = "fixed" if mode == "fixed" else "walk_forward"
         periods = _required(evaluation, periods_key, dict, "task.evaluation")
         if mode == "walk_forward":
-            for key in ("train_months", "validation_months", "step_months", "max_parameter_sets"):
+            expected_walk_forward = {
+                "train_months",
+                "max_parameter_sets",
+                "schedule",
+                "development",
+                "gate",
+            }
+            if set(periods) != expected_walk_forward:
+                raise ValueError(
+                    "task.evaluation.walk_forward must contain exactly train_months, "
+                    "max_parameter_sets, schedule, development, and gate"
+                )
+            for key in ("train_months", "max_parameter_sets"):
                 value = periods.get(key)
                 if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                     raise ValueError(f"task.evaluation.walk_forward.{key} must be a positive integer")
-            if periods["validation_months"] != periods["step_months"]:
-                raise ValueError("walk_forward.step_months must equal validation_months")
+            evaluation_schedule = validate_schedule(
+                _required(
+                    periods,
+                    "schedule",
+                    dict,
+                    "task.evaluation.walk_forward",
+                ),
+                context="task.evaluation.walk_forward.schedule",
+                require_start=True,
+            )
+            if production is not None and evaluation_schedule != schedule:
+                raise ValueError(
+                    "task.production.schedule must equal "
+                    "task.evaluation.walk_forward.schedule"
+                )
         development = _period(
             _required(periods, "development", dict, f"task.evaluation.{periods_key}"),
             f"task.evaluation.{periods_key}.development",

@@ -19,6 +19,7 @@ from quant_core.config import BacktestConfig
 from quant_core.data.market_data import ProjectPaths, load_universe, read_daily
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.workspace import write_json_atomic
+from quant_core.schedule import latest_schedule_boundary, schedule_boundaries
 
 
 Selector = Callable[[pd.DataFrame, pd.DataFrame, pd.Timestamp, pd.Timestamp], pd.DataFrame]
@@ -272,23 +273,44 @@ def evaluate_walk_forward(
     folds: list[dict[str, object]] = []
     selections: list[pd.DataFrame] = []
     train_months = int(walk_forward["train_months"])
-    validation_months = int(walk_forward["validation_months"])
+    schedule = walk_forward["schedule"]
+    if not isinstance(schedule, dict):
+        raise ValueError("walk_forward.schedule must be a mapping")
     symbols = set(universe["symbol"].astype(str))
     all_signal_dates = sorted(history.loc[history["date"].between(start, end), "date"].unique())
+    if not all_signal_dates:
+        raise ValueError("insufficient data for walk-forward evaluation period")
+    trading_dates = pd.DatetimeIndex(
+        history.loc[history["symbol"].astype(str).isin(symbols), "date"].unique()
+    ).sort_values()
+    replay_start = latest_schedule_boundary(start, schedule, trading_dates)
+    boundaries = [
+        replay_start,
+        *(
+            boundary
+            for boundary in schedule_boundaries(trading_dates, schedule)
+            if replay_start < boundary <= end
+        ),
+    ]
     fold_specs: list[dict[str, pd.Timestamp]] = []
-    fold_start = start
-    while fold_start <= end:
-        next_start = fold_start + pd.DateOffset(months=validation_months)
-        fold_end = min(end, next_start - timedelta(days=1))
-        train_start = fold_start - pd.DateOffset(months=train_months)
-        train_end = fold_start - timedelta(days=1)
+    for index, boundary in enumerate(boundaries):
+        next_start = boundaries[index + 1] if index + 1 < len(boundaries) else None
+        fold_end = min(
+            end,
+            next_start - timedelta(days=1) if next_start is not None else end,
+        )
+        validation_start = max(start, boundary)
+        if validation_start > fold_end:
+            continue
+        train_start = boundary - pd.DateOffset(months=train_months)
         fold_specs.append({
             "train_start": train_start,
-            "train_end": train_end,
-            "validation_start": fold_start,
+            "train_end": boundary,
+            "selection_start": boundary,
+            "parameter_date": boundary,
+            "validation_start": validation_start,
             "validation_end": fold_end,
         })
-        fold_start = next_start
 
     cached: dict[tuple[int, int], tuple[pd.DataFrame, BacktestResult]] = {}
     completed_evaluations = 0
@@ -397,12 +419,13 @@ def evaluate_walk_forward(
                 ranked.append((-float(value), json.dumps(params, sort_keys=True, separators=(",", ":")), params, metrics))
         record: dict[str, object] = {
             "train_start": train_start.date().isoformat(), "train_end": train_end.date().isoformat(),
+            "parameter_date": spec["parameter_date"].date().isoformat(),
             "validation_start": spec["validation_start"].date().isoformat(),
             "validation_end": spec["validation_end"].date().isoformat(),
         }
         if ranked:
             _, _, params, train_metrics = sorted(ranked)[0]
-            fold_start = spec["validation_start"]
+            fold_start = spec["selection_start"]
             fold_end = spec["validation_end"]
             validation_history = history[history["date"] <= fold_end]
             selected, _ = evaluate_candidate(
@@ -416,10 +439,32 @@ def evaluate_walk_forward(
             record["status"] = "no_feasible_parameters"
         folds.append(record)
     selected_all = pd.concat(selections, ignore_index=True) if selections else pd.DataFrame(columns=["date", "symbol", "target_weight"])
-    selected_all.attrs["signal_dates"] = all_signal_dates
+    replay_signal_dates = sorted(
+        history.loc[history["date"].between(replay_start, end), "date"].unique()
+    )
+    selected_all.attrs["signal_dates"] = replay_signal_dates
     selected_all.attrs["universe_symbols"] = sorted(symbols)
-    oos_daily = history[history["date"].between(start, end) & history["symbol"].astype(str).isin(symbols)]
-    result = run_backtest(oos_daily, selected_all)
+    oos_daily = history[
+        history["date"].between(replay_start, end)
+        & history["symbol"].astype(str).isin(symbols)
+    ]
+    replay_result = run_backtest(oos_daily, selected_all)
+    scored_daily_returns = replay_result.daily_returns[
+        replay_result.daily_returns["date"].between(start, end)
+    ].reset_index(drop=True)
+    scored_equity = scored_daily_returns[["date"]].copy()
+    scored_equity["equity"] = (
+        1.0 + scored_daily_returns["net_return"].astype(float)
+    ).cumprod()
+    scored_positions = replay_result.positions[
+        replay_result.positions["date"].between(start, end)
+    ].reset_index(drop=True)
+    result = BacktestResult(
+        scored_daily_returns,
+        scored_equity,
+        scored_positions,
+        compute_metrics(scored_daily_returns),
+    )
     for record in folds:
         left, right = pd.Timestamp(record["validation_start"]), pd.Timestamp(record["validation_end"])
         record["oos_metrics"] = compute_metrics(result.daily_returns[result.daily_returns["date"].between(left, right)])
@@ -435,7 +480,10 @@ def evaluate_walk_forward(
             projected_total_seconds=projected_total_seconds,
             available_seconds=available_seconds,
         )
-    return selected_all, result, folds
+    selected_scored = selected_all[selected_all["date"].between(start, end)].copy()
+    selected_scored.attrs["signal_dates"] = all_signal_dates
+    selected_scored.attrs["universe_symbols"] = sorted(symbols)
+    return selected_scored, result, folds
 
 
 def main() -> None:

@@ -7,10 +7,8 @@ import json
 import math
 import os
 import tempfile
-from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping, Sequence
@@ -19,6 +17,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from quant_core import schedule as schedule_policy
 from quant_core.backtest.engine import compute_metrics, run_backtest
 from quant_core.config import BacktestConfig
 from quant_core.data.market_data import (
@@ -34,6 +33,11 @@ from quant_core.data.market_data import (
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.evaluator import evaluate_candidate, validate_selection
 from quant_core.research.workspace import write_json_atomic
+from quant_core.schedule import (
+    is_schedule_boundary,
+    latest_schedule_boundary,
+    schedule_bucket,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -214,6 +218,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
 
     backtest_source = Path(inspect.getfile(run_backtest)).read_bytes()
     production_source = Path(__file__).read_bytes()
+    schedule_source = Path(inspect.getfile(schedule_policy)).read_bytes()
     backtest_contract = _sha256_bytes(
         backtest_source
         + _canonical_json(BacktestConfig().__dict__).encode("utf-8")
@@ -229,6 +234,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
         "backtest_contract": backtest_contract,
         "execution_contract": _sha256_bytes(
             production_source
+            + schedule_source
             + backtest_contract.encode("ascii")
             + PRODUCTION_SCHEMA_VERSION.to_bytes(4, "big")
         ),
@@ -244,87 +250,6 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
         hashes=hashes,
         champion=champion,
     )
-
-
-def _period_ordinal(value: pd.Timestamp, period: str) -> int:
-    if period == "calendar_month":
-        return value.year * 12 + value.month - 1
-    if period == "iso_week":
-        monday = value.normalize() - pd.Timedelta(days=value.weekday())
-        return int((monday - pd.Timestamp("1970-01-05")).days // 7)
-    raise ValueError(f"period {period!r} does not have a calendar ordinal")
-
-
-@lru_cache(maxsize=1)
-def _exchange_trade_dates() -> tuple[date, ...]:
-    try:
-        import akshare as ak
-
-        calendar = ak.tool_trade_date_hist_sina()
-        column = "trade_date" if "trade_date" in calendar.columns else calendar.columns[0]
-        return tuple(sorted(pd.to_datetime(calendar[column]).dt.date.unique()))
-    except Exception:
-        return ()
-
-
-def _trading_day_ordinal(value: pd.Timestamp) -> int:
-    day = pd.Timestamp(value).date()
-    calendar = _exchange_trade_dates()
-    if calendar:
-        index = bisect_left(calendar, day)
-        if index < len(calendar) and calendar[index] == day:
-            return index
-    # Stable offline fallback. Production data still proves that `day` traded.
-    return int(np.busday_count("1970-01-01", np.datetime64(day)))
-
-
-def schedule_bucket(
-    value: pd.Timestamp,
-    schedule: Mapping[str, object],
-    trading_dates: Sequence[pd.Timestamp],
-) -> str:
-    dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).sort_values().unique()
-    timestamp = pd.Timestamp(value).normalize()
-    period = str(schedule["period"])
-    interval = int(schedule["interval"])
-    if period == "trading_day":
-        if timestamp not in dates:
-            raise ValueError(f"{timestamp.date()} is not a trading date")
-        return f"trading_day:{_trading_day_ordinal(timestamp) // interval}"
-    ordinal = _period_ordinal(timestamp, period)
-    return f"{period}:{ordinal // interval}"
-
-
-def is_schedule_boundary(
-    value: pd.Timestamp,
-    schedule: Mapping[str, object],
-    trading_dates: Sequence[pd.Timestamp],
-) -> bool:
-    dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).sort_values().unique()
-    timestamp = pd.Timestamp(value).normalize()
-    matches = np.flatnonzero(dates == timestamp)
-    if not len(matches):
-        return False
-    index = int(matches[0])
-    trigger = str(schedule["trigger"])
-    if str(schedule["period"]) == "trading_day":
-        ordinal = _trading_day_ordinal(timestamp)
-        interval = int(schedule["interval"])
-        remainder = ordinal % interval
-        return remainder == (0 if trigger == "start" else interval - 1)
-    bucket = schedule_bucket(timestamp, schedule, dates)
-    calendar = _exchange_trade_dates()
-    if calendar:
-        day = timestamp.date()
-        calendar_index = bisect_left(calendar, day)
-        if calendar_index < len(calendar) and calendar[calendar_index] == day:
-            neighbor_index = calendar_index + (-1 if trigger == "start" else 1)
-            if 0 <= neighbor_index < len(calendar):
-                neighbor = pd.Timestamp(calendar[neighbor_index])
-                return schedule_bucket(neighbor, schedule, dates) != bucket
-    if trigger == "start":
-        return index > 0 and schedule_bucket(dates[index - 1], schedule, dates) != bucket
-    return index < len(dates) - 1 and schedule_bucket(dates[index + 1], schedule, dates) != bucket
 
 
 def _passes_constraints(
@@ -453,27 +378,6 @@ def _freeze_search(
     }
     write_json_atomic(path, payload)
     return path
-
-
-def _latest_valid_freeze(
-    context: ProductionContext, signal_date: pd.Timestamp
-) -> tuple[Path, Mapping[str, object]] | None:
-    candidates: list[tuple[pd.Timestamp, Path, Mapping[str, object]]] = []
-    for store in (_parameter_store(context), _legacy_parameter_store(context)):
-        if not store.is_dir():
-            continue
-        for path in store.glob("*.json"):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                searched = pd.Timestamp(payload["searched_on"])
-            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if searched <= signal_date and _input_hashes_match(payload, context.hashes):
-                candidates.append((searched, path, payload))
-    if not candidates:
-        return None
-    _, path, payload = max(candidates, key=lambda item: (item[0], str(item[1])))
-    return path, payload
 
 
 def _valid_freeze(
@@ -631,6 +535,7 @@ def _next_trade_date(signal: pd.Timestamp, all_dates: Sequence[pd.Timestamp]) ->
 def _target_holdings(
     context: ProductionContext,
     daily: pd.DataFrame,
+    schedule_boundary: pd.Timestamp,
     signal_date: pd.Timestamp,
     trade_date: pd.Timestamp,
     parameters: Mapping[str, object],
@@ -638,7 +543,7 @@ def _target_holdings(
     raw = context.strategy.select_with_params(
         daily[daily["date"] <= signal_date].copy(),
         context.universe.copy(),
-        signal_date,
+        schedule_boundary,
         signal_date,
         dict(parameters),
     )
@@ -646,9 +551,10 @@ def _target_holdings(
         raw,
         daily,
         set(context.universe["symbol"]),
-        signal_date,
+        schedule_boundary,
         signal_date,
     )
+    selected = selected[selected["date"] == signal_date].reset_index(drop=True)
     total = float(selected["target_weight"].sum()) if not selected.empty else 0.0
     if total > 1.0 + 1e-9:
         raise ValueError("target ETF weights exceed one")
@@ -717,7 +623,7 @@ def next_schedule_boundary(
 ) -> pd.Timestamp:
     signal = pd.Timestamp(signal_date).normalize()
     known = pd.DatetimeIndex(pd.to_datetime(trading_dates)).normalize()
-    calendar = _exchange_trade_dates()
+    calendar = schedule_policy.exchange_trade_dates()
     if calendar:
         official = pd.DatetimeIndex(calendar)
         tail_start = max(signal, pd.Timestamp(official[-1])) + pd.Timedelta(days=1)
@@ -759,7 +665,7 @@ def causal_replay(
     audits: list[Mapping[str, object]] = []
     for index, boundary in enumerate(boundaries):
         result = search_parameters(context, daily[daily["date"] <= boundary], boundary)
-        segment_start = max(boundary, pd.Timestamp(curve_dates[0]))
+        segment_start = boundary
         segment_end = (
             boundaries[index + 1] - pd.Timedelta(days=1)
             if index + 1 < len(boundaries)
@@ -790,15 +696,27 @@ def causal_replay(
             }
         )
     combined = pd.concat(selections, ignore_index=True) if selections else pd.DataFrame()
-    combined.attrs["signal_dates"] = list(curve_dates)
+    replay_start = boundaries[0]
+    replay_dates = pd.DatetimeIndex(
+        strategy_daily.loc[
+            strategy_daily["date"].between(replay_start, signal_date), "date"
+        ].unique()
+    ).sort_values()
+    combined.attrs["signal_dates"] = list(replay_dates)
     combined.attrs["universe_symbols"] = sorted(symbols)
     backtest_daily = strategy_daily[
-        strategy_daily["date"].between(curve_dates[0], signal_date)
+        strategy_daily["date"].between(replay_start, signal_date)
     ].copy()
     result = run_backtest(backtest_daily, combined)
     if result.daily_returns.empty:
         raise RuntimeError("causal strategy replay produced no daily returns")
-    strategy_returns = result.daily_returns.set_index("date")["net_return"].astype(float)
+    strategy_returns = (
+        result.daily_returns[
+            result.daily_returns["date"].between(curve_dates[0], signal_date)
+        ]
+        .set_index("date")["net_return"]
+        .astype(float)
+    )
 
     benchmark = _normalize_symbol(production["benchmark"])
     benchmark_frame = (
@@ -917,8 +835,12 @@ def run_recommendation(
         production = context.task.production
         assert production is not None
 
-        current_freeze = _latest_valid_freeze(context, signal_date)
-        expected_path = _freeze_path(context, signal_date, visible_dates)
+        schedule_boundary = latest_schedule_boundary(
+            signal_date,
+            production["schedule"],
+            visible_dates,
+        )
+        expected_path = _freeze_path(context, schedule_boundary, visible_dates)
         legacy_expected_path = (
             _legacy_parameter_store(context) / expected_path.name
         )
@@ -938,10 +860,12 @@ def run_recommendation(
             freeze_payload = expected_freeze
             parameters = expected_freeze["parameters"]
             search_status = "reused"
-        elif current_freeze is None or is_schedule_boundary(
-            signal_date, production["schedule"], visible_dates
-        ):
-            search = search_parameters(context, daily, signal_date)
+        else:
+            search = search_parameters(
+                context,
+                daily[daily["date"] <= schedule_boundary],
+                schedule_boundary,
+            )
             freeze_path = _freeze_search(context, search, visible_dates)
             freeze_payload = {
                 "searched_on": search.signal_date.date().isoformat(),
@@ -949,11 +873,6 @@ def run_recommendation(
             }
             parameters = search.parameters
             search_status = "searched"
-        else:
-            freeze_path, payload = current_freeze
-            freeze_payload = payload
-            parameters = payload["parameters"]
-            search_status = "reused"
 
         trade_date = _next_trade_date(signal_date, all_dates)
         last_tuning_date = pd.Timestamp(freeze_payload["searched_on"]).normalize()
@@ -963,7 +882,12 @@ def run_recommendation(
             visible_dates,
         )
         holdings = _target_holdings(
-            context, daily, signal_date, trade_date, parameters
+            context,
+            daily,
+            schedule_boundary,
+            signal_date,
+            trade_date,
+            parameters,
         )
         curve, curve_metrics, replay_audit = causal_replay(context, daily, signal_date)
 

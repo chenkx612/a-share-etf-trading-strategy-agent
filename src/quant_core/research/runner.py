@@ -1928,9 +1928,8 @@ def _run_once_impl(
                 key: task.evaluation_periods[key]
                 for key in (
                     "train_months",
-                    "validation_months",
-                    "step_months",
                     "max_parameter_sets",
+                    "schedule",
                 )
             },
             "constraints": task.raw["evaluation"]["constraints"],
