@@ -29,14 +29,61 @@
 
 ## 当前结论
 
-当前没有开放 P0；以下问题按优先级继续处理：
+当前存在开放 P0，修复前不得启动新的 Loop 研发；以下问题按优先级继续处理：
 
 | 优先级 | 问题 |
 | --- | --- |
+| P0 | 候选容器挂载完整行情缓存，Development 数据边界可被绕过 |
+| P1 | Agent 可绕过 Attempt 与 Development 预算控制直接调用 evaluator |
 | P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
+| P2 | 每轮结构归因警告错误地把拒绝候选称为已接受候选 |
 
 ## 一、待解决问题
+
+### P0：执行新的 Loop 研发前必须解决
+
+#### 候选容器挂载完整行情缓存，Development 数据边界可被绕过
+
+- **问题**：`active-etf-rerank-topk` Run 003 的 Round 006/009 事件日志证明，候选 Agent 可直接读取
+  `data/etf_daily.parquet` 并在进程内调用固定 evaluator；该缓存实际包含截至 Gate 终点的行情，
+  而非只包含 Development 及其必要前置历史。两轮日志中的自定义评测仍使用 Development 日期，
+  没有发现已经读取 Gate 指标的证据，但当前隔离只遮蔽 Research Root 和 Gate runtime，未在原始
+  市场数据层强制截断，协作型 Agent 的 Prompt 约束因此成了唯一 Gate 边界。误填日期、自定义脚本
+  或直接检查 Gate 期行情都可绕过 Harness-owned Gate，破坏后续研究可信度。
+- **方案**：候选容器只挂载内容寻址、只读的 Development 数据视图；视图最多保留 Development
+  终点及完成首个训练折、信号窗口所需的前置历史，物理删除终点之后的所有行情。完整缓存和 Gate
+  评测数据只允许宿主 Harness 进程访问，不能通过 worktree、只读 bind、已安装包资源或符号链接
+  进入候选容器。把 Development 视图的范围和哈希纳入 Run/Attempt 契约。
+- **验证**：真实容器测试覆盖 Bash、Python、pandas、pyarrow、绝对路径、符号链接和直接导入
+  evaluator；候选可完成合法 Development 与必要训练回看，但任何可见行情的最大日期不得晚于
+  Development 终点，完整缓存与 Gate runtime 均不可见。预检应在分配 Run 前验证这一数据拓扑，
+  越界立即按基础设施故障熔断。
+- **风险**：截断视图必须保留足够训练和特征预热历史，否则会静默改变 Development 结果；修复后
+  需用同一 Champion 对照宿主固定 Development，逐字核对折定义、可行性和汇总指标。
+
+### P1：推荐解决
+
+#### Agent 可绕过 Attempt 与 Development 预算控制直接调用 evaluator
+
+- **问题**：Run 003 的 Round 006/009 未提交 checkpoint，也没有 Harness-owned
+  `development_attempts`，但事件日志显示两轮均多次直接导入
+  `quant_core.research.evaluator.evaluate_walk_forward` 批量评测候选；Round 009 截止前一次脚本还
+  完成了七组网格输出。由于 `evaluate_walk_forward(..., execution=None)` 是合法调用，这些评测
+  绕过 checkpoint 校验、Attempt 去重、耗时投影、finalization 预留、进度事件和研究记忆，最终
+  两个 `result.json` 仍显示空尝试并以超时失败。外层 Round 硬时限仍生效，固定 Gate/Promotion
+  也未被这些脚本直接改写，但“被放弃的 Development 尝试必须进入研究记忆”的既有解决并未形成
+  可执行边界。
+- **方案**：在候选容器上下文中禁止无 Harness execution capability 的顶层 evaluator 调用；官方
+  Attempt 由宿主 receiver 对冻结 checkpoint 执行并返回规范化结果。保留纯函数级单元诊断能力，
+  但批量 walk-forward 入口必须校验不可由候选伪造的 Harness capability。Prompt 继续指导正确流程，
+  但不得作为唯一约束。
+- **验证**：真实 Agent 容器内直接导入、`python -m`、包装函数和省略 `execution` 均应在开始评测前
+  拒绝；官方 Attempt 仍可评测、去重、写入 learning，并遵守耗时投影与 finalization 预留。超时后
+  所有已成功返回给 Agent 的顶层 Development 结果都必须存在对应 Attempt 最小事实。
+- **风险**：Agent 仍能用 pandas 或自写回测器做轻量探索；在 Development 数据边界已物理隔离的
+  前提下，这属于协作型研究能力。Harness 至少应阻止对固定 evaluator 的偶然绕行，并明确哪些
+  探索必须登记为顶层 Attempt。
 
 ### P2：有时间时优化
 
@@ -64,6 +111,18 @@
 - **验证**：只有满足安全前置条件的诊断失败可以释放研究预算；所有历史事件和失败原因仍可追溯。
 - **风险**：修复前必须保留失败记录并继续使用同一任务根；直接删除 Round 目录或编辑状态文件会破坏
   恢复语义。
+
+#### 每轮结构归因警告错误地把拒绝候选称为已接受候选
+
+- **问题**：Run 003 的 `report-facts.json` 对 Round 001、003、004、005、007、008、010 等拒绝候选
+  均写入 `Accepted candidate contains multiple or opaque structural changes`。只有 Round 002
+  实际接受；任务级 `integrity_warnings` 正确地只汇总了接受轮，因此未改变 Promotion 或最终
+  Champion，但逐轮事实的措辞与 Decision 冲突，容易在自动报告或人工复盘时把拒绝候选误读为晋级。
+- **方案**：结构分类器使用中性的 `Candidate contains ...`，或在报告组装层按 Decision 生成措辞；
+  接受轮是否进入任务级 integrity warning 仍由独立逻辑决定，不能靠文案字符串推断。
+- **验证**：同一 `combined_change` 分类分别覆盖 accepted、rejected 和其他合法 Decision；逐轮警告
+  与 Decision 一致，只有接受候选的归因风险进入任务级汇总，历史报告重建保持确定。
+- **风险**：这是报告准确性问题，不影响已冻结指标、Gate、Promotion、patch 重放或 Champion。
 
 ## 二、已解决问题
 
