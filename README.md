@@ -251,8 +251,16 @@ python3 -m quant_core.cli data update --universe path/to/universe.csv --universe
 python3 -m quant_core.cli factor compute --start 2024-01-01 --end 2024-12-31
 python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31
 python3 -m quant_core.cli optimize grid --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31 --top-n 3,5,10
-python3 -m quant_core.cli recommend today --universe path/to/universe.csv --date 2024-12-31 --top-n 10
+quant-agent recommend active_etf_rerank_topk
+quant-agent recommend active_etf_rerank_topk --date 2026-07-24
+
+# Offline verification against the existing local market-data cache
+quant-agent recommend active_etf_rerank_topk --date 2026-07-24 --skip-refresh
 ```
+
+`recommend` 会直接在终端打印次日 ETF/现金目标持仓、最近一次与下一次调参日，
+并自动生成近期严格因果收益曲线。曲线逐个调参周期重放：每个交易日只沿用当时
+最近一个调参日搜索得到的参数，不会用后续调参结果回填历史。
 
 缺少 `pyarrow` 时，本地表会自动降级为 CSV；安装项目依赖后默认使用 Parquet。
 

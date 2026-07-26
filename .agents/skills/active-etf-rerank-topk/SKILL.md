@@ -14,37 +14,37 @@ broker.
 2. Run after the requested signal trading day has closed:
 
 ```bash
-conda run --no-capture-output -n quant python \
-  .agents/skills/active-etf-rerank-topk/scripts/recommend_next_holdings.py \
-  --date YYYY-MM-DD
+conda run --no-capture-output -n quant \
+  quant-agent recommend active_etf_rerank_topk --date YYYY-MM-DD
 ```
 
-3. Use `--skip-refresh` only for an offline run whose `--data-root` already
-   contains the intended signal-date qfq data. Use `--output-dir` only to isolate
-   validation artifacts. Keep official exchange-calendar resolution enabled so
-   cache-wide missing sessions cannot pass continuity checks.
-4. Do not add or pass strategy parameter overrides, a universe override, or an
-   auto-tuning step. The script must read the task-configured production module
-   and universe and instantiate `EtfRerankTopKParams()` unchanged.
+3. Use `--skip-refresh` only for an offline run whose repository data cache
+   already contains the intended signal-date qfq data.
+4. Do not add or pass strategy parameter overrides or a universe override. On
+   the first successful run of every calendar month, the script deterministically
+   selects and freezes one parameter set from the production module's fixed grid,
+   using only the preceding 18 months through that signal date and the production
+   hard constraints. Later runs in that month must reuse the frozen artifact.
 5. Stop if Champion synchronization validation fails. Synchronize the Harness
    Champion to production before retrying; never execute `champion.py`.
 
-The script refreshes only symbols lacking a valid signal-date close. Each
-successful refresh replaces that symbol's cached history with its returned
-five-year qfq history. A failed symbol remains auditable and is unavailable on
-the signal date without blocking valid peers. The script never falls back to an
-older signal date merely to make the full universe complete.
+The framework refreshes the task universe and benchmark, owns parameter
+scheduling, and fails closed when a due search or causal replay cannot complete.
+Do not call or copy a strategy-specific recommendation script.
 
 ## Report the result
 
-Read `recommendation_summary.json` and report in Chinese:
+Read `outputs/active-etf-rerank-topk/summary.json` and
+the referenced recommendation CSV, then report in Chinese:
 
 - the requested date, resolved signal date, and next-trading-day execution
   semantics;
 - every ETF target weight and the cash weight;
-- every dynamic exclusion and refresh failure;
-- the strategy, Champion, task, and universe hashes;
-- whether Champion/production hash synchronization passed.
+- the strategy, Champion, task, universe, policy, grid, and backtest-contract hashes;
+- the effective monthly parameter set and whether it was searched or reused;
+- the strict-causal one-year cumulative-return curve and `510300` comparison,
+  including annualized return and maximum drawdown;
+- the current-universe survivorship-bias disclosure.
 
-Treat the dated CSV as the execution-facing target portfolio. Confirm ETF plus
-cash weights total exactly 1.0.
+Treat the referenced `recommendation.csv` as the execution-facing target
+portfolio. Confirm ETF plus cash weights total exactly 1.0.

@@ -83,6 +83,97 @@ class ResearchTask:
             if not all(part.isidentifier() for part in module.split(".")):
                 raise ValueError("task.strategy.module must be a Python module path")
 
+        production = data.get("production")
+        if production is not None:
+            if strategy is None:
+                raise ValueError("task.strategy is required when production is configured")
+            if not isinstance(production, dict):
+                raise ValueError("task.production must be a table")
+            expected = {
+                "schedule",
+                "train_months",
+                "objective",
+                "constraints",
+                "max_parameter_sets",
+                "curve_months",
+                "benchmark",
+            }
+            if set(production) != expected:
+                raise ValueError(
+                    "task.production must contain exactly schedule, train_months, "
+                    "objective, constraints, max_parameter_sets, curve_months, and benchmark"
+                )
+            schedule = _required(production, "schedule", dict, "task.production")
+            if set(schedule) != {"period", "interval", "trigger"}:
+                raise ValueError(
+                    "task.production.schedule must contain exactly period, interval, and trigger"
+                )
+            period = _required(schedule, "period", str, "task.production.schedule")
+            if period not in {"trading_day", "iso_week", "calendar_month"}:
+                raise ValueError(
+                    "task.production.schedule.period must be trading_day, iso_week, "
+                    "or calendar_month"
+                )
+            interval = schedule.get("interval")
+            if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
+                raise ValueError("task.production.schedule.interval must be a positive integer")
+            if schedule.get("trigger") not in {"start", "end"}:
+                raise ValueError("task.production.schedule.trigger must be start or end")
+            for key in ("train_months", "max_parameter_sets", "curve_months"):
+                value = production.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ValueError(f"task.production.{key} must be a positive integer")
+            objective = _required(production, "objective", str, "task.production")
+            supported_metrics = {
+                "total_return",
+                "annual_return",
+                "annual_volatility",
+                "sharpe",
+                "sortino",
+                "max_drawdown",
+                "avg_turnover",
+            }
+            if objective not in supported_metrics:
+                raise ValueError("task.production.objective is not a supported backtest metric")
+            benchmark = _required(production, "benchmark", str, "task.production")
+            if not benchmark.isdigit():
+                raise ValueError("task.production.benchmark must be a numeric security code")
+            constraints = _required(production, "constraints", dict, "task.production")
+            if not constraints:
+                raise ValueError("task.production.constraints must not be empty")
+            for name, constraint in constraints.items():
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        "task.production.constraints must use non-empty metric names"
+                    )
+                if name not in supported_metrics:
+                    raise ValueError(
+                        f"task.production.constraints.{name} is not a supported backtest metric"
+                    )
+                if not isinstance(constraint, dict) or set(constraint) != {
+                    "operator",
+                    "threshold",
+                }:
+                    raise ValueError(
+                        f"task.production.constraints.{name} must contain exactly "
+                        "operator and threshold"
+                    )
+                if constraint.get("operator") not in {">=", "<=", "abs<="}:
+                    raise ValueError(
+                        f"task.production.constraints.{name}.operator must be one of "
+                        ">=, <=, abs<="
+                    )
+                threshold = constraint.get("threshold")
+                if (
+                    not isinstance(threshold, (int, float))
+                    or isinstance(threshold, bool)
+                    or not math.isfinite(float(threshold))
+                ):
+                    raise ValueError(
+                        f"task.production.constraints.{name}.threshold must be numeric "
+                        "and finite"
+                    )
+
         scope = _required(data, "scope", dict, "task")
         cls._string_list(scope, "editable", required=True)
         editable = scope["editable"]
@@ -327,6 +418,11 @@ class ResearchTask:
     def strategy_module(self) -> str | None:
         strategy = self.raw.get("strategy")
         return str(strategy["module"]) if isinstance(strategy, Mapping) else None
+
+    @property
+    def production(self) -> Mapping[str, Any] | None:
+        value = self.raw.get("production")
+        return value if isinstance(value, Mapping) else None
 
 
 @dataclass(frozen=True)

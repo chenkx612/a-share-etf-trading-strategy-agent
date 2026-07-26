@@ -47,6 +47,23 @@ mode = "workspace"
 [data]
 universe = "universes/active_etf_rotation.csv"
 
+[production]
+train_months = 18
+objective = "sortino"
+max_parameter_sets = 128
+curve_months = 12
+benchmark = "510300"
+
+[production.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
+
+[production.constraints]
+annual_return = { operator = ">=", threshold = 0.03 }
+max_drawdown = { operator = "abs<=", threshold = 0.20 }
+avg_turnover = { operator = "<=", threshold = 0.35 }
+
 [scope]
 editable = [
   "src/quant_core/strategy/etf_rerank_topk.py",

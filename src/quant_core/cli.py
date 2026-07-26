@@ -30,6 +30,7 @@ from quant_core.data.market_data import (
     write_table,
 )
 from quant_core.factors import compute_factors, normalize_sharpe_windows
+from quant_core.production import run_recommendation
 from quant_core.research import (
     ResearchTask,
     regenerate_loop_report,
@@ -460,6 +461,11 @@ def command_report_build(args: argparse.Namespace) -> None:
 
 
 def command_recommend_today(args: argparse.Namespace) -> None:
+    """Compatibility helper for the legacy Sharpe-pool research skill.
+
+    This is intentionally not registered as a public CLI command; production
+    recommendations use ``quant-agent recommend <task>``.
+    """
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
     params = build_strategy_params(args)
@@ -578,6 +584,61 @@ def command_loop(args: argparse.Namespace) -> None:
     except ValueError as exc:
         raise SystemExit(f"quant-agent loop: error: {exc}") from exc
     command_research_loop(args)
+
+
+def command_recommend(args: argparse.Namespace) -> None:
+    try:
+        task_path = resolve_research_task_reference(args.task, args.root)
+    except ValueError as exc:
+        raise SystemExit(f"quant-agent recommend: error: {exc}") from exc
+    requested_date = date.fromisoformat(args.date) if args.date is not None else None
+    summary_path = run_recommendation(
+        args.root,
+        task_path,
+        requested_date=requested_date,
+        skip_refresh=args.skip_refresh,
+    )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    root = Path(args.root).resolve()
+    recommendation_path = root / summary["recommendation_path"]
+    recommendation = pd.read_csv(
+        recommendation_path,
+        dtype={"symbol": str},
+    )
+    print(f"wrote production recommendation summary to {summary_path}")
+    print(
+        f"signal date: {summary['signal_date']}; trade date: {summary['trade_date']}; "
+        f"parameter status: {summary['search_status']}"
+    )
+    schedule = summary["parameter_schedule"]
+    print(
+        f"parameter policy: {summary['parameter_train_months']}-month lookback; "
+        f"{schedule['period']}/{schedule['trigger']} every {schedule['interval']} period(s)"
+    )
+    print(
+        f"parameter search: actually searched on {summary['last_tuning_date']}; "
+        f"next scheduled boundary {summary['next_tuning_date']}"
+    )
+    if schedule["period"] in {"calendar_month", "iso_week"}:
+        print(
+            "schedule note: the first successful run in each calendar period searches; "
+            "a late first run therefore has a shorter reuse span"
+        )
+    print("next-day target holdings:")
+    display_columns = [
+        column
+        for column in ("record_type", "symbol", "name", "target_weight")
+        if column in recommendation
+    ]
+    print(
+        recommendation[display_columns].to_string(
+            index=False,
+            formatters={
+                "target_weight": lambda value: f"{float(value):.2%}",
+            },
+        )
+    )
+    print(f"recent causal return curve: {root / summary['curve_png_path']}")
 
 
 def command_research_report(args: argparse.Namespace) -> None:
@@ -765,20 +826,21 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_grid.add_argument("--show", type=int, default=5)
     optimize_grid.set_defaults(func=command_optimize_grid)
 
-    recommend = sub.add_parser("recommend")
-    recommend_sub = recommend.add_subparsers(dest="command", required=True)
-    recommend_today = recommend_sub.add_parser("today")
-    recommend_today.add_argument("--date", required=True)
-    recommend_today.add_argument("--strategy", choices=STRATEGY_CHOICES, default=STRATEGY_NAME)
-    recommend_today.add_argument("--universe", required=True)
-    recommend_today.add_argument("--universe-name", default="default")
-    recommend_today.add_argument("--top-n", type=int)
-    recommend_today.add_argument("--sharpe-window", type=int)
-    recommend_today.add_argument("--factor-lower-bound", type=float)
-    recommend_today.add_argument("--corr-window", type=int)
-    recommend_today.add_argument("--corr-threshold", type=float)
-    recommend_today.add_argument("--stop-loss-pct", type=float)
-    recommend_today.set_defaults(func=command_recommend_today)
+    recommend = sub.add_parser(
+        "recommend",
+        help="generate a production recommendation for a managed task",
+    )
+    recommend.add_argument(
+        "task",
+        help="task file, tasks/<name>.toml stem, or task id",
+    )
+    recommend.add_argument("--date", help="requested ISO date; defaults to today in Shanghai")
+    recommend.add_argument(
+        "--skip-refresh",
+        action="store_true",
+        help="use only the existing local market-data cache",
+    )
+    recommend.set_defaults(func=command_recommend)
 
     report = sub.add_parser("report")
     report_sub = report.add_subparsers(dest="command", required=True)

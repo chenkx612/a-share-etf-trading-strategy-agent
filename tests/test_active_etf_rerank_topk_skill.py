@@ -378,6 +378,41 @@ def test_offline_run_records_contract_hashes_dates_and_dynamic_exclusions(
     assert len(summary["dynamic_exclusions"]) == len(
         pd.read_csv(REPO_ROOT / "universes/active_etf_rotation.csv"),
     ) - 3
+    assert summary["one_year_performance"]["status"] == "unavailable"
+    assert summary["one_year_performance"]["reason"] == "csi300_etf_proxy_unavailable"
+
+
+def test_one_year_performance_curve_uses_csi300_etf_proxy() -> None:
+    script = load_script()
+    dates = pd.bdate_range(end="2026-07-24", periods=300)
+    daily = sample_daily(dates, ("A", "510300"))
+    selected = etf_rerank_topk.select(
+        daily,
+        pd.DataFrame([
+            {"symbol": "A", "name": "ETF A"},
+            {"symbol": "510300", "name": "沪深300ETF华泰柏瑞"},
+        ]),
+        dates[0],
+        dates[-1],
+    )
+
+    curve, audit = script.build_one_year_performance_curve(
+        daily,
+        selected,
+        date(2026, 7, 24),
+    )
+
+    assert audit["status"] == "available"
+    assert audit["benchmark"]["symbol"] == "510300"
+    assert curve is not None
+    assert curve.columns.tolist() == [
+        "date",
+        "strategy_equity",
+        "csi300_equity",
+        "strategy_cumulative_return",
+        "csi300_cumulative_return",
+    ]
+    assert curve["date"].iloc[-1] == pd.Timestamp("2026-07-24")
 
 
 def test_production_replay_final_holdings_equal_direct_select(tmp_path: Path) -> None:

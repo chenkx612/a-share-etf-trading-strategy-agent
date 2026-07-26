@@ -32,10 +32,13 @@ from quant_core.data.market_data import (  # noqa: E402
     replace_symbol_history,
     write_table,
 )
+from quant_core.backtest.engine import run_backtest  # noqa: E402
 
 
 TASK_ID = "active-etf-rerank-topk"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / ".agents" / "skills" / TASK_ID / "outputs"
+CSI300_BENCHMARK_SYMBOL = "510300"
+CSI300_BENCHMARK_NAME = "沪深300ETF华泰柏瑞"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MARKET_CLOSE = time(15, 0)
 OUTPUT_COLUMNS = [
@@ -218,6 +221,193 @@ def parse_requested_date(value: str) -> date:
     if parsed.isoformat() != value:
         raise ValueError(f"--date must use YYYY-MM-DD: {value}")
     return parsed
+
+
+def build_one_year_performance_curve(
+    daily: pd.DataFrame,
+    selected: pd.DataFrame,
+    signal_date: date,
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    """Replay the production strategy and a tradable CSI 300 proxy on identical dates."""
+    performance_start = pd.Timestamp(signal_date) - pd.DateOffset(years=1)
+    signal_dates = pd.DatetimeIndex(selected.attrs.get("signal_dates", [])).sort_values()
+    signal_dates = signal_dates[(signal_dates >= performance_start) & (signal_dates <= pd.Timestamp(signal_date))]
+    if signal_dates.empty:
+        return None, {
+            "status": "unavailable",
+            "reason": "no_signal_dates_in_one_year_window",
+            "start": performance_start.date().isoformat(),
+            "end": signal_date.isoformat(),
+        }
+
+    benchmark_daily = daily[daily["symbol"].astype(str) == CSI300_BENCHMARK_SYMBOL].copy()
+    if benchmark_daily.empty:
+        return None, {
+            "status": "unavailable",
+            "reason": "csi300_etf_proxy_unavailable",
+            "benchmark_symbol": CSI300_BENCHMARK_SYMBOL,
+            "start": performance_start.date().isoformat(),
+            "end": signal_date.isoformat(),
+        }
+
+    replay_daily = daily.copy()
+    replay_daily["date"] = pd.to_datetime(replay_daily["date"])
+    replay_daily = replay_daily[
+        (replay_daily["date"] >= performance_start)
+        & (replay_daily["date"] <= pd.Timestamp(signal_date))
+    ].copy()
+    if "open" not in replay_daily.columns:
+        # Offline validation fixtures may provide only qfq closes.  This preserves a
+        # deterministic close-to-close approximation while live AkShare data uses opens.
+        replay_daily["open"] = replay_daily["close"]
+    if "open" not in benchmark_daily.columns:
+        benchmark_daily["open"] = benchmark_daily["close"]
+    benchmark_daily["date"] = pd.to_datetime(benchmark_daily["date"])
+    benchmark_daily = benchmark_daily[
+        benchmark_daily["date"].isin(signal_dates)
+    ].copy()
+    if benchmark_daily["date"].nunique() != len(signal_dates):
+        return None, {
+            "status": "unavailable",
+            "reason": "csi300_etf_proxy_has_missing_signal_dates",
+            "benchmark_symbol": CSI300_BENCHMARK_SYMBOL,
+            "start": performance_start.date().isoformat(),
+            "end": signal_date.isoformat(),
+        }
+
+    strategy_selected = selected[
+        (pd.to_datetime(selected["date"]) >= performance_start)
+        & (pd.to_datetime(selected["date"]) <= pd.Timestamp(signal_date))
+    ].copy()
+    strategy_selected.attrs["signal_dates"] = signal_dates
+    strategy_selected.attrs["universe_symbols"] = sorted(
+        replay_daily["symbol"].astype(str).unique().tolist(),
+    )
+    benchmark_selected = pd.DataFrame({
+        "date": signal_dates,
+        "symbol": CSI300_BENCHMARK_SYMBOL,
+        "target_weight": 1.0,
+    })
+    benchmark_selected.attrs["signal_dates"] = signal_dates
+    benchmark_selected.attrs["universe_symbols"] = [CSI300_BENCHMARK_SYMBOL]
+
+    strategy_result = run_backtest(replay_daily, strategy_selected)
+    benchmark_result = run_backtest(benchmark_daily, benchmark_selected)
+    curve = strategy_result.equity_curve.rename(columns={"equity": "strategy_equity"}).merge(
+        benchmark_result.equity_curve.rename(columns={"equity": "csi300_equity"}),
+        on="date",
+        how="inner",
+        validate="one_to_one",
+    )
+    curve["strategy_cumulative_return"] = curve["strategy_equity"] - 1.0
+    curve["csi300_cumulative_return"] = curve["csi300_equity"] - 1.0
+    return curve, {
+        "status": "available",
+        "start": performance_start.date().isoformat(),
+        "end": signal_date.isoformat(),
+        "benchmark": {
+            "name": "沪深300（以可交易的沪深300ETF代理）",
+            "symbol": CSI300_BENCHMARK_SYMBOL,
+            "symbol_name": CSI300_BENCHMARK_NAME,
+        },
+        "strategy_total_return": float(curve["strategy_cumulative_return"].iloc[-1]),
+        "csi300_total_return": float(curve["csi300_cumulative_return"].iloc[-1]),
+    }
+
+
+def monthly_parameter_path(output_dir: Path, signal_date: date) -> Path:
+    return output_dir / f"monthly_parameters_{signal_date:%Y-%m}.json"
+
+
+def select_monthly_parameters(
+    module: Any,
+    daily: pd.DataFrame,
+    universe: pd.DataFrame,
+    signal_date: date,
+    output_dir: Path,
+    strategy_sha256: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Freeze one causally selected production parameter set per calendar month."""
+    path = monthly_parameter_path(output_dir, signal_date)
+    if path.is_file():
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        effective_from = date.fromisoformat(str(stored["effective_from"]))
+        if effective_from > signal_date:
+            raise RuntimeError(
+                "Monthly parameter artifact is newer than the requested signal date; "
+                "refusing a look-ahead replay"
+            )
+        if stored.get("strategy_sha256") != strategy_sha256:
+            raise RuntimeError(
+                "Monthly parameter artifact does not match the synchronized Champion; "
+                "start a new monthly parameter review"
+            )
+        params = module.EtfRerankTopKParams(**stored["parameters"])
+        return params, {**stored, "path": str(path), "status": "reused"}
+
+    training_start = pd.Timestamp(signal_date) - pd.DateOffset(months=18)
+    backtest_daily = daily.copy()
+    if "open" not in backtest_daily.columns:
+        backtest_daily["open"] = backtest_daily["close"]
+    candidates: list[dict[str, Any]] = []
+    for candidate in module.parameter_grid():
+        selected = module.select_with_params(
+            daily,
+            universe,
+            training_start,
+            pd.Timestamp(signal_date),
+            candidate,
+        )
+        result = run_backtest(
+            backtest_daily[backtest_daily["date"] >= training_start],
+            selected,
+        )
+        metrics = result.metrics
+        feasible = bool(metrics) and (
+            metrics["annual_return"] >= 0.03
+            and abs(metrics["max_drawdown"]) <= 0.20
+            and metrics["avg_turnover"] <= 0.35
+        )
+        candidates.append({
+            "parameters": candidate,
+            "sortino": metrics.get("sortino"),
+            "feasible": feasible,
+        })
+    feasible = [
+        item for item in candidates
+        if item["feasible"] and isinstance(item["sortino"], float) and math.isfinite(item["sortino"])
+    ]
+    if not feasible:
+        # A newly initialized offline cache may not yet contain the full training
+        # window. Keep the verified Champion default rather than selecting an
+        # infeasible set; the next monthly review will retry after data accrues.
+        record = {
+            "effective_month": signal_date.strftime("%Y-%m"),
+            "effective_from": signal_date.isoformat(),
+            "training_start": training_start.date().isoformat(),
+            "training_end": signal_date.isoformat(),
+            "strategy_sha256": strategy_sha256,
+            "parameters": asdict(module.EtfRerankTopKParams()),
+            "selection_metric": "sortino",
+            "selection_status": "insufficient_feasible_history",
+            "feasible_parameter_count": 0,
+        }
+        write_json_atomic(path, record)
+        return module.EtfRerankTopKParams(), {**record, "path": str(path), "status": "fallback"}
+    chosen = max(feasible, key=lambda item: (float(item["sortino"]), json.dumps(item["parameters"], sort_keys=True)))
+    record = {
+        "effective_month": signal_date.strftime("%Y-%m"),
+        "effective_from": signal_date.isoformat(),
+        "training_start": training_start.date().isoformat(),
+        "training_end": signal_date.isoformat(),
+        "strategy_sha256": strategy_sha256,
+        "parameters": chosen["parameters"],
+        "selection_metric": "sortino",
+        "selection_sortino": chosen["sortino"],
+        "feasible_parameter_count": len(feasible),
+    }
+    write_json_atomic(path, record)
+    return module.EtfRerankTopKParams(**chosen["parameters"]), {**record, "path": str(path), "status": "refreshed"}
 
 
 def exchange_trade_dates() -> list[date]:
@@ -605,7 +795,8 @@ def run(
             "Imported strategy module does not resolve to the verified production source: "
             f"{module_path}"
         )
-    params = module.EtfRerankTopKParams()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     replay_start = five_year_start(signal_date)
     input_daily = refreshed.copy()
     input_daily["date"] = pd.to_datetime(input_daily["date"])
@@ -613,6 +804,14 @@ def run(
         (input_daily["date"].dt.date >= replay_start)
         & (input_daily["date"].dt.date <= signal_date)
     ].copy()
+    params, monthly_parameter_review = select_monthly_parameters(
+        module,
+        input_daily,
+        universe,
+        signal_date,
+        output_dir,
+        champion["production_strategy_sha256"],
+    )
     universe_audit, exclusions = build_universe_audit(
         input_daily,
         universe,
@@ -629,21 +828,29 @@ def run(
     eligible_universe = universe[
         universe["symbol"].astype(str).isin(eligible_symbols)
     ].copy()
-    selected = module.select(
+    selected = module.select_with_params(
         input_daily,
         eligible_universe,
         pd.Timestamp(replay_start),
         pd.Timestamp(signal_date),
+        asdict(params),
     )
     output, holdings, cash_weight = build_output(selected, signal_date, execution_date)
 
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     recommendation_path = (
         output_dir
         / f"recommendation_{signal_date.isoformat()}_active-etf-rotation.csv"
     )
     output.to_csv(recommendation_path, index=False)
+    performance_curve, performance = build_one_year_performance_curve(
+        input_daily,
+        selected,
+        signal_date,
+    )
+    if performance_curve is not None:
+        performance_path = output_dir / f"performance_{signal_date.isoformat()}_one_year.csv"
+        performance_curve.to_csv(performance_path, index=False)
+        performance["curve_path"] = str(performance_path)
     summary = {
         "strategy": contract.strategy_name,
         "requested_date": requested.isoformat(),
@@ -651,6 +858,7 @@ def run(
         "holding_for": "next_trading_day",
         "execution_date": execution_date.isoformat() if execution_date else None,
         "parameters": asdict(params),
+        "monthly_parameter_review": monthly_parameter_review,
         "replay_start": replay_start.isoformat(),
         "replay_end": signal_date.isoformat(),
         "hashes": {
@@ -673,6 +881,7 @@ def run(
         "refresh_audit": refresh_audit,
         "universe_audit": universe_audit,
         "recommendation_path": str(recommendation_path),
+        "one_year_performance": performance,
     }
     summary_path = output_dir / "recommendation_summary.json"
     write_json_atomic(summary_path, summary)

@@ -67,6 +67,26 @@ def walk_forward_task() -> dict:
     return payload
 
 
+def production_task() -> dict:
+    payload = walk_forward_task()
+    payload["production"] = {
+        "schedule": {
+            "period": "calendar_month",
+            "interval": 1,
+            "trigger": "start",
+        },
+        "train_months": 18,
+        "objective": "sortino",
+        "constraints": {
+            "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
+        },
+        "max_parameter_sets": 128,
+        "curve_months": 12,
+        "benchmark": "510300",
+    }
+    return payload
+
+
 def completed_result() -> dict:
     return {
         "experiment_id": "experiment-001",
@@ -97,6 +117,37 @@ def test_task_requires_positive_round_minutes_when_present() -> None:
     payload["budget"]["round_minutes"] = 0
 
     with pytest.raises(ValueError, match="round_minutes"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_accepts_strict_production_contract() -> None:
+    task = ResearchTask.from_mapping(production_task())
+    assert task.production is not None
+    assert task.production["schedule"]["period"] == "calendar_month"
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("schedule", "period"), "quarter", "schedule.period"),
+        (("schedule", "interval"), 0, "schedule.interval"),
+        (("schedule", "trigger"), "middle", "schedule.trigger"),
+        (("train_months",), 0, "train_months"),
+        (("objective",), "calmar", "objective"),
+        (("max_parameter_sets",), 0, "max_parameter_sets"),
+        (("curve_months",), 0, "curve_months"),
+        (("benchmark",), "", "benchmark"),
+    ],
+)
+def test_task_rejects_invalid_production_contract(
+    path: tuple[str, ...], value: object, message: str
+) -> None:
+    payload = production_task()
+    target = payload["production"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
         ResearchTask.from_mapping(payload)
 
 

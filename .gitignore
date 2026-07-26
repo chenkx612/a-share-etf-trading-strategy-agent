@@ -39,3 +39,4 @@ dist/
 *.log
 
 task.toml
+.cache/

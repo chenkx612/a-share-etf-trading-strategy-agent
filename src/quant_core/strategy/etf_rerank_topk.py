@@ -74,6 +74,25 @@ def select(
     return select_with_params(daily, universe, start, end, _params_to_dict(EtfRerankTopKParams()))
 
 
+def data_requirements() -> dict[str, object]:
+    """Declare production inputs without exposing parameter-name conventions."""
+    return {
+        "required_columns": [
+            "date",
+            "symbol",
+            "name",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+            "turnover",
+        ],
+        "min_history": 140,
+    }
+
+
 def parameter_grid() -> list[dict[str, object]]:
     grid: list[dict[str, object]] = []
     # Champion baseline: rank_buffer=1, mom_sleeve_weight=0.30, use_relative_mom=True,
