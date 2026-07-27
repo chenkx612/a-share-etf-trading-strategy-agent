@@ -36,6 +36,8 @@ class DevelopmentAttemptReceiver:
         command_timeout: int,
         deadline_monotonic: float,
         metrics_normalizer: MetricsNormalizer,
+        development_view_sha256: str | None = None,
+        development_end: str | None = None,
         *,
         monotonic: Callable[[], float] = time.monotonic,
         event_sink: Callable[..., None] | None = None,
@@ -50,6 +52,8 @@ class DevelopmentAttemptReceiver:
         self.command_timeout = command_timeout
         self.deadline_monotonic = deadline_monotonic
         self.metrics_normalizer = metrics_normalizer
+        self.development_view_sha256 = development_view_sha256
+        self.development_end = development_end
         self.monotonic = monotonic
         self.event_sink = event_sink
         self.event_details = dict(event_details or {})
@@ -126,6 +130,8 @@ class DevelopmentAttemptReceiver:
             if (
                 isinstance(manifest, dict)
                 and manifest.get("candidate_sha256") == strategy_sha256
+                and manifest.get("development_view_sha256")
+                == self.development_view_sha256
             ):
                 return directory, manifest
         return None
@@ -194,7 +200,9 @@ class DevelopmentAttemptReceiver:
         directory.mkdir()
         completed_at = datetime.now(timezone.utc).isoformat()
         manifest = {
-            "schema_version": 1,
+            "schema_version": (
+                2 if self.development_view_sha256 is not None else 1
+            ),
             "attempt_id": attempt_id,
             "checkpoint_id": checkpoint.checkpoint_id,
             "candidate_sha256": checkpoint.strategy_sha256,
@@ -202,6 +210,9 @@ class DevelopmentAttemptReceiver:
             "completed_at": completed_at,
             "development_metrics": normalized,
         }
+        if self.development_view_sha256 is not None:
+            manifest["development_view_sha256"] = self.development_view_sha256
+            manifest["development_end"] = self.development_end
         write_json_atomic(directory / "attempt.json", manifest)
         self._ack(request_id, {
             "status": "accepted",

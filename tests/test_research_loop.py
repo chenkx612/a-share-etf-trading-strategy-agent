@@ -147,8 +147,18 @@ def _reporter(task_path: Path, manager: ResearchWorkspace, state: dict[str, obje
 
 
 def _running_state(task: Path, experiment_id: str = "001") -> dict[str, object]:
+    base = ResearchWorkspace(
+        task.parent,
+        task.parent / ".research",
+        "loop-test",
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    champion = base.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    run = base.for_run(1)
+    run.run_root.mkdir(parents=True, exist_ok=True)
+    run.freeze_run_development_inputs()
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "task_id": "loop-test",
         "run_number": 1,
         "task_fingerprint": hashlib.sha256(task.read_bytes()).hexdigest(),
@@ -166,6 +176,8 @@ def _running_state(task: Path, experiment_id: str = "001") -> dict[str, object]:
         "current_round": experiment_id,
         "last_round": None,
         "stop_reason": None,
+        "development_view_sha256": champion["development_view_sha256"],
+        "development_end": champion["development_end"],
     }
 
 
@@ -631,6 +643,79 @@ def test_loop_marks_an_incomplete_round_as_interrupted_failure(tmp_path: Path) -
     assert state["failed"] == 1
     assert decision["decision"] == "failed"
     assert result["status"] == "failed"
+
+
+def test_legacy_active_run_without_development_contract_fails_closed(
+    tmp_path: Path,
+) -> None:
+    task = _task(tmp_path, max_failures=1)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        run_number=1,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.rounds.mkdir(parents=True)
+    legacy = {
+        **_running_state(task),
+        "schema_version": 3,
+    }
+    legacy.pop("development_view_sha256")
+    legacy.pop("development_end")
+    manager.development_inputs_path.unlink()
+    manager.loop_state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["failure_code"] == "development_inputs_incompatible"
+    assert state["rounds_completed"] == 0
+
+
+@pytest.mark.parametrize(
+    "frozen_content",
+    [
+        "{",
+        json.dumps({"schema_version": 1, "development_end": "2021-12-31"}),
+    ],
+)
+def test_invalid_frozen_development_manifest_stops_active_run(
+    tmp_path: Path,
+    frozen_content: str,
+) -> None:
+    task = _task(tmp_path, max_failures=1)
+    state = _running_state(task)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "loop-test",
+        run_number=1,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.rounds.mkdir(parents=True, exist_ok=True)
+    manager.loop_state_path.write_text(json.dumps(state), encoding="utf-8")
+    manager.development_inputs_path.write_text(frozen_content, encoding="utf-8")
+
+    state_path = run_loop(
+        task,
+        workspace=tmp_path,
+        managed_runner=_runner([]),
+        reporter=_reporter,
+    )
+
+    stopped = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stopped["status"] == "stopped"
+    assert stopped["stop_reason"] == "infrastructure_failure"
+    assert stopped["failure_code"] == "development_inputs_incompatible"
+    assert stopped["report_status"] == "completed"
+    assert stopped["rounds_completed"] == 0
 
 
 def test_loop_stops_instead_of_resuming_under_a_changed_environment(

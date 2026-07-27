@@ -480,6 +480,30 @@ class ExperimentResult:
             raise ValueError(
                 "result.evaluation_environment_sha256 must be a SHA-256 digest"
             )
+        development_view_sha256 = data.get("development_view_sha256")
+        development_end = data.get("development_end")
+        if (development_view_sha256 is None) != (development_end is None):
+            raise ValueError(
+                "result Development view hash and end must be declared together"
+            )
+        if development_view_sha256 is not None:
+            if (
+                not isinstance(development_view_sha256, str)
+                or len(development_view_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in development_view_sha256
+                )
+            ):
+                raise ValueError(
+                    "result.development_view_sha256 must be a SHA-256 digest"
+                )
+            if not isinstance(development_end, str):
+                raise ValueError("result.development_end must be an ISO date")
+            try:
+                date.fromisoformat(development_end)
+            except ValueError as exc:
+                raise ValueError("result.development_end must be an ISO date") from exc
         feedback = data.get("feedback")
         if feedback is not None and (not isinstance(feedback, str) or not feedback.strip()):
             raise ValueError("result.feedback must be a non-empty str when present")
@@ -551,14 +575,29 @@ class ExperimentResult:
             submitted = 0
             for index, attempt in enumerate(development_attempts):
                 context = f"result.development_attempts[{index}]"
-                if not isinstance(attempt, dict) or set(attempt) != {
+                legacy_fields = {
                     "attempt_id",
                     "candidate_sha256",
                     "hypothesis",
                     "development_metrics",
                     "outcome",
                     "learning",
-                }:
+                }
+                current_fields = legacy_fields | {
+                    "development_view_sha256",
+                    "development_end",
+                }
+                if (
+                    not isinstance(attempt, dict)
+                    or frozenset(attempt) not in {
+                        frozenset(legacy_fields),
+                        frozenset(current_fields),
+                    }
+                    or (
+                        set(attempt) == legacy_fields
+                        and isinstance(data.get("development_view_sha256"), str)
+                    )
+                ):
                     raise ValueError(f"{context} has invalid fields")
                 attempt_id = _required(attempt, "attempt_id", str, context)
                 if (
@@ -576,6 +615,39 @@ class ExperimentResult:
                 ):
                     raise ValueError(f"{context}.candidate_sha256 must be a unique SHA-256 digest")
                 seen_hashes.add(digest)
+                if set(attempt) == legacy_fields:
+                    view_digest = None
+                    attempt_end = None
+                else:
+                    view_digest = _required(
+                        attempt, "development_view_sha256", str, context
+                    )
+                    attempt_end = _required(attempt, "development_end", str, context)
+                if view_digest is not None and (
+                    len(view_digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in view_digest
+                    )
+                ):
+                    raise ValueError(
+                        f"{context}.development_view_sha256 must be a SHA-256 digest"
+                    )
+                if attempt_end is not None:
+                    try:
+                        date.fromisoformat(attempt_end)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{context}.development_end must be an ISO date"
+                        ) from exc
+                if view_digest is not None and data.get("development_view_sha256") != view_digest:
+                    raise ValueError(
+                        f"{context} does not match the frozen Development view"
+                    )
+                if attempt_end is not None and data.get("development_end") != attempt_end:
+                    raise ValueError(
+                        f"{context} does not match the frozen Development end"
+                    )
                 _required(attempt, "hypothesis", str, context)
                 if not isinstance(attempt.get("development_metrics"), dict):
                     raise ValueError(f"{context}.development_metrics must be an object")

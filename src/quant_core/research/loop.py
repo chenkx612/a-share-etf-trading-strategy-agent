@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 import shutil
@@ -27,12 +28,16 @@ from quant_core.research.runner import (
     run_managed_once,
     target_reached,
 )
-from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
+from quant_core.research.workspace import (
+    DevelopmentInputsError,
+    ResearchWorkspace,
+    write_json_atomic,
+)
 
 
 ManagedRunner = Callable[..., Path]
 LoopReporter = Callable[[Path, ResearchWorkspace, dict[str, Any]], Path]
-ContainerPreflight = Callable[[ResearchTask, Path], None]
+ContainerPreflight = Callable[..., None]
 ProviderPreflight = Callable[[ResearchTask, Path], None]
 EnvironmentProbe = Callable[[], EvaluationEnvironment]
 _ROUND_ID = re.compile(r"^(\d+)$")
@@ -52,10 +57,12 @@ def _new_state(
     run_number: int,
     evaluation_environment_sha256: str,
     diagnostics_enabled: bool,
+    development_view_sha256: str,
+    development_end: str,
 ) -> dict[str, Any]:
     now = _timestamp()
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "task_id": task.task_id,
         "run_number": run_number,
         "task_fingerprint": fingerprint,
@@ -79,6 +86,8 @@ def _new_state(
         "report_failure_kind": None,
         "report_failure_code": None,
         "diagnostics_enabled": diagnostics_enabled,
+        "development_view_sha256": development_view_sha256,
+        "development_end": development_end,
     }
 
 
@@ -89,7 +98,7 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
         state["current_round"] = state.pop("current_experiment_id", None)
     if "last_round" not in state:
         state["last_round"] = state.pop("last_experiment_id", None)
-    if state.get("schema_version") not in {2, 3}:
+    if state.get("schema_version") not in {2, 3, 4}:
         raise ValueError("research loop uses an incompatible state schema")
     return state
 
@@ -280,6 +289,10 @@ def run_loop(
         task.baseline_exclude,
         task.strategy_path,
     )
+    development_manifest = base_manager.development_manifest()
+    development_view_sha256 = str(
+        development_manifest["development_view_sha256"]
+    )
     metrics_key = _metrics_key(task)
     task_state = base_manager.load_state(task.strategy_path)
     base_manager.refresh_champion_metrics_status(
@@ -310,6 +323,36 @@ def run_loop(
         diagnostics_enabled = bool(state.get("diagnostics_enabled", False) or retain_diagnostics)
         state["diagnostics_enabled"] = diagnostics_enabled
         manager.diagnostics_enabled = diagnostics_enabled
+        incompatible_development_inputs = (
+            state.get("schema_version") != 4
+            or state.get("development_view_sha256") != development_view_sha256
+            or state.get("development_end") != development_end
+            or not manager.development_inputs_path.is_file()
+        )
+        if not incompatible_development_inputs:
+            try:
+                manager.freeze_run_development_inputs()
+            except DevelopmentInputsError:
+                incompatible_development_inputs = True
+        if incompatible_development_inputs:
+            state["schema_version"] = 4
+            state["status"] = "stopped"
+            state["stop_reason"] = "infrastructure_failure"
+            state["failure_kind"] = "infrastructure"
+            state["failure_code"] = "development_inputs_incompatible"
+            state["failure_message"] = (
+                "Active Run lacks the frozen Development input contract "
+                "or its inputs changed"
+            )
+            _save(manager.loop_state_path, state)
+            return _finish_with_report(
+                task_file,
+                manager,
+                manager.loop_state_path,
+                state,
+                "infrastructure_failure",
+                reporter,
+            )
     else:
         run_number = base_manager.next_run_number()
         manager = base_manager.for_run(run_number)
@@ -349,7 +392,7 @@ def run_loop(
                 })
                 applied = "failed"
             _record_decision(state, current, applied)
-        state["schema_version"] = 3
+        state["schema_version"] = 4
         state["resume_environment_sha256"] = environment.sha256
         _save(manager.loop_state_path, state)
         return _finish_with_report(
@@ -361,7 +404,7 @@ def run_loop(
             reporter,
         )
     if active_runs:
-        state["schema_version"] = 3
+        state["schema_version"] = 4
 
     # Injected managed runners own their execution environment. The production
     # runner must prove its Docker boundary before a Run is allocated or resumed.
@@ -369,7 +412,31 @@ def run_loop(
     if preflight is None and managed_runner is run_managed_once:
         preflight = preflight_agent_container
     if preflight is not None:
-        preflight(task, managed_root)
+        try:
+            parameters = tuple(inspect.signature(preflight).parameters.values())
+            parameter_count = len(inspect.signature(preflight).parameters)
+            accepts_view = (
+                any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters)
+                or parameter_count >= 4
+            )
+            accepts_source = (
+                any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters)
+                or parameter_count >= 5
+            )
+        except (TypeError, ValueError):
+            accepts_view = False
+        if accepts_view:
+            arguments = [
+                task,
+                managed_root,
+                base_manager.development_runtime,
+                development_manifest,
+            ]
+            if accepts_source:
+                arguments.append(source)
+            preflight(*arguments)
+        else:
+            preflight(task, managed_root)
 
     authentication_preflight = provider_preflight
     if authentication_preflight is None and managed_runner is run_managed_once:
@@ -382,8 +449,18 @@ def run_loop(
         state["stop_reason"] = None
         lifecycle_event = ("run_resumed", "resumed")
     else:
+        manager.run_root.mkdir(parents=True, exist_ok=False)
+        manager.freeze_run_development_inputs()
         manager.rounds.mkdir(parents=True, exist_ok=False)
-        state = _new_state(task, fingerprint, run_number, environment.sha256, diagnostics_enabled)
+        state = _new_state(
+            task,
+            fingerprint,
+            run_number,
+            environment.sha256,
+            diagnostics_enabled,
+            development_view_sha256,
+            development_end,
+        )
         lifecycle_event = ("run_started", "started")
     loop_state_path = manager.loop_state_path
     _save(loop_state_path, state)

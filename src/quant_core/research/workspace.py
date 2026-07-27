@@ -100,22 +100,15 @@ def _temporary_git_write_environment(
         }
 
 
-def _filter_tables(root: Path, end: date) -> None:
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix not in {".csv", ".parquet"}:
-            continue
-        try:
-            frame = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
-        except (OSError, ValueError):
-            continue
-        if "date" not in frame.columns:
-            continue
-        dates = pd.to_datetime(frame["date"], errors="coerce")
-        frame = frame[dates.dt.date <= end]
-        if path.suffix == ".parquet":
-            frame.to_parquet(path, index=False)
-        else:
-            frame.to_csv(path, index=False)
+_RUNTIME_ROOTS = (Path("data"), Path("outputs") / "factors")
+_RUNTIME_FORMATS = {".csv": "csv", ".parquet": "parquet"}
+
+
+class DevelopmentInputsError(RuntimeError):
+    """A fixed runtime input cannot be represented by the Development contract."""
+
+    failure_kind = "infrastructure"
+    failure_code = "development_inputs_invalid"
 
 
 def remove_runtime_inputs(workspace: Path) -> None:
@@ -124,6 +117,8 @@ def remove_runtime_inputs(workspace: Path) -> None:
 
 
 def copy_runtime_inputs(source: Path, destination: Path, *, end: date | None = None) -> None:
+    if end is not None:
+        raise ValueError("filtered runtime copies must use build_development_view")
     destination.mkdir(parents=True, exist_ok=True)
     data = source / "data"
     if data.is_dir():
@@ -132,9 +127,237 @@ def copy_runtime_inputs(source: Path, destination: Path, *, end: date | None = N
     if factors.is_dir():
         (destination / "outputs").mkdir(exist_ok=True)
         shutil.copytree(factors, destination / "outputs" / "factors", symlinks=True)
-    if end is not None:
-        _filter_tables(destination / "data", end)
-        _filter_tables(destination / "outputs" / "factors", end)
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _table_schema(frame: pd.DataFrame) -> list[dict[str, str]]:
+    return [
+        {"name": str(name), "dtype": str(dtype)}
+        for name, dtype in zip(frame.columns, frame.dtypes, strict=True)
+    ]
+
+
+def _read_runtime_table(path: Path, format_name: str) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path) if format_name == "parquet" else pd.read_csv(path)
+    except Exception as exc:
+        raise DevelopmentInputsError(
+            f"Development input could not be read: {path.name}"
+        ) from exc
+
+
+def _runtime_source_files(root: Path) -> list[tuple[Path, Path]]:
+    files: list[tuple[Path, Path]] = []
+    for relative_root in _RUNTIME_ROOTS:
+        directory = root / relative_root
+        if not os.path.lexists(directory):
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            raise DevelopmentInputsError(
+                f"Development input root is not a regular directory: {relative_root.as_posix()}"
+            )
+        for path in sorted(directory.rglob("*")):
+            relative = path.relative_to(root)
+            if path.is_symlink():
+                raise DevelopmentInputsError(
+                    f"Development inputs must not contain symbolic links: {relative.as_posix()}"
+                )
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise DevelopmentInputsError(
+                    f"Development inputs must contain only regular files: {relative.as_posix()}"
+                )
+            if path.suffix.lower() not in _RUNTIME_FORMATS:
+                raise DevelopmentInputsError(
+                    f"Unsupported Development input format: {relative.as_posix()}"
+                )
+            files.append((path, relative))
+    return files
+
+
+def _development_manifest_payload(
+    development_end: date,
+    files: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "development_end": development_end.isoformat(),
+        "files": list(files),
+    }
+
+
+def validate_development_view(
+    view: Path,
+    manifest: Mapping[str, Any],
+) -> None:
+    """Revalidate a content-addressed view before exposing it to a candidate."""
+    if manifest.get("schema_version") != 1:
+        raise DevelopmentInputsError("Development view manifest schema is incompatible")
+    end_text = manifest.get("development_end")
+    files = manifest.get("files")
+    digest = manifest.get("development_view_sha256")
+    if not isinstance(end_text, str) or not isinstance(files, list) or not isinstance(digest, str):
+        raise DevelopmentInputsError("Development view manifest is incomplete")
+    try:
+        end = date.fromisoformat(end_text)
+    except ValueError as exc:
+        raise DevelopmentInputsError("Development view end date is invalid") from exc
+    payload = _development_manifest_payload(end, files)
+    if hashlib.sha256(_canonical_json(payload)).hexdigest() != digest:
+        raise DevelopmentInputsError("Development view manifest hash does not match")
+    if view.name != digest:
+        raise DevelopmentInputsError("Development view path is not content addressed")
+    expected: dict[str, Mapping[str, Any]] = {}
+    for record in files:
+        if not isinstance(record, Mapping) or not isinstance(record.get("path"), str):
+            raise DevelopmentInputsError("Development view file manifest is invalid")
+        relative = Path(str(record["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise DevelopmentInputsError("Development view file path is unsafe")
+        if relative.as_posix() in expected:
+            raise DevelopmentInputsError("Development view manifest contains duplicate files")
+        expected[relative.as_posix()] = record
+    actual = {
+        relative.as_posix(): path
+        for path, relative in _runtime_source_files(view)
+    }
+    if set(actual) != set(expected):
+        raise DevelopmentInputsError("Development view file set does not match its manifest")
+    for relative, path in actual.items():
+        record = expected[relative]
+        if path.stat().st_size != record.get("size") or _file_sha256(path) != record.get("sha256"):
+            raise DevelopmentInputsError(
+                f"Development view content does not match its manifest: {relative}"
+            )
+        frame = _read_runtime_table(path, str(record.get("format")))
+        expected_format = _RUNTIME_FORMATS.get(path.suffix.lower())
+        if expected_format != record.get("format"):
+            raise DevelopmentInputsError(f"Development view format changed: {relative}")
+        if "date" not in frame.columns:
+            raise DevelopmentInputsError(f"Development view is missing date column: {relative}")
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        if dates.isna().any():
+            raise DevelopmentInputsError(f"Development view contains invalid dates: {relative}")
+        if not frame.empty and dates.dt.date.max() > end:
+            raise DevelopmentInputsError(f"Development view exceeds its date boundary: {relative}")
+        if len(frame) != record.get("rows") or _table_schema(frame) != record.get("schema"):
+            raise DevelopmentInputsError(f"Development view table metadata changed: {relative}")
+        actual_min = dates.min().date().isoformat() if not frame.empty else None
+        actual_max = dates.max().date().isoformat() if not frame.empty else None
+        if actual_min != record.get("date_min") or actual_max != record.get("date_max"):
+            raise DevelopmentInputsError(f"Development view date range changed: {relative}")
+    manifest_path = view / "manifest.json"
+    try:
+        persisted_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DevelopmentInputsError("Development view manifest file changed") from exc
+    if manifest_path.is_symlink() or persisted_manifest != dict(manifest):
+        raise DevelopmentInputsError("Development view manifest file changed")
+
+
+def build_development_view(
+    evaluation_runtime: Path,
+    views_root: Path,
+    development_end: date,
+) -> tuple[Path, dict[str, Any]]:
+    """Build one strict, atomic, content-addressed Development data view."""
+    views_root.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=views_root))
+    try:
+        records: list[dict[str, Any]] = []
+        source_files = _runtime_source_files(evaluation_runtime)
+        source_hashes = {
+            relative.as_posix(): _file_sha256(source)
+            for source, relative in source_files
+        }
+        for source, relative in source_files:
+            source_digest = source_hashes[relative.as_posix()]
+            format_name = _RUNTIME_FORMATS[source.suffix.lower()]
+            frame = _read_runtime_table(source, format_name)
+            if _file_sha256(source) != source_digest:
+                raise DevelopmentInputsError(
+                    f"Development input changed while it was being read: {relative.as_posix()}"
+                )
+            if "date" not in frame.columns:
+                raise DevelopmentInputsError(
+                    f"Development input is missing date column: {relative.as_posix()}"
+                )
+            dates = pd.to_datetime(frame["date"], errors="coerce")
+            if dates.isna().any():
+                raise DevelopmentInputsError(
+                    f"Development input contains invalid dates: {relative.as_posix()}"
+                )
+            filtered = frame.loc[dates.dt.date <= development_end].copy()
+            destination = temporary / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if format_name == "parquet":
+                filtered.to_parquet(destination, index=False)
+            else:
+                filtered.to_csv(destination, index=False)
+            persisted = _read_runtime_table(destination, format_name)
+            persisted_dates = pd.to_datetime(persisted["date"], errors="raise")
+            records.append({
+                "path": relative.as_posix(),
+                "format": format_name,
+                "size": destination.stat().st_size,
+                "rows": len(persisted),
+                "date_min": (
+                    persisted_dates.min().date().isoformat() if not persisted.empty else None
+                ),
+                "date_max": (
+                    persisted_dates.max().date().isoformat() if not persisted.empty else None
+                ),
+                "schema": _table_schema(persisted),
+                "sha256": _file_sha256(destination),
+            })
+        final_sources = _runtime_source_files(evaluation_runtime)
+        final_hashes = {
+            relative.as_posix(): _file_sha256(source)
+            for source, relative in final_sources
+        }
+        if final_hashes != source_hashes:
+            raise DevelopmentInputsError(
+                "Development inputs changed while the view was being built"
+            )
+        payload = _development_manifest_payload(development_end, records)
+        digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+        manifest = {**payload, "development_view_sha256": digest}
+        write_json_atomic(temporary / "manifest.json", manifest)
+        destination = views_root / digest
+        if destination.exists():
+            try:
+                validate_development_view(destination, manifest)
+            except DevelopmentInputsError:
+                corrupt = views_root / f".corrupt-{digest}-{os.getpid()}"
+                os.replace(destination, corrupt)
+                try:
+                    os.replace(temporary, destination)
+                finally:
+                    shutil.rmtree(corrupt, ignore_errors=True)
+            else:
+                shutil.rmtree(temporary)
+        else:
+            try:
+                os.replace(temporary, destination)
+            except OSError:
+                if not destination.exists():
+                    raise
+                validate_development_view(destination, manifest)
+                shutil.rmtree(temporary)
+        validate_development_view(destination, manifest)
+        return destination, manifest
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 def runtime_inputs_manifest(root: Path) -> dict[str, str]:
@@ -332,8 +555,23 @@ class ResearchWorkspace:
         return self.root / ".cache" / "runtime"
 
     @property
+    def development_views(self) -> Path:
+        return self.runtime / "development-views"
+
+    @property
     def development_runtime(self) -> Path:
-        return self.runtime / "development"
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return self.development_views / ".uninitialized"
+        digest = state.get("development_view_sha256")
+        return self.development_views / (
+            digest if isinstance(digest, str) else ".uninitialized"
+        )
+
+    @property
+    def development_inputs_path(self) -> Path:
+        return self.run_root / "development-inputs.json"
 
     @property
     def evaluation_runtime(self) -> Path:
@@ -569,7 +807,11 @@ class ResearchWorkspace:
         return {
             "champion_sha256": champion,
             "metrics_key": metrics_key,
-            "development_inputs_sha256": runtime_inputs_sha256(self.development_runtime),
+            "development_inputs_sha256": (
+                str(state["development_view_sha256"])
+                if isinstance(state.get("development_view_sha256"), str)
+                else None
+            ),
             "gate_inputs_sha256": runtime_inputs_sha256(self.evaluation_runtime),
             "evaluator_contract_sha256": contract,
             "evaluation_environment_sha256": self.evaluation_environment_sha256,
@@ -740,25 +982,29 @@ class ResearchWorkspace:
             return
         state = json.loads(source.read_text(encoding="utf-8"))
         schema_version = state.get("schema_version")
-        if schema_version == 6 and source == self.state_path:
+        if schema_version == 7 and source == self.state_path:
             if "last_experiment_id" in state and "last_round_id" not in state:
                 state["last_round_id"] = state.pop("last_experiment_id")
                 write_json_atomic(self.state_path, state)
             return
-        if schema_version not in {2, 3, 4, 5}:
+        if schema_version not in {2, 3, 4, 5, 6}:
             raise ValueError("research workspace uses an incompatible champion schema")
         if schema_version in {4, 5} and isinstance(state.get("pending_promotion"), dict):
             state = self._recover_promotion(state)
-        if schema_version == 5:
+        if schema_version in {5, 6}:
             metrics_record = state.get("champion_metrics_record")
             if isinstance(metrics_record, dict):
                 reasons = metrics_record.get("stale_reasons")
                 stale_reasons = list(reasons) if isinstance(reasons, list) else []
-                if "legacy_missing_evaluation_environment" not in stale_reasons:
+                if schema_version == 5 and "legacy_missing_evaluation_environment" not in stale_reasons:
                     stale_reasons.append("legacy_missing_evaluation_environment")
+                if schema_version == 6 and "legacy_missing_development_view" not in stale_reasons:
+                    stale_reasons.append("legacy_missing_development_view")
                 metrics_record["status"] = "stale"
                 metrics_record["stale_reasons"] = stale_reasons
-            state["schema_version"] = 6
+            state["schema_version"] = 7
+            state["development_view_sha256"] = None
+            state["development_end"] = None
             write_json_atomic(self.state_path, state)
             if source != self.state_path:
                 source.unlink()
@@ -789,7 +1035,7 @@ class ResearchWorkspace:
         if champion_round_id is None:
             champion_round_id = self._latest_accepted_round()
         migrated = {
-            "schema_version": 6,
+            "schema_version": 7,
             "task_id": self.task_id,
             "baseline_mode": state.get("baseline_mode", "workspace"),
             "baseline_exclude": list(state.get("baseline_exclude", [])),
@@ -804,6 +1050,7 @@ class ResearchWorkspace:
                 state.get("last_experiment_id"),
             ),
             "pending_promotion": None,
+            "development_view_sha256": None,
             "development_end": state.get("development_end"),
             "updated_at": state.get("updated_at"),
         }
@@ -845,7 +1092,7 @@ class ResearchWorkspace:
             )
             shutil.rmtree(self.run_temp, ignore_errors=True)
         if remove_development_cache:
-            shutil.rmtree(self.development_runtime, ignore_errors=True)
+            shutil.rmtree(self.development_views, ignore_errors=True)
         removable = [
             self.root / ".tmp" / "runs",
             self.runtime,
@@ -1144,12 +1391,53 @@ class ResearchWorkspace:
     def _prepare_runtime(self, state: dict[str, Any], development_end: date | None) -> None:
         if not self.evaluation_runtime.exists():
             copy_runtime_inputs(self.source, self.evaluation_runtime)
-        expected = development_end.isoformat() if development_end else None
-        if not self.development_runtime.exists() or state.get("development_end") != expected:
-            shutil.rmtree(self.development_runtime, ignore_errors=True)
-            copy_runtime_inputs(self.evaluation_runtime, self.development_runtime, end=development_end)
-            state["development_end"] = expected
+        legacy = self.runtime / "development"
+        if os.path.lexists(legacy):
+            shutil.rmtree(legacy, ignore_errors=True)
+        if development_end is None:
+            development_end = date.max
+        view, manifest = build_development_view(
+            self.evaluation_runtime,
+            self.development_views,
+            development_end,
+        )
+        digest = str(manifest["development_view_sha256"])
+        changed = (
+            state.get("development_view_sha256") != digest
+            or state.get("development_end") != development_end.isoformat()
+        )
+        state["development_view_sha256"] = digest
+        state["development_end"] = development_end.isoformat()
+        if changed:
             write_json_atomic(self.state_path, state)
+        validate_development_view(view, manifest)
+
+    def development_manifest(self) -> dict[str, Any]:
+        path = self.development_runtime / "manifest.json"
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DevelopmentInputsError("Development view manifest is unavailable") from exc
+        if not isinstance(manifest, dict):
+            raise DevelopmentInputsError("Development view manifest is invalid")
+        validate_development_view(self.development_runtime, manifest)
+        return manifest
+
+    def freeze_run_development_inputs(self) -> dict[str, Any]:
+        if self.run_number is None:
+            raise RuntimeError("cannot freeze Development inputs without a Run")
+        manifest = self.development_manifest()
+        if self.development_inputs_path.exists():
+            try:
+                frozen = json.loads(self.development_inputs_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DevelopmentInputsError("Run Development inputs are unreadable") from exc
+            if frozen != manifest:
+                raise DevelopmentInputsError("Run Development inputs do not match the current view")
+        else:
+            self.run_root.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(self.development_inputs_path, manifest)
+        return manifest
 
     def initialize(
         self,
@@ -1184,7 +1472,7 @@ class ResearchWorkspace:
             os.replace(self.champion_next_path, self.champion_path)
             champion_sha256 = _file_sha256(self.champion_path)
         state: dict[str, Any] = {
-            "schema_version": 6,
+            "schema_version": 7,
             "task_id": self.task_id,
             "baseline_mode": baseline_mode,
             "baseline_exclude": list(baseline_exclude),
@@ -1196,6 +1484,8 @@ class ResearchWorkspace:
             "champion_metrics_record": None,
             "last_round_id": None,
             "pending_promotion": None,
+            "development_view_sha256": None,
+            "development_end": None,
         }
         write_json_atomic(self.state_path, state)
         self._prepare_runtime(state, development_end)
@@ -1206,7 +1496,7 @@ class ResearchWorkspace:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
-        if state.get("schema_version") != 6:
+        if state.get("schema_version") != 7:
             raise ValueError("research workspace uses an incompatible Champion schema")
         self._strategy_path(state, strategy_path)
         if isinstance(state.get("pending_promotion"), dict):
@@ -1260,6 +1550,7 @@ class ResearchWorkspace:
             champion_path=champion,
         )
         self._add_worktree(candidate, base_commit)
+        self.development_manifest()
         copy_runtime_inputs(self.development_runtime, candidate)
         return candidate, state
 

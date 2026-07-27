@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import tomllib
+from datetime import date
 from pathlib import Path
 from typing import Sequence
 
 import pytest
+import pandas as pd
 
 import quant_core.research.runner as research_runner
 from quant_core.research import ResearchTask, run_once
@@ -32,6 +35,7 @@ from quant_core.research.runner import (
     preflight_provider_authentication,
     probe_candidate_bind_source,
 )
+from quant_core.research.workspace import build_development_view
 
 
 TASK_TOML = """
@@ -1719,6 +1723,36 @@ def test_agent_container_blocks_host_and_read_only_access(
     assert input_path.read_text(encoding="utf-8") == "development"
     assert fixed_script.read_text(encoding="utf-8") == "FIXED = True\n"
     assert secret.read_text(encoding="utf-8") == "gate-secret"
+
+
+@pytest.mark.skipif(
+    os.environ.get("QUANT_TEST_AGENT_CONTAINER") != "1",
+    reason="set QUANT_TEST_AGENT_CONTAINER=1 after building the research Agent image",
+)
+def test_real_agent_preflight_validates_the_frozen_development_view(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+    shutil.copytree(Path.cwd() / "src", tmp_path / "src")
+    evaluation = tmp_path / "evaluation"
+    (evaluation / "data").mkdir(parents=True)
+    pd.DataFrame({
+        "date": ["2018-01-01", "2021-12-31", "2022-01-01"],
+        "value": [1, 2, 3],
+    }).to_parquet(evaluation / "data/prices.parquet", index=False)
+    view, manifest = build_development_view(
+        evaluation,
+        tmp_path / ".research/runner-test/.cache/runtime/development-views",
+        date(2021, 12, 31),
+    )
+
+    preflight_agent_container(
+        ResearchTask.load(task_path),
+        tmp_path / ".research",
+        view,
+        manifest,
+    )
 
 
 def test_run_once_uses_opencode_and_evaluates_gate(tmp_path: Path) -> None:

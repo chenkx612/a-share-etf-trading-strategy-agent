@@ -30,6 +30,7 @@ from quant_core.research.workspace import (
     copy_runtime_inputs,
     evaluator_contract_sha256_for_commit,
     remove_runtime_inputs,
+    validate_development_view,
     write_json_atomic,
     workspace_python_env,
 )
@@ -60,13 +61,18 @@ _NO_TOOL_PERMISSIONS = {
 class AgentContainerInfrastructureError(RuntimeError):
     """Raised when the isolated Agent container cannot be started safely."""
 
+    def __init__(self, message: str, code: str = "agent_container_preflight_failed") -> None:
+        super().__init__(message)
+        self.code = code
+        self.failure_kind = "infrastructure"
+        self.failure_code = code
+
 
 class CandidateBindPreflightError(AgentContainerInfrastructureError):
     """Raised before a Round is allocated when Docker cannot see its worktree."""
 
     def __init__(self, message: str, code: str, evidence_path: Path) -> None:
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code)
         self.evidence_path = evidence_path
 
 
@@ -1155,6 +1161,9 @@ def _redact_authentication_log(
 def preflight_agent_container(
     task: ResearchTask,
     research_root: Path,
+    development_view: Path | None = None,
+    development_manifest: Mapping[str, Any] | None = None,
+    source: Path | None = None,
 ) -> None:
     """Verify the real Agent mount topology before allocating a Loop Run."""
     preflight_root = research_root / task.task_id / ".tmp" / "container-preflight"
@@ -1163,10 +1172,26 @@ def preflight_agent_container(
         root = Path(temporary)
         candidate = root / "workspace"
         candidate.mkdir()
-        development = candidate / "data"
-        development.mkdir()
-        input_path = development / "input.txt"
-        input_path.write_text("development", encoding="utf-8")
+        source_tree = (source or research_root.resolve().parent) / "src"
+        if source_tree.is_dir():
+            shutil.copytree(source_tree, candidate / "src")
+        if development_view is None or development_manifest is None:
+            development = candidate / "data"
+            development.mkdir()
+            input_path = development / "input.csv"
+            input_path.write_text("date,value\n2020-01-01,development\n", encoding="utf-8")
+            expected_files = {
+                "data/input.csv": hashlib.sha256(input_path.read_bytes()).hexdigest()
+            }
+            development_end = "9999-12-31"
+        else:
+            validate_development_view(development_view, development_manifest)
+            copy_runtime_inputs(development_view, candidate)
+            expected_files = {
+                str(record["path"]): str(record["sha256"])
+                for record in development_manifest["files"]
+            }
+            development_end = str(development_manifest["development_end"])
         hidden = candidate / ".research"
         hidden.mkdir()
         (hidden / "sentinel.json").write_text("hidden", encoding="utf-8")
@@ -1179,19 +1204,47 @@ def preflight_agent_container(
         configured_model = str(task.raw["opencode"]["model"])
         provider = configured_model.partition("/")[0]
         script = "\n".join([
+            "import hashlib",
+            "import json",
+            "import os",
             "import subprocess",
+            "import pandas as pd",
+            "import pyarrow.parquet as pq",
             "from pathlib import Path",
+            "import quant_core.research.evaluator",
             "workspace = Path('/workspace')",
             "(workspace / 'candidate.txt').write_text('ok', encoding='utf-8')",
-            "data = workspace / 'data/input.txt'",
-            "assert data.read_text(encoding='utf-8') == 'development'",
-            "try:",
-            "    data.write_text('changed', encoding='utf-8')",
-            "except OSError:",
-            "    pass",
-            "else:",
-            "    raise AssertionError('development input was writable')",
+            f"expected = {expected_files!r}",
+            f"development_end = pd.Timestamp({development_end!r})",
+            (
+                "actual = {p.relative_to(workspace).as_posix(): "
+                "hashlib.sha256(p.read_bytes()).hexdigest() "
+                "for root in (workspace/'data', workspace/'outputs/factors') "
+                "if root.exists() for p in root.rglob('*') if p.is_file()}"
+            ),
+            "assert actual == expected, (actual, expected)",
+            "for relative in expected:",
+            "    path = workspace / relative",
+            "    assert not path.is_symlink()",
+            "    frame = (pd.read_csv(path) if path.suffix == '.csv' else pd.read_parquet(path))",
+            "    if path.suffix == '.parquet': pq.read_table(path)",
+            "    dates = pd.to_datetime(frame['date'], errors='raise')",
+            "    assert frame.empty or dates.max() <= development_end",
+            "    probe = subprocess.run(['bash', '-c', 'test -r \"$1\" && head -c 1 \"$1\" >/dev/null', 'probe', str(path)])",
+            "    assert probe.returncode == 0",
+            "    try:",
+            "        path.write_bytes(path.read_bytes())",
+            "    except OSError:",
+            "        pass",
+            "    else:",
+            "        raise AssertionError('development input was writable')",
             "assert not (workspace / '.research/sentinel.json').exists()",
+            "assert not (workspace / '.cache/runtime/evaluation').exists()",
+            "assert not (workspace / 'outputs/backtests').exists()",
+            f"assert not Path({str(research_root.resolve())!r}).exists()",
+            f"assert not Path({str(Path.cwd().resolve())!r}).exists() or Path({str(Path.cwd().resolve())!r}) == workspace",
+            "for forbidden in ('/data', '/outputs/factors', '/opt/quant/data', '/app/data'):",
+            "    assert not Path(forbidden).exists()",
             *[
                 f"assert Path({path!r}).is_file()"
                 for path in expected_runtime_files
@@ -1212,7 +1265,11 @@ def preflight_agent_container(
             candidate,
             log_path,
             60,
-            read_only_paths=[development],
+            read_only_paths=[
+                path
+                for path in (candidate / "data", candidate / "outputs" / "factors")
+                if path.exists()
+            ],
         )
         if exit_code != 0:
             detail = _container_infrastructure_error(log_path)
@@ -1222,11 +1279,13 @@ def preflight_agent_container(
                 except OSError:
                     detail = f"container exited with code {exit_code}"
             raise AgentContainerInfrastructureError(
-                f"Agent container preflight failed: {detail}"
+                f"Agent container preflight failed: {detail}",
+                "development_view_container_preflight_failed",
             )
         if not writable.is_file():
             raise AgentContainerInfrastructureError(
-                "Agent container preflight did not persist its workspace write"
+                "Agent container preflight did not persist its workspace write",
+                "development_view_container_preflight_failed",
             )
 
 
@@ -1612,14 +1671,18 @@ def _development_attempts(
                     learning = value.strip()
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
-            attempts.append({
+            attempt = {
                 "attempt_id": manifest.get("attempt_id"),
                 "candidate_sha256": manifest.get("candidate_sha256"),
                 "hypothesis": manifest.get("hypothesis"),
                 "development_metrics": manifest.get("development_metrics", {}),
                 "outcome": "abandoned",
                 "learning": learning,
-            })
+            }
+            if isinstance(manifest.get("development_view_sha256"), str):
+                attempt["development_view_sha256"] = manifest["development_view_sha256"]
+                attempt["development_end"] = manifest.get("development_end")
+            attempts.append(attempt)
 
     submission = result.get("submission")
     submitted_sha = (
@@ -1649,7 +1712,7 @@ def _development_attempts(
             ),
             default=0,
         ) + 1
-        attempts.append({
+        synthetic = {
             "attempt_id": f"{next_attempt_id:03d}",
             "candidate_sha256": submitted_sha,
             "hypothesis": result.get("hypothesis"),
@@ -1658,7 +1721,11 @@ def _development_attempts(
             ),
             "outcome": "submitted",
             "learning": None,
-        })
+        }
+        if isinstance(result.get("development_view_sha256"), str):
+            synthetic["development_view_sha256"] = result["development_view_sha256"]
+            synthetic["development_end"] = result.get("development_end")
+        attempts.append(synthetic)
     return attempts
 
 
@@ -1891,6 +1958,8 @@ def _run_once_impl(
     event_sink: EventSink | None = None,
     round_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    development_view_sha256: str | None = None,
+    development_end: str | None = None,
 ) -> Path:
     from quant_core.research.checkpoint import (
         CheckpointReceiver,
@@ -1990,6 +2059,8 @@ def _run_once_impl(
         command_timeout,
         round_clock.deadline_monotonic,
         _normalize_development_metrics,
+        development_view_sha256,
+        development_end,
         monotonic=monotonic,
         event_sink=event_sink,
         event_details=event_details,
@@ -2316,6 +2387,8 @@ def run_once(
     round_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     evaluation_environment: EvaluationEnvironment | None = None,
+    development_view_sha256: str | None = None,
+    development_end: str | None = None,
 ) -> Path:
     environment = evaluation_environment or capture_evaluation_environment()
     result_path = _run_once_impl(
@@ -2332,8 +2405,14 @@ def run_once(
         event_sink=event_sink,
         round_id=round_id,
         monotonic=monotonic,
+        development_view_sha256=development_view_sha256,
+        development_end=development_end,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    if development_view_sha256 is not None:
+        result["development_view_sha256"] = development_view_sha256
+    if development_end is not None:
+        result["development_end"] = development_end
     result["development_attempts"] = _development_attempts(
         Path(output_dir).resolve(),
         result,
@@ -2680,6 +2759,16 @@ def run_managed_once(
         round_id=round_id,
         monotonic=monotonic,
         evaluation_environment=environment,
+        development_view_sha256=(
+            str(state["development_view_sha256"])
+            if isinstance(state.get("development_view_sha256"), str)
+            else None
+        ),
+        development_end=(
+            str(state["development_end"])
+            if isinstance(state.get("development_end"), str)
+            else None
+        ),
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["experiment_id"] = f"{manager.run_id}/{round_id}"
