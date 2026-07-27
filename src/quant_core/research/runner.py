@@ -1051,6 +1051,16 @@ def _run_opencode_container(
                 evaluator_facade: Path | None = None
                 evaluator_cache_mask: Path | None = None
                 if (cwd / _CANDIDATE_EVALUATOR_RELATIVE).is_file():
+                    # Docker cannot create a nested mountpoint after its parent
+                    # has been bind-mounted read-only.
+                    evaluator_cache_mountpoint = (
+                        cwd / _CANDIDATE_EVALUATOR_RELATIVE
+                    ).parent / "__pycache__"
+                    if evaluator_cache_mountpoint.is_symlink():
+                        raise ValueError(
+                            "Candidate evaluator cache mountpoint must not be a symlink"
+                        )
+                    evaluator_cache_mountpoint.mkdir(exist_ok=True)
                     evaluator_facade = temporary_root / "evaluator.py"
                     evaluator_facade.write_text(
                         _candidate_evaluator_facade(),

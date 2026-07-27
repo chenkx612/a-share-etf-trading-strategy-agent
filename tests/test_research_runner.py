@@ -1167,6 +1167,12 @@ def test_container_runner_deletes_staged_runtime_files(
         assert evaluator_facade.stat().st_mode & 0o777 == 0o444
         assert evaluator_cache_mask.is_dir()
         assert list(evaluator_cache_mask.iterdir()) == []
+        assert (evaluator.parent / "__pycache__").is_dir()
+        assert any(
+            part.startswith("type=bind,src=")
+            and ",dst=/workspace/src/quant_core/research,readonly" in part
+            for part in command
+        )
         return 0
 
     monkeypatch.setattr(research_runner, "_run_prompt_process", succeed)
@@ -1178,6 +1184,7 @@ def test_container_runner_deletes_staged_runtime_files(
         tmp_path,
         tmp_path / "agent.log",
         1,
+        read_only_paths=[evaluator.parent],
     )
 
     assert exit_code == 0
