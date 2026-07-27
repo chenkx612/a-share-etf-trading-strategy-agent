@@ -129,7 +129,11 @@ quant-agent loop active_etf_rerank_topk -d
   时限，实际仍受实时剩余 Round 时间约束，不会再隐含使用较短的工具默认值。每次
   Development 前，Agent 必须先提交与当前策略哈希一致的 checkpoint，再通过
   `python3 -m quant_core.research.attempt evaluate` 请求 Harness 执行固定评测；walk-forward
-  evaluator 通过 Harness 状态验证冻结副本，并用首尾折的基准耗时估算完整网格。评测预算会
+  evaluator 通过 Harness 状态验证冻结副本，并用首尾折的基准耗时估算完整网格。候选容器中的
+  evaluator 模块由只读门面覆盖：低层 `evaluate_candidate()` 与 selection 校验仍可用于诊断，
+  顶层 walk-forward 函数和模块 CLI 只会抛出 `HarnessExecutionRequired`。权威实现不进入候选
+  解释器，因此修改 marker、模块全局变量或伪造 `WalkForwardExecutionControl` 都不能恢复它。
+  评测预算会
   扣除 Round 时长的四分之一、最多 300 秒作为 finalization 预留；若预计超预算则提前拒绝，并把
   进度和估算写入本次 backtest 输出目录的 `progress.json`。Agent 可用
   `python3 -m quant_core.research.checkpoint submit <metadata.json>` 冻结当前策略；超时时
@@ -155,6 +159,15 @@ Provider 模型名、推理档位、认证和价格属于外部状态，不在�
 OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Root、Gate runtime 和
 主工作区不会进入容器。候选中的 `data/`、`outputs/factors/` 以及不承载回测生成输出的
 `scope.forbidden` 路径会以只读方式重新挂载。候选代码和回测生成目录保持可写。
+Harness 还会把宿主临时身份文件只读挂载到
+`/run/quant-research/candidate-container`，并继续使用 `cap-drop=ALL` 和
+`no-new-privileges`。真正的执行边界由另一个 OS 级只读 bind mount 提供：候选工作区中的
+`src/quant_core/research/evaluator.py` 被替换为受限门面，对应 `__pycache__` 也以空只读目录遮蔽，
+避免从候选可写 bytecode 恢复被隐藏实现。门面和挂载源均位于候选 worktree 之外，Agent 无法通过
+同一 workspace 的别名路径改写。
+官方 Attempt receiver 始终在无此标记的宿主执行，因此 checkpoint、去重、预算投影、
+finalization 预留和 Attempt 耐久记录保持由 Harness 控制。此边界不禁止 pandas、自写轻量回测器
+或 `evaluate_candidate()` 等低层诊断。
 
 后续 Round 所需的脱敏研究历史继续由 Harness 注入 Prompt，不会通过挂载原始
 `.research` 提供。若 `research run-once` 的 workspace 自身包含 `.research`，该目录会在
@@ -195,7 +208,9 @@ Run 或消耗 Round。Harness 还会在 Run 和后续 Round 分配前发起无�
 
 ```bash
 QUANT_TEST_AGENT_CONTAINER=1 pytest -q \
-  tests/test_research_runner.py::test_agent_container_blocks_host_and_read_only_access
+  tests/test_research_runner.py::test_agent_container_blocks_host_and_read_only_access \
+  tests/test_research_runner.py::test_real_agent_preflight_validates_the_frozen_development_view \
+  tests/test_research_attempt.py::test_candidate_container_official_attempt_uses_host_receiver
 ```
 
 ### Run operations

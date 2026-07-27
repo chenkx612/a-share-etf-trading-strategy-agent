@@ -45,6 +45,12 @@ _DEVELOPMENT_FINALIZATION_RESERVE_SECONDS = 300
 _DEVELOPMENT_ESTIMATE_SAFETY_FACTOR = 1.25
 _AGENT_CONTAINER_IMAGE = "quant-agent-research:latest"
 _CONTAINER_WORKSPACE = "/workspace"
+_CANDIDATE_CONTAINER_MARKER = Path(
+    "/run/quant-research/candidate-container"
+)
+_CANDIDATE_EVALUATOR_RELATIVE = Path(
+    "src/quant_core/research/evaluator.py"
+)
 _NO_TOOL_PERMISSIONS = {
     "external_directory": "deny",
     "question": "deny",
@@ -320,6 +326,29 @@ def _container_path(path: Path, workspace: Path) -> str:
     except ValueError as exc:
         raise ValueError(f"Agent container path is outside the candidate workspace: {path}") from exc
     return f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+
+def _candidate_evaluator_facade() -> str:
+    command = "python3 -m quant_core.research.attempt evaluate"
+    return (
+        "from quant_core.research.candidate_evaluator import "
+        "evaluate_candidate, validate_selection\n\n"
+        "OFFICIAL_DEVELOPMENT_ATTEMPT_COMMAND = "
+        f"{command!r}\n\n"
+        "class HarnessExecutionRequired(RuntimeError):\n"
+        "    \"\"\"Raised when a candidate bypasses the Harness-owned Attempt.\"\"\"\n\n"
+        "def _harness_execution_required(*args, **kwargs):\n"
+        "    raise HarnessExecutionRequired(\n"
+        "        \"Candidate containers must request fixed Development evaluation \"\n"
+        "        \"through the Harness: \"\n"
+        "        + OFFICIAL_DEVELOPMENT_ATTEMPT_COMMAND\n"
+        "    )\n\n"
+        "evaluate_walk_forward = _harness_execution_required\n\n"
+        "def main():\n"
+        "    _harness_execution_required()\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    main()\n"
+    )
 
 
 def _opencode_runtime_sources() -> tuple[tuple[Path, Path], ...]:
@@ -630,6 +659,9 @@ def _docker_opencode_command(
     runtime_home: Path | None = None,
     container_name: str | None = None,
     bash_timeout_ms: int | None = None,
+    candidate_marker: Path | None = None,
+    candidate_evaluator_facade: Path | None = None,
+    candidate_evaluator_cache_mask: Path | None = None,
 ) -> list[str]:
     workspace = cwd.resolve()
     translated = [
@@ -665,11 +697,21 @@ def _docker_opencode_command(
         docker.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         docker.extend(_container_mount(runtime_home, "/home/agent"))
     mounted: set[Path] = set()
+    facade_target = (
+        _container_path(
+            workspace / _CANDIDATE_EVALUATOR_RELATIVE,
+            workspace,
+        )
+        if candidate_evaluator_facade is not None
+        else None
+    )
     for path in read_only_paths:
         resolved = path.resolve()
         if resolved in mounted or not resolved.exists():
             continue
         target = _container_path(resolved, workspace)
+        if target == facade_target:
+            continue
         docker.extend(_container_mount(resolved, target, read_only=True))
         mounted.add(resolved)
     for mask, hidden in hidden_mounts:
@@ -677,6 +719,33 @@ def _docker_opencode_command(
             _container_mount(
                 mask,
                 _container_path(hidden, workspace),
+                read_only=True,
+            )
+        )
+    if candidate_marker is not None:
+        docker.extend(
+            _container_mount(
+                candidate_marker.resolve(),
+                str(_CANDIDATE_CONTAINER_MARKER),
+                read_only=True,
+            )
+        )
+    if candidate_evaluator_facade is not None:
+        docker.extend(
+            _container_mount(
+                candidate_evaluator_facade.resolve(),
+                str(facade_target),
+                read_only=True,
+            )
+        )
+    if candidate_evaluator_cache_mask is not None:
+        docker.extend(
+            _container_mount(
+                candidate_evaluator_cache_mask.resolve(),
+                (
+                    f"{_CONTAINER_WORKSPACE}/"
+                    "src/quant_core/research/__pycache__"
+                ),
                 read_only=True,
             )
         )
@@ -967,13 +1036,29 @@ def _run_opencode_container(
             original_auth = host_auth.read_bytes() if host_auth is not None else None
             with tempfile.TemporaryDirectory(
                 prefix=".agent-hidden-",
-                dir=log_path.parent,
             ) as temporary:
                 temporary_root = Path(temporary)
                 runtime_home = temporary_root / "home"
                 (runtime_home / ".local" / "share" / "opencode").mkdir(parents=True)
                 (runtime_home / ".config" / "opencode").mkdir(parents=True)
                 _stage_opencode_runtime(runtime_home)
+                candidate_marker = temporary_root / "candidate-container"
+                candidate_marker.write_text(
+                    "Harness-managed candidate container\n",
+                    encoding="utf-8",
+                )
+                candidate_marker.chmod(0o444)
+                evaluator_facade: Path | None = None
+                evaluator_cache_mask: Path | None = None
+                if (cwd / _CANDIDATE_EVALUATOR_RELATIVE).is_file():
+                    evaluator_facade = temporary_root / "evaluator.py"
+                    evaluator_facade.write_text(
+                        _candidate_evaluator_facade(),
+                        encoding="utf-8",
+                    )
+                    evaluator_facade.chmod(0o444)
+                    evaluator_cache_mask = temporary_root / "evaluator-pycache"
+                    evaluator_cache_mask.mkdir()
                 mask = temporary_root / "mask"
                 mask.mkdir()
                 hidden_mounts = (
@@ -999,6 +1084,9 @@ def _run_opencode_container(
                             runtime_home,
                             container_name,
                             max(1, int(float(timeout) * 1000)),
+                            candidate_marker,
+                            evaluator_facade,
+                            evaluator_cache_mask,
                         )
                         container_stopped = False
                         try:
@@ -1208,11 +1296,90 @@ def preflight_agent_container(
             "import json",
             "import os",
             "import subprocess",
+            "import sys",
             "import pandas as pd",
             "import pyarrow.parquet as pq",
             "from pathlib import Path",
-            "import quant_core.research.evaluator",
+            "import quant_core.research.evaluator as candidate_evaluator",
+            "from quant_core.research.evaluator import HarnessExecutionRequired",
             "workspace = Path('/workspace')",
+            f"marker = Path({str(_CANDIDATE_CONTAINER_MARKER)!r})",
+            "assert marker.is_file()",
+            "try:",
+            "    marker.write_text('forged', encoding='utf-8')",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise AssertionError('candidate container marker was writable')",
+            "try:",
+            "    marker.unlink()",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise AssertionError('candidate container marker was removable')",
+            "facade = Path(candidate_evaluator.__file__)",
+            (
+                "assert facade == "
+                "workspace / 'src/quant_core/research/evaluator.py'"
+            ),
+            "assert callable(candidate_evaluator.evaluate_candidate)",
+            "assert not hasattr(candidate_evaluator, '_passes')",
+            "facade_cache = facade.parent / '__pycache__'",
+            "assert facade_cache.is_dir()",
+            "try:",
+            "    (facade_cache / 'forged.pyc').write_bytes(b'forged')",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise AssertionError('candidate evaluator bytecode cache was writable')",
+            "try:",
+            "    facade.write_text('forged', encoding='utf-8')",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise AssertionError('candidate evaluator facade was writable')",
+            "try:",
+            "    facade.unlink()",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    raise AssertionError('candidate evaluator facade was removable')",
+            (
+                "official = "
+                "'python3 -m quant_core.research.attempt evaluate'"
+            ),
+            "def assert_evaluator_blocked(call):",
+            "    try:",
+            "        call()",
+            "    except HarnessExecutionRequired as exc:",
+            "        assert official in str(exc), str(exc)",
+            "    else:",
+            "        raise AssertionError('candidate evaluator bypass succeeded')",
+            (
+                "candidate_evaluator.CANDIDATE_CONTAINER_MARKER = "
+                "Path('/nonexistent')"
+            ),
+            (
+                "candidate_evaluator._reject_candidate_container_evaluation = "
+                "lambda: None"
+            ),
+            (
+                "direct = lambda **kwargs: candidate_evaluator.evaluate_walk_forward("
+                "None, None, None, None, None, None, None, None, **kwargs)"
+            ),
+            "assert_evaluator_blocked(lambda: direct())",
+            "assert_evaluator_blocked(lambda: direct(execution=object()))",
+            "def wrapper():",
+            "    return direct()",
+            "assert_evaluator_blocked(wrapper)",
+            (
+                "module_cli = subprocess.run("
+                "[sys.executable, '-m', 'quant_core.research.evaluator'], "
+                "text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, "
+                "check=False)"
+            ),
+            "assert module_cli.returncode != 0",
+            "assert official in module_cli.stdout, module_cli.stdout",
             "(workspace / 'candidate.txt').write_text('ok', encoding='utf-8')",
             f"expected = {expected_files!r}",
             f"development_end = pd.Timestamp({development_end!r})",

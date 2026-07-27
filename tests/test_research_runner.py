@@ -23,6 +23,7 @@ from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     CandidateBindPreflightError,
     _agent_read_only_paths,
+    _candidate_evaluator_facade,
     _docker_opencode_command,
     _development_finalization_reserve,
     _metrics_key,
@@ -453,6 +454,25 @@ def test_docker_opencode_command_mounts_only_candidate_and_read_only_inputs(
     )
     assert command[-2:] == ["--dir", "/workspace"]
     assert "test-agent:local" in command
+
+
+def test_candidate_evaluator_facade_cannot_reveal_walk_forward_by_patching_guard() -> None:
+    namespace = {"__name__": "candidate_evaluator_facade"}
+    exec(_candidate_evaluator_facade(), namespace)
+    namespace["CANDIDATE_CONTAINER_MARKER"] = Path("/nonexistent")
+    namespace["_reject_candidate_container_evaluation"] = lambda: None
+
+    with pytest.raises(
+        namespace["HarnessExecutionRequired"],
+        match=r"python3 -m quant_core\.research\.attempt evaluate",
+    ):
+        namespace["evaluate_walk_forward"](
+            None, None, None, None, None, None, None, None,
+            execution=object(),
+        )
+
+    assert callable(namespace["evaluate_candidate"])
+    assert "_passes" not in namespace
 
 
 def test_opencode_runtime_is_staged_inside_single_home_mount(
@@ -1071,6 +1091,9 @@ def test_container_runner_deletes_staged_runtime_files(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    evaluator = tmp_path / "src/quant_core/research/evaluator.py"
+    evaluator.parent.mkdir(parents=True)
+    evaluator.write_text("# authoritative host evaluator\n", encoding="utf-8")
     auth = tmp_path / "auth.json"
     config = tmp_path / "opencode.jsonc"
     models = tmp_path / "models.json"
@@ -1081,6 +1104,9 @@ def test_container_runner_deletes_staged_runtime_files(
     monkeypatch.setenv("QUANT_OPENCODE_CONFIG_FILE", str(config))
     monkeypatch.setenv("QUANT_OPENCODE_MODELS_FILE", str(models))
     runtime_homes: list[Path] = []
+    candidate_markers: list[Path] = []
+    evaluator_facades: list[Path] = []
+    evaluator_cache_masks: list[Path] = []
 
     def succeed(
         command: Sequence[str],
@@ -1096,9 +1122,51 @@ def test_container_runner_deletes_staged_runtime_files(
         )
         runtime_home = Path(home_mount.split("src=", 1)[1].split(",dst=", 1)[0])
         runtime_homes.append(runtime_home)
+        marker_mount = next(
+            part
+            for part in command
+            if part.startswith("type=bind,src=")
+            and ",dst=/run/quant-research/candidate-container,readonly" in part
+        )
+        candidate_marker = Path(
+            marker_mount.split("src=", 1)[1].split(",dst=", 1)[0]
+        )
+        candidate_markers.append(candidate_marker)
+        facade_mount = next(
+            part
+            for part in command
+            if part.startswith("type=bind,src=")
+            and ",dst=/workspace/src/quant_core/research/evaluator.py,readonly"
+            in part
+        )
+        evaluator_facade = Path(
+            facade_mount.split("src=", 1)[1].split(",dst=", 1)[0]
+        )
+        evaluator_facades.append(evaluator_facade)
+        cache_mount = next(
+            part
+            for part in command
+            if part.startswith("type=bind,src=")
+            and ",dst=/workspace/src/quant_core/research/__pycache__,readonly"
+            in part
+        )
+        evaluator_cache_mask = Path(
+            cache_mount.split("src=", 1)[1].split(",dst=", 1)[0]
+        )
+        evaluator_cache_masks.append(evaluator_cache_mask)
         assert (runtime_home / ".local/share/opencode/auth.json").is_file()
         assert (runtime_home / ".config/opencode/opencode.jsonc").is_file()
         assert (runtime_home / ".cache/opencode/models.json").is_file()
+        assert candidate_marker.read_text(encoding="utf-8").startswith(
+            "Harness-managed"
+        )
+        assert candidate_marker.stat().st_mode & 0o777 == 0o444
+        assert "evaluate_walk_forward = _harness_execution_required" in (
+            evaluator_facade.read_text(encoding="utf-8")
+        )
+        assert evaluator_facade.stat().st_mode & 0o777 == 0o444
+        assert evaluator_cache_mask.is_dir()
+        assert list(evaluator_cache_mask.iterdir()) == []
         return 0
 
     monkeypatch.setattr(research_runner, "_run_prompt_process", succeed)
@@ -1115,6 +1183,12 @@ def test_container_runner_deletes_staged_runtime_files(
     assert exit_code == 0
     assert len(runtime_homes) == 1
     assert not runtime_homes[0].exists()
+    assert len(candidate_markers) == 1
+    assert not candidate_markers[0].exists()
+    assert len(evaluator_facades) == 1
+    assert not evaluator_facades[0].exists()
+    assert len(evaluator_cache_masks) == 1
+    assert not evaluator_cache_masks[0].exists()
 
 
 def test_candidate_session_persists_validated_rotated_oauth_credentials(

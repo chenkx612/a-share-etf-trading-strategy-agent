@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -15,6 +18,7 @@ from quant_core.research.checkpoint import CheckpointReceiver, RUNTIME_DIR, subm
 from quant_core.research.runner import (
     _development_attempts,
     _normalize_development_metrics,
+    _run_opencode_container,
 )
 
 
@@ -113,6 +117,85 @@ def test_attempts_are_deduplicated_and_preserve_optional_learning(
     assert attempts[0]["learning"].startswith("The first candidate")
     assert attempts[1]["learning"] is None
     assert len(list((output / "development-attempts").iterdir())) == 2
+
+
+@pytest.mark.skipif(
+    os.environ.get("QUANT_TEST_AGENT_CONTAINER") != "1",
+    reason="set QUANT_TEST_AGENT_CONTAINER=1 after building the research Agent image",
+)
+def test_candidate_container_official_attempt_uses_host_receiver(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "candidate"
+    workspace.mkdir()
+    shutil.copytree(Path.cwd() / "src", workspace / "src")
+    output = tmp_path / "round"
+    output.mkdir()
+    strategy = workspace / "strategy.py"
+    strategy.write_text("VALUE = 1\n", encoding="utf-8")
+    metrics_path = workspace / "outputs/development/metrics.json"
+    checkpoint_receiver = CheckpointReceiver(
+        workspace,
+        output,
+        "strategy.py",
+        None,
+        time.monotonic() + 60,
+    )
+
+    def host_evaluator(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(json.dumps({
+            "sortino": 1.25,
+            "max_drawdown": -0.1,
+        }), encoding="utf-8")
+        return 0
+
+    attempt_receiver = DevelopmentAttemptReceiver(
+        workspace,
+        output,
+        ["host-development-evaluator"],
+        metrics_path,
+        checkpoint_receiver.latest_valid,
+        host_evaluator,
+        30,
+        time.monotonic() + 60,
+        _normalize_development_metrics,
+    )
+    checkpoint_receiver.start()
+    attempt_receiver.start()
+    try:
+        metadata = workspace / RUNTIME_DIR / "metadata.json"
+        metadata.write_text(json.dumps(_metadata("container")), encoding="utf-8")
+        checkpoint = submit(metadata, workspace=workspace)
+        exit_code = _run_opencode_container(
+            ["python3", "-m", "quant_core.research.attempt", "evaluate"],
+            "",
+            workspace,
+            output / "container-attempt.log",
+            30,
+        )
+    finally:
+        attempt_receiver.stop()
+        checkpoint_receiver.stop()
+
+    assert exit_code == 0
+    response = json.loads(
+        (output / "container-attempt.log").read_text(encoding="utf-8")
+    )
+    assert response["candidate_sha256"] == checkpoint["strategy_sha256"]
+    assert response["development_metrics"]["sortino"] == 1.25
+    attempt = json.loads(
+        (output / "development-attempts/001/attempt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert attempt["candidate_sha256"] == checkpoint["strategy_sha256"]
+    assert attempt["development_metrics"]["max_drawdown"] == -0.1
 
 
 def test_synthetic_attempt_id_follows_highest_recorded_id(tmp_path: Path) -> None:

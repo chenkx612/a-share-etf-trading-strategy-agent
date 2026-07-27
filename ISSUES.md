@@ -33,35 +33,11 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Agent 可绕过 Attempt 与 Development 预算控制直接调用 evaluator |
 | P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | 每轮结构归因警告错误地把拒绝候选称为已接受候选 |
 
 ## 一、待解决问题
-
-### P1：推荐解决
-
-#### Agent 可绕过 Attempt 与 Development 预算控制直接调用 evaluator
-
-- **问题**：Run 003 的 Round 006/009 未提交 checkpoint，也没有 Harness-owned
-  `development_attempts`，但事件日志显示两轮均多次直接导入
-  `quant_core.research.evaluator.evaluate_walk_forward` 批量评测候选；Round 009 截止前一次脚本还
-  完成了七组网格输出。由于 `evaluate_walk_forward(..., execution=None)` 是合法调用，这些评测
-  绕过 checkpoint 校验、Attempt 去重、耗时投影、finalization 预留、进度事件和研究记忆，最终
-  两个 `result.json` 仍显示空尝试并以超时失败。外层 Round 硬时限仍生效，固定 Gate/Promotion
-  也未被这些脚本直接改写，但“被放弃的 Development 尝试必须进入研究记忆”的既有解决并未形成
-  可执行边界。
-- **方案**：在候选容器上下文中禁止无 Harness execution capability 的顶层 evaluator 调用；官方
-  Attempt 由宿主 receiver 对冻结 checkpoint 执行并返回规范化结果。保留纯函数级单元诊断能力，
-  但批量 walk-forward 入口必须校验不可由候选伪造的 Harness capability。Prompt 继续指导正确流程，
-  但不得作为唯一约束。
-- **验证**：真实 Agent 容器内直接导入、`python -m`、包装函数和省略 `execution` 均应在开始评测前
-  拒绝；官方 Attempt 仍可评测、去重、写入 learning，并遵守耗时投影与 finalization 预留。超时后
-  所有已成功返回给 Agent 的顶层 Development 结果都必须存在对应 Attempt 最小事实。
-- **风险**：Agent 仍能用 pandas 或自写回测器做轻量探索；在 Development 数据边界已物理隔离的
-  前提下，这属于协作型研究能力。Harness 至少应阻止对固定 evaluator 的偶然绕行，并明确哪些
-  探索必须登记为顶层 Attempt。
 
 ### P2：有时间时优化
 
@@ -238,6 +214,25 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
+
+#### Agent 顶层 Development 评测必须经过 Harness-owned Attempt
+
+- **问题**：候选曾可直接导入或通过模块 CLI 调用 `evaluate_walk_forward()`，以
+  `execution=None` 或伪造 execution 绕过 checkpoint、Attempt 去重、预算投影、finalization
+  预留和研究记忆；外层 Round 时限仍生效，但成功完成的顶层搜索不会形成 Attempt 审计事实。
+- **解决**：解释器内的 marker 判断不足以作为权限边界，因为候选可修改模块全局变量。Harness
+  仍为 Agent 容器挂载只读身份文件，但真正的执行边界改为 OS 级模块覆盖：宿主临时目录中的受限
+  evaluator 门面只读挂载到候选 `src/quant_core/research/evaluator.py`，并用空只读目录遮蔽其
+  `__pycache__`。门面只转发 `evaluate_candidate()` 和 selection 校验，walk-forward 函数与 CLI
+  固定抛出 `HarnessExecutionRequired`；权威实现不进入候选解释器。挂载源位于 worktree 外，
+  容器继续丢弃全部 capabilities 并启用 `no-new-privileges`。官方 receiver 在宿主执行冻结评测。
+- **验证**：单元测试覆盖修改 marker、替换旧 guard、伪造 execution 仍不能从门面取得权威入口；
+  生产容器预检验证门面、标记和 bytecode 遮蔽均只读且不可删除，并在真实镜像内覆盖直接导入、
+  包装调用和 CLI。既有 receiver 回归继续覆盖 checkpoint、候选哈希、去重、learning、预算和
+  Attempt 汇总。
+- **风险**：边界只保护项目权威的顶层 walk-forward evaluator。候选仍可使用 pandas、自写轻量
+  Development 诊断和 `evaluate_candidate()` 等低层纯函数；在冻结 Development 数据边界内，这是
+  保留的协作研究能力，不构成 Harness-owned 顶层 Attempt。
 
 #### Evaluator 指纹不得写入主 Git 对象库
 
