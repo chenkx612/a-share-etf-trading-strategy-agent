@@ -33,7 +33,7 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P0 | 候选容器挂载完整行情缓存，Development 数据边界可被绕过 |
+| P0 | Development 数据视图缺少 fail-closed 验证与契约闭环 |
 | P1 | Agent 可绕过 Attempt 与 Development 预算控制直接调用 evaluator |
 | P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
@@ -43,24 +43,29 @@
 
 ### P0：执行新的 Loop 研发前必须解决
 
-#### 候选容器挂载完整行情缓存，Development 数据边界可被绕过
+#### Development 数据视图缺少 fail-closed 验证与契约闭环
 
 - **问题**：`active-etf-rerank-topk` Run 003 的 Round 006/009 事件日志证明，候选 Agent 可直接读取
-  `data/etf_daily.parquet` 并在进程内调用固定 evaluator；该缓存实际包含截至 Gate 终点的行情，
-  而非只包含 Development 及其必要前置历史。两轮日志中的自定义评测仍使用 Development 日期，
-  没有发现已经读取 Gate 指标的证据，但当前隔离只遮蔽 Research Root 和 Gate runtime，未在原始
-  市场数据层强制截断，协作型 Agent 的 Prompt 约束因此成了唯一 Gate 边界。误填日期、自定义脚本
-  或直接检查 Gate 期行情都可绕过 Harness-owned Gate，破坏后续研究可信度。
-- **方案**：候选容器只挂载内容寻址、只读的 Development 数据视图；视图最多保留 Development
-  终点及完成首个训练折、信号窗口所需的前置历史，物理删除终点之后的所有行情。完整缓存和 Gate
-  评测数据只允许宿主 Harness 进程访问，不能通过 worktree、只读 bind、已安装包资源或符号链接
-  进入候选容器。把 Development 视图的范围和哈希纳入 Run/Attempt 契约。
-- **验证**：真实容器测试覆盖 Bash、Python、pandas、pyarrow、绝对路径、符号链接和直接导入
-  evaluator；候选可完成合法 Development 与必要训练回看，但任何可见行情的最大日期不得晚于
-  Development 终点，完整缓存与 Gate runtime 均不可见。预检应在分配 Run 前验证这一数据拓扑，
-  越界立即按基础设施故障熔断。
-- **风险**：截断视图必须保留足够训练和特征预热历史，否则会静默改变 Development 结果；修复后
-  需用同一 Champion 对照宿主固定 Development，逐字核对折定义、可行性和汇总指标。
+  `data/etf_daily.parquet` 并在进程内调用固定 evaluator；但两轮日志同时显示该文件的最大日期为
+  Development 终点 `2025-07-21`，没有证据表明候选看到了 Gate 行情或 Gate 指标。当前标准路径已经
+  从完整 Evaluation runtime 派生按 Development 终点截断的视图，再复制到候选 worktree 并将
+  `data/` 只读挂载，因此“候选容器已挂载完整行情缓存”和“Prompt 是唯一 Gate 边界”不是现有证据
+  支持的事实。真正的缺口是该边界仍为 best-effort：表过滤会跳过无法解析、缺少 `date` 列或不受支持
+  格式的文件，复制会保留符号链接，容器预检只检查合成哨兵而不核验真实可见行情的日期范围；数据视图
+  的范围和哈希也尚未进入 Run/Attempt 契约。数据格式、缓存拓扑或挂载逻辑一旦回归，Harness 不能在
+  Run 分配前 fail closed，也无法仅凭持久化契约证明候选只接触过冻结的 Development 输入。
+- **方案**：把候选可见输入构建为内容寻址、只读且无符号链接的 Development 数据视图；视图最多保留
+  Development 终点及完成首个训练折、信号窗口所需的前置历史，所有行情文件必须由显式格式契约解析
+  并验证日期上界，未知格式、解析失败、缺失日期语义或越界一律按基础设施故障拒绝。完整缓存和 Gate
+  评测数据只允许宿主 Harness 进程访问，不能通过 worktree、只读 bind、已安装包资源或符号链接进入
+  候选容器。把视图范围、逐文件 manifest 和整体哈希纳入 Run/Attempt 契约。
+- **验证**：真实容器测试覆盖 Bash、Python、pandas、pyarrow、绝对路径、符号链接、未知或损坏文件
+  和直接导入 evaluator；候选可完成合法 Development 与必要训练回看，但任何可见行情的最大日期不得
+  晚于 Development 终点，完整缓存与 Gate runtime 均不可见。预检应在分配 Run 前核验真实数据视图、
+  manifest、挂载拓扑和日期上界，任一不一致立即按基础设施故障熔断。使用同一冻结 Champion 对照宿主
+  固定 Development，折定义、可行性、参数选择和汇总指标必须一致。
+- **风险**：严格格式契约必须覆盖合法的非行情辅助文件，截断视图也必须保留足够训练和特征预热历史，
+  否则会拒绝正常任务或静默改变 Development 结果；内容寻址缓存还需避免重复大文件带来的空间放大。
 
 ### P1：推荐解决
 
