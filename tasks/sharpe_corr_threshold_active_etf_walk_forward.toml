@@ -1,0 +1,125 @@
+id = "sharpe-corr-threshold-active-etf-walk-forward"
+goal = """
+在固定的 universes/active_etf_rotation.csv 候选池上研发并评估
+sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后验收益筛选的股票池。
+本任务使用独立 task id；不得继承旧 sector_rotation.csv 股票池下的 Champion、参数结论、
+Gate 指标或研究记忆。首次运行以工作区当前策略为基线，并由 Harness 在本任务的固定契约下
+重新评估。
+
+active_etf_rotation.csv 只决定允许参与的 symbol 集合。fund_size 是当前时点的审计字段，
+不得进入历史打分、权重、阈值或参数选择。该 CSV 是当前成分快照，因此仍存在幸存者偏差；
+本任务不宣称恢复历史成分。每个历史信号日只能动态纳入当日已有行情且满足所需滚动窗口的
+ETF；不得填补上市前数据，不得后向填充，不得使用未来收益、未来成分、全样本统计量或
+Development 之后的信息构造特征。所有信号只能使用交易日 t 收盘时已知的数据，目标权重
+由固定回测器在 t+1 执行。
+
+评估必须使用 Harness 固定的 walk-forward：每个自然月首个交易日以此前 12 个月为训练窗，
+仅在训练窗内按硬约束和 Sortino 选择 parameter_grid() 中的参数，然后将该参数冻结到随后
+一个月的样本外验证折。Development 用于候选研发；Gate 与 Development 不重叠，Gate 的
+逐折参数、持仓、收益和指标不得反馈给后续候选。不得修改 evaluator、数据区间、股票池、
+硬约束、晋级规则或测试来配合候选。
+
+策略模块必须保留 select(daily, universe, start, end)、parameter_grid() 和
+select_with_params(daily, universe, start, end, params) 接口，返回至少包含 date、
+symbol、target_weight 的 DataFrame。权重必须有限、非负且每日总和不超过 1，允许持有现金；
+无持仓日也要通过 attrs 的 signal_dates 和 universe_symbols 表达完整状态。参数网格必须
+确定、规模受限且具有经济含义。
+
+每轮只验证一个主要机制。候选提交前须在 Development 中检查因果性、确定性、上市边界、
+缺失行情、信号日至次日开盘时序、纯多头权重和参数网格唯一性，并量化相对当前 Champion
+的持仓差异、触发次数、总暴露和换手变化。候选先满足年化收益、最大回撤和平均换手率约束，
+再以 Gate 汇总 Sortino 达到最小改善门槛；Promotion 完全由 Harness 决定。
+"""
+
+[budget]
+max_rounds = 10
+max_hours = 4
+max_consecutive_failures = 3
+round_minutes = 30
+
+[opencode]
+model = "xai/grok-4.5"
+variant = "high"
+timeout_minutes = 30
+
+[strategy]
+name = "sharpe-corr-threshold"
+module = "quant_core.strategy.sharpe_corr_threshold"
+
+[baseline]
+mode = "workspace"
+
+[data]
+universe = "universes/active_etf_rotation.csv"
+
+[scope]
+editable = [
+  "src/quant_core/strategy/sharpe_corr_threshold.py",
+]
+forbidden = [
+  "src/quant_core/backtest/",
+  "src/quant_core/data/",
+  "src/quant_core/factors/",
+  "src/quant_core/research/",
+  "src/quant_core/cli.py",
+  "src/quant_core/config.py",
+  "tests/",
+  "universes/",
+  "data/",
+  "outputs/",
+  ".agents/",
+  ".research/",
+]
+
+[commands]
+test = [
+  "{python}", "-m", "pytest", "-q",
+  "tests/test_sector_rotation_research.py",
+  "tests/test_research_evaluator.py",
+]
+metrics_path = "outputs/backtests/{run_id}/metrics.json"
+
+[evaluation]
+mode = "walk_forward"
+objective = "sortino"
+
+[evaluation.contract]
+paths = [
+  "pyproject.toml",
+  "src/quant_core/__init__.py",
+  "src/quant_core/backtest",
+  "src/quant_core/config.py",
+  "src/quant_core/data",
+  "src/quant_core/factors",
+  "src/quant_core/research",
+  "src/quant_core/schedule.py",
+  "src/quant_core/strategy/__init__.py",
+  "tests/test_research_evaluator.py",
+  "tests/test_sector_rotation_research.py",
+  "universes/active_etf_rotation.csv",
+]
+
+[evaluation.constraints]
+annual_return = { operator = ">=", threshold = 0.05 }
+max_drawdown = { operator = "abs<=", threshold = 0.15 }
+avg_turnover = { operator = "<=", threshold = 0.30 }
+
+[evaluation.acceptance]
+minimum_improvement = 0.03
+
+[evaluation.walk_forward]
+train_months = 12
+max_parameter_sets = 64
+
+[evaluation.walk_forward.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
+
+[evaluation.walk_forward.development]
+start = "2022-08-01"
+end = "2025-07-21"
+
+[evaluation.walk_forward.gate]
+start = "2025-07-22"
+end = "2026-07-24"
