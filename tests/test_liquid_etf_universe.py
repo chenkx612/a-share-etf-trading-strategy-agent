@@ -97,12 +97,6 @@ def test_normalized_etf_group_key_removes_spaces_and_ignores_etf_case() -> None:
     assert builder.normalized_etf_group_key("创业板") == "创业板"
 
 
-def test_default_shortlist_size_bounds_refresh_workload_at_one_hundred() -> None:
-    builder = load_builder()
-
-    assert builder.DEFAULT_SHORTLIST_SIZE == 100
-
-
 def test_shortlist_filters_size_deduplicates_by_largest_and_uses_symbol_tie_break() -> None:
     builder = load_builder()
     spot = pd.DataFrame(

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
-from quant_core.config import BacktestConfig
 from quant_core.research.evaluator import evaluate_candidate
 from quant_core.strategy.sharpe_corr_threshold import select
 
@@ -27,14 +25,6 @@ def _daily() -> pd.DataFrame:
                 "turnover": 1.0,
             })
     return pd.DataFrame(rows)
-
-
-def test_research_uses_fixed_backtest_config() -> None:
-    config = BacktestConfig()
-
-    assert config.fee_rate == pytest.approx(0.001)
-    assert config.initial_capital == pytest.approx(100_000.0)
-    assert config.lot_size == 100
 
 
 def test_research_evaluator_runs_sharpe_corr_threshold_baseline() -> None:

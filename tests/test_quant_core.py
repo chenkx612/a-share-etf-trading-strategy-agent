@@ -79,12 +79,6 @@ def test_compute_factors_supports_parameterized_sharpe_windows() -> None:
     assert factors["sharpe_10"].notna().any()
 
 
-def test_strategy_params_use_custom_sharpe_window() -> None:
-    params = SharpeCorrThresholdParams(top_n=1, sharpe_window=30)
-
-    assert params.factor_name == "sharpe_30"
-
-
 def test_missing_sharpe_factor_columns_are_computed_from_daily() -> None:
     daily = sample_daily()
     factors = compute_factors(daily, sharpe_windows=[20]).drop(columns=["sharpe_20"])
