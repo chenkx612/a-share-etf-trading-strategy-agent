@@ -12,6 +12,17 @@ import pandas as pd
 SUPPORTED_SCHEDULE_PERIODS = {"trading_day", "iso_week", "calendar_month"}
 
 
+def _normalized_trading_dates(
+    trading_dates: Sequence[pd.Timestamp],
+) -> pd.DatetimeIndex:
+    return (
+        pd.DatetimeIndex(pd.to_datetime(trading_dates))
+        .normalize()
+        .unique()
+        .sort_values()
+    )
+
+
 def validate_schedule(
     schedule: Mapping[str, object],
     *,
@@ -78,7 +89,7 @@ def schedule_bucket(
     schedule: Mapping[str, object],
     trading_dates: Sequence[pd.Timestamp],
 ) -> str:
-    dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).sort_values().unique()
+    dates = _normalized_trading_dates(trading_dates)
     timestamp = pd.Timestamp(value).normalize()
     period = str(schedule["period"])
     interval = int(schedule["interval"])
@@ -95,7 +106,7 @@ def is_schedule_boundary(
     schedule: Mapping[str, object],
     trading_dates: Sequence[pd.Timestamp],
 ) -> bool:
-    dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).sort_values().unique()
+    dates = _normalized_trading_dates(trading_dates)
     timestamp = pd.Timestamp(value).normalize()
     matches = np.flatnonzero(dates == timestamp)
     if not len(matches):
@@ -110,19 +121,10 @@ def is_schedule_boundary(
     period = str(schedule["period"])
     interval = int(schedule["interval"])
     bucket = _period_ordinal(timestamp, period) // interval
-    calendar = exchange_trade_dates()
-    if calendar:
-        day = timestamp.date()
-        calendar_index = bisect_left(calendar, day)
-        if calendar_index < len(calendar) and calendar[calendar_index] == day:
-            neighbor_index = calendar_index + (-1 if trigger == "start" else 1)
-            if 0 <= neighbor_index < len(calendar):
-                neighbor = pd.Timestamp(calendar[neighbor_index])
-                return _period_ordinal(neighbor, period) // interval != bucket
     if trigger == "start":
         return (
-            index > 0
-            and _period_ordinal(pd.Timestamp(dates[index - 1]), period) // interval
+            index == 0
+            or _period_ordinal(pd.Timestamp(dates[index - 1]), period) // interval
             != bucket
         )
     return (
@@ -136,7 +138,7 @@ def schedule_boundaries(
     trading_dates: Sequence[pd.Timestamp],
     schedule: Mapping[str, object],
 ) -> list[pd.Timestamp]:
-    dates = pd.DatetimeIndex(pd.to_datetime(trading_dates)).sort_values().unique()
+    dates = _normalized_trading_dates(trading_dates)
     if dates.empty:
         return []
     period = str(schedule["period"])
@@ -154,32 +156,16 @@ def schedule_boundaries(
         _period_ordinal(pd.Timestamp(value), period) // interval
         for value in dates
     ]
-    calendar = exchange_trade_dates()
     boundaries: list[pd.Timestamp] = []
     for index, value in enumerate(dates):
         timestamp = pd.Timestamp(value)
-        boundary: bool | None = None
-        if calendar:
-            calendar_index = bisect_left(calendar, timestamp.date())
-            if (
-                calendar_index < len(calendar)
-                and calendar[calendar_index] == timestamp.date()
-            ):
-                neighbor_index = calendar_index + (-1 if trigger == "start" else 1)
-                if 0 <= neighbor_index < len(calendar):
-                    neighbor = pd.Timestamp(calendar[neighbor_index])
-                    boundary = (
-                        _period_ordinal(neighbor, period) // interval
-                        != buckets[index]
-                    )
-        if boundary is None:
-            if trigger == "start":
-                boundary = index > 0 and buckets[index - 1] != buckets[index]
-            else:
-                boundary = (
-                    index < len(dates) - 1
-                    and buckets[index + 1] != buckets[index]
-                )
+        if trigger == "start":
+            boundary = index == 0 or buckets[index - 1] != buckets[index]
+        else:
+            boundary = (
+                index < len(dates) - 1
+                and buckets[index + 1] != buckets[index]
+            )
         if boundary:
             boundaries.append(timestamp)
     return boundaries

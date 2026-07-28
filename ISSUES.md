@@ -33,11 +33,32 @@
 
 | 优先级 | 问题 |
 | --- | --- |
+| P1 | Run 前未验证 Parent 的固定测试基线 |
 | P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | 每轮结构归因警告错误地把拒绝候选称为已接受候选 |
 
 ## 一、待解决问题
+
+### P1：重要可靠性问题
+
+#### Run 前未验证 Parent 的固定测试基线
+
+- **问题**：Harness 的预检没有在分配耐久 Run 和研究轮次前，对 Parent/Champion 执行任务声明的固定
+  `commands.test`。上述 Run 002 中，Round 001 和 002 的候选只允许修改策略文件，却都因禁止修改的
+  `tests/test_research_evaluator.py` 同一组 4 个失败被记为普通 `Tests failed`；随后 Round 003 研发
+  超时，最终以 `max_consecutive_failures` 停止。两个有效 Development Attempt、约 90 分钟墙钟时间和
+  全部连续失败预算因此被固定基线故障消耗，且 `failure_kind`/`failure_code` 仍为空。
+- **方案**：在新 Run 分配前以及固定评测契约或环境使 Champion stale 时，于只读 Parent 快照和真实
+  Evaluation runtime 中执行一次固定测试；失败归类为 evaluator/configuration 基础设施故障并熔断，
+  保留诊断日志但不创建 Round、消耗研究预算或让候选 Agent 尝试修复 forbidden scope。对已经开始的
+  Run，若候选测试失败且 diff 不触及失败测试的依赖闭包，可与 Parent 对照复跑以区分候选回归和固定
+  基线故障。
+- **验证**：覆盖 Parent 测试失败、候选独有回归、环境相关失败、超时及 stale Champion 重评；固定
+  基线失败不得分配 Run/Round 或增加 `failed`，候选独有失败仍正常计入，日志明确记录 failure kind、
+  code、命令、环境哈希和 Parent 哈希。
+- **风险**：预检会增加一次固定测试成本；可以按 Parent、测试契约和环境哈希安全缓存成功结果，但
+  不得缓存失败或跨任一适用性变化复用。
 
 ### P2：有时间时优化
 
@@ -119,6 +140,22 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   Candidate 哈希才是审计事实。底层参数组合与 folds 不作为独立 Attempt，避免低质量信息膨胀。
 
 ### P0：曾阻断可信研发
+
+#### Walk-forward 历史折边界不得依赖实时交易日历
+
+- **问题**：固定 evaluator 曾在 `calendar_month` 和 `iso_week` 边界判断中实时调用 AkShare，并在
+  Provider 异常时静默改用输入表相邻日期；相同源码、任务和冻结行情会随网络状态得到不同 folds、
+  参数日期与预算投影。
+- **解决**：排序、归一化并去重后的冻结候选池行情日期并集是 Research 历史边界的唯一权威输入。
+  周期 `start` 取本地序列中每个周期的首日；周期 `end` 仅在已有后续周期日期可证明时取上一周期末日。
+  生产推荐仍可用交易所日历构造未来候选日期，但运行时日历不再参与历史月/周边界判断。任务已显式将
+  `src/quant_core/schedule.py` 纳入 evaluator 契约，因此本次源码变化会使旧 Champion 指标自动 stale；
+  历史 Run 保持不可变。
+- **验证**：固定行情下模拟 Provider 可用、异常及返回不同日历，fold 数、参数日期与边界保持一致；
+  另覆盖自然周期首日、月初缺行情、长假、周期中段评测起点、重复日期和多 symbol 缺行。预算投影仍为
+  2 折及 `750s`。
+- **风险**：所有 ETF 同时缺失的日期按回测实际可交易语义视为不可交易日。该定义可能不同于交易所
+  官方开市日，但可由已冻结的评测输入完整重放，不允许再用实时 Provider 隐式补齐。
 
 #### Development 数据视图必须 fail closed 并冻结到审计契约
 

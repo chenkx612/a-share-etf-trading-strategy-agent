@@ -226,11 +226,18 @@ def test_schedule_supports_month_start_week_end_and_stable_trading_day_intervals
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dates = pd.DatetimeIndex(
-        ["2026-06-29", "2026-06-30", "2026-07-01", "2026-07-02", "2026-07-03"]
+        [
+            "2026-06-29",
+            "2026-06-30",
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-03",
+            "2026-07-06",
+        ]
     )
     exchange_dates = tuple(
         pd.DatetimeIndex(
-            ["2026-06-25", "2026-06-26", *dates.astype(str).tolist(), "2026-07-06"]
+            ["2026-06-25", "2026-06-26", *dates.astype(str).tolist()]
         ).date
     )
     monkeypatch.setattr(
@@ -268,6 +275,42 @@ def test_calendar_end_fallback_requires_a_following_period(
     assert schedule_boundaries(dates, monthly_end) == [
         pd.Timestamp("2026-06-30")
     ]
+
+
+def test_calendar_boundaries_use_only_normalized_local_dates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = pd.to_datetime(
+        [
+            "2026-06-29 15:00",
+            "2026-06-30",
+            "2026-06-30 15:00",
+            "2026-07-06",
+            "2026-07-07",
+        ],
+        format="mixed",
+    )
+    monkeypatch.setattr(
+        "quant_core.schedule.exchange_trade_dates",
+        lambda: pytest.fail("calendar period boundaries must not query a provider"),
+    )
+
+    assert schedule_boundaries(
+        dates,
+        {"period": "calendar_month", "interval": 1, "trigger": "start"},
+    ) == [pd.Timestamp("2026-06-29"), pd.Timestamp("2026-07-06")]
+    assert schedule_boundaries(
+        dates,
+        {"period": "calendar_month", "interval": 1, "trigger": "end"},
+    ) == [pd.Timestamp("2026-06-30")]
+    assert schedule_boundaries(
+        dates,
+        {"period": "iso_week", "interval": 1, "trigger": "start"},
+    ) == [pd.Timestamp("2026-06-29"), pd.Timestamp("2026-07-06")]
+    assert schedule_boundaries(
+        dates,
+        {"period": "iso_week", "interval": 1, "trigger": "end"},
+    ) == [pd.Timestamp("2026-06-30")]
 
 
 def test_schedule_boundaries_scans_normalized_dates_once(

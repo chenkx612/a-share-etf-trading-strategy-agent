@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -177,6 +178,79 @@ def test_walk_forward_monthly_boundaries_do_not_depend_on_period_start() -> None
     assert outputs[0][0] == outputs[1][0] == ["2024-04-01", "2024-05-01"]
     assert outputs[0][1].daily_returns.iloc[0]["net_return"] > 0.0
     assert outputs[1][1].daily_returns.iloc[0]["net_return"] > 0.0
+
+
+@pytest.mark.parametrize(
+    "exchange_dates",
+    [
+        (),
+        (date(2024, 4, 1), date(2024, 5, 6), date(2024, 6, 3)),
+        (date(2024, 4, 2), date(2024, 5, 2), date(2024, 6, 4)),
+        RuntimeError("provider unavailable"),
+    ],
+)
+def test_walk_forward_boundaries_depend_only_on_frozen_market_dates(
+    monkeypatch: pytest.MonkeyPatch,
+    exchange_dates: tuple[date, ...] | RuntimeError,
+) -> None:
+    local_dates = pd.DatetimeIndex([
+        *pd.bdate_range("2024-01-02", "2024-04-30"),
+        *pd.bdate_range("2024-05-06", "2024-05-31"),
+        *pd.bdate_range("2024-06-03", "2024-06-14"),
+    ])
+    daily = pd.DataFrame([
+        {"date": day, "symbol": symbol, "open": 10.0 + offset}
+        for offset, day in enumerate(local_dates)
+        for symbol in ("A", "B")
+        if not (symbol == "A" and day == pd.Timestamp("2024-06-03"))
+    ])
+
+    def provider_calendar() -> tuple[date, ...]:
+        if isinstance(exchange_dates, RuntimeError):
+            raise exchange_dates
+        return exchange_dates
+
+    monkeypatch.setattr(
+        "quant_core.schedule.exchange_trade_dates",
+        provider_calendar,
+    )
+
+    def selector(daily, universe, start, end, params):
+        signal_dates = daily.loc[
+            daily["date"].between(start, end)
+            & daily["symbol"].eq(params["symbol"]),
+            "date",
+        ]
+        return pd.DataFrame({
+            "date": signal_dates,
+            "symbol": params["symbol"],
+            "target_weight": 1.0,
+        })
+
+    _, _, folds = evaluate_walk_forward(
+        daily,
+        pd.DataFrame({"symbol": ["A", "B"]}),
+        {"start": "2024-04-18", "end": "2024-06-14"},
+        _walk_forward(1),
+        {"max_drawdown": {"operator": "abs<=", "threshold": 1.0}},
+        "annual_return",
+        [{"symbol": "A"}],
+        selector,
+    )
+
+    assert [fold["parameter_date"] for fold in folds] == [
+        "2024-04-01",
+        "2024-05-06",
+        "2024-06-03",
+    ]
+    assert [
+        (fold["validation_start"], fold["validation_end"])
+        for fold in folds
+    ] == [
+        ("2024-04-18", "2024-05-05"),
+        ("2024-05-06", "2024-06-02"),
+        ("2024-06-03", "2024-06-14"),
+    ]
 
 
 def test_walk_forward_rejects_an_empty_training_window() -> None:
