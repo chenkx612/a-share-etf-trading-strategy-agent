@@ -33,32 +33,11 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | Run 前未验证 Parent 的固定测试基线 |
 | P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | 每轮结构归因警告错误地把拒绝候选称为已接受候选 |
 
 ## 一、待解决问题
-
-### P1：重要可靠性问题
-
-#### Run 前未验证 Parent 的固定测试基线
-
-- **问题**：Harness 的预检没有在分配耐久 Run 和研究轮次前，对 Parent/Champion 执行任务声明的固定
-  `commands.test`。上述 Run 002 中，Round 001 和 002 的候选只允许修改策略文件，却都因禁止修改的
-  `tests/test_research_evaluator.py` 同一组 4 个失败被记为普通 `Tests failed`；随后 Round 003 研发
-  超时，最终以 `max_consecutive_failures` 停止。两个有效 Development Attempt、约 90 分钟墙钟时间和
-  全部连续失败预算因此被固定基线故障消耗，且 `failure_kind`/`failure_code` 仍为空。
-- **方案**：在新 Run 分配前以及固定评测契约或环境使 Champion stale 时，于只读 Parent 快照和真实
-  Evaluation runtime 中执行一次固定测试；失败归类为 evaluator/configuration 基础设施故障并熔断，
-  保留诊断日志但不创建 Round、消耗研究预算或让候选 Agent 尝试修复 forbidden scope。对已经开始的
-  Run，若候选测试失败且 diff 不触及失败测试的依赖闭包，可与 Parent 对照复跑以区分候选回归和固定
-  基线故障。
-- **验证**：覆盖 Parent 测试失败、候选独有回归、环境相关失败、超时及 stale Champion 重评；固定
-  基线失败不得分配 Run/Round 或增加 `failed`，候选独有失败仍正常计入，日志明确记录 failure kind、
-  code、命令、环境哈希和 Parent 哈希。
-- **风险**：预检会增加一次固定测试成本；可以按 Parent、测试契约和环境哈希安全缓存成功结果，但
-  不得缓存失败或跨任一适用性变化复用。
 
 ### P2：有时间时优化
 
@@ -103,6 +82,23 @@
 
 本节只保留会影响信任边界、评测语义、恢复一致性或长时间运行可靠性的经验。一次性的字段遗漏、
 Prompt 表述和其他低风险修补由代码、测试及版本历史承载，不再逐条记录。
+
+### P1：固定评测基线可靠性
+
+#### Run 和 Round 分配前验证 Parent 固定测试
+
+- **问题**：Harness 曾在分配耐久 Run 和研究轮次前跳过 Parent/Champion 的 `commands.test`，使固定
+  基线故障被误记为候选失败并消耗连续失败预算。
+- **解决**：使用不可变 Champion worktree 和真实 Evaluation runtime 执行 Parent 固定测试。成功缓存
+  键包含 Champion SHA、稳定测试命令契约 SHA、Evaluator 契约 SHA、Evaluation runtime 输入 SHA 和
+  Evaluation environment SHA，任一变化都会重测，失败永不缓存。新 Run 前失败写入任务级
+  `preflight-failures/` 并在 Run 分配前熔断；活动 Run 在下一 Round 分配前失败则以
+  `infrastructure_failure` 停止且不改已有计数。Candidate 测试失败时固定执行一次同环境 Parent A/B
+  对照：Parent 通过仍归为候选回归，Parent 同样失败、超时或不可执行则改判基础设施故障并保留两份日志。
+- **验证**：覆盖失败、超时、不可执行、成功缓存及适用性失效，schema 7→8 迁移、Promotion 清缓存、
+  下一 Round 前熔断，以及 Candidate/Parent 分歧与共同失败归因。
+- **风险**：首次预检和适用性变化会增加一次固定测试成本；失败路径的 A/B 对照也会额外执行一次测试，
+  这是避免静态依赖闭包误判的确定性成本。
 
 ### P2：诊断可观测性
 

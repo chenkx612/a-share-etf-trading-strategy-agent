@@ -25,6 +25,7 @@ from quant_core.research.runner import (
     preflight_agent_container,
     preflight_provider_authentication,
     probe_candidate_bind_source,
+    run_parent_fixed_tests,
     run_managed_once,
     target_reached,
 )
@@ -40,6 +41,7 @@ LoopReporter = Callable[[Path, ResearchWorkspace, dict[str, Any]], Path]
 ContainerPreflight = Callable[..., None]
 ProviderPreflight = Callable[[ResearchTask, Path], None]
 EnvironmentProbe = Callable[[], EvaluationEnvironment]
+ParentTestPreflight = Callable[..., dict[str, Any] | None]
 _ROUND_ID = re.compile(r"^(\d+)$")
 
 
@@ -252,6 +254,7 @@ def run_loop(
     container_preflight: ContainerPreflight | None = None,
     provider_preflight: ProviderPreflight | None = None,
     environment_probe: EnvironmentProbe | None = None,
+    parent_test_preflight: ParentTestPreflight | None = None,
     retain_diagnostics: bool = False,
 ) -> Path:
     """Run managed research rounds until one of the configured budgets is exhausted."""
@@ -444,6 +447,42 @@ def run_loop(
     if authentication_preflight is not None and not active_runs:
         authentication_preflight(task, managed_root)
 
+    fixed_test_preflight = parent_test_preflight
+    if fixed_test_preflight is None and managed_runner is run_managed_once:
+        fixed_test_preflight = run_parent_fixed_tests
+
+    def check_parent_fixed_tests(evidence_root: Path) -> None:
+        if fixed_test_preflight is None:
+            return
+        current_state = base_manager.load_state(task.strategy_path)
+        if not isinstance(current_state.get("champion_sha256"), str):
+            return
+        try:
+            signature = inspect.signature(fixed_test_preflight)
+            accepts_evidence = (
+                "evidence_root" in signature.parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            )
+        except (TypeError, ValueError):
+            accepts_evidence = True
+        if accepts_evidence:
+            fixed_test_preflight(
+                task,
+                base_manager,
+                environment,
+                evidence_root=evidence_root,
+            )
+        else:
+            fixed_test_preflight(task, base_manager, environment)
+
+    parent_checked_before_lifecycle = False
+    if not active_runs:
+        check_parent_fixed_tests(base_manager.root / "preflight-failures")
+        parent_checked_before_lifecycle = True
+
     if active_runs:
         state["status"] = "running"
         state["stop_reason"] = None
@@ -513,6 +552,45 @@ def run_loop(
                 reason,
                 reporter,
             )
+
+        if parent_checked_before_lifecycle:
+            parent_checked_before_lifecycle = False
+        else:
+            try:
+                check_parent_fixed_tests(manager.run_root / "preflight-failures")
+            except Exception as exc:
+                if getattr(exc, "failure_kind", None) != "infrastructure":
+                    raise
+                state["status"] = "stopped"
+                state["failure_kind"] = "infrastructure"
+                state["failure_code"] = getattr(
+                    exc,
+                    "failure_code",
+                    "parent_fixed_tests_unavailable",
+                )
+                state["failure_message"] = str(exc)
+                evidence_path = getattr(exc, "evidence_path", None)
+                preflight_failure = {
+                    "failure_kind": "infrastructure",
+                    "failure_code": state["failure_code"],
+                    "message": str(exc),
+                }
+                if isinstance(evidence_path, Path):
+                    relative_evidence = (
+                        evidence_path.relative_to(manager.run_root).as_posix()
+                    )
+                    state["failure_evidence"] = relative_evidence
+                    preflight_failure["evidence_path"] = relative_evidence
+                state["preflight_failure"] = preflight_failure
+                _save(loop_state_path, state)
+                return _finish_with_report(
+                    task_file,
+                    manager,
+                    loop_state_path,
+                    state,
+                    "infrastructure_failure",
+                    reporter,
+                )
 
         if authentication_preflight is not None and (
             bool(active_runs) or int(state["rounds_completed"]) > 0

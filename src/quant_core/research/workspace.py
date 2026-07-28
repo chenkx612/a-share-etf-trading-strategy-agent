@@ -982,9 +982,16 @@ class ResearchWorkspace:
             return
         state = json.loads(source.read_text(encoding="utf-8"))
         schema_version = state.get("schema_version")
-        if schema_version == 7 and source == self.state_path:
+        if schema_version in {7, 8} and source == self.state_path:
+            changed = False
             if "last_experiment_id" in state and "last_round_id" not in state:
                 state["last_round_id"] = state.pop("last_experiment_id")
+                changed = True
+            if schema_version == 7:
+                state["schema_version"] = 8
+                state["champion_fixed_test_record"] = None
+                changed = True
+            if changed:
                 write_json_atomic(self.state_path, state)
             return
         if schema_version not in {2, 3, 4, 5, 6}:
@@ -1002,7 +1009,8 @@ class ResearchWorkspace:
                     stale_reasons.append("legacy_missing_development_view")
                 metrics_record["status"] = "stale"
                 metrics_record["stale_reasons"] = stale_reasons
-            state["schema_version"] = 7
+            state["schema_version"] = 8
+            state["champion_fixed_test_record"] = None
             state["development_view_sha256"] = None
             state["development_end"] = None
             write_json_atomic(self.state_path, state)
@@ -1035,7 +1043,7 @@ class ResearchWorkspace:
         if champion_round_id is None:
             champion_round_id = self._latest_accepted_round()
         migrated = {
-            "schema_version": 7,
+            "schema_version": 8,
             "task_id": self.task_id,
             "baseline_mode": state.get("baseline_mode", "workspace"),
             "baseline_exclude": list(state.get("baseline_exclude", [])),
@@ -1045,6 +1053,7 @@ class ResearchWorkspace:
             "champion_sha256": champion_sha256,
             "champion_round_id": champion_round_id,
             "champion_metrics_record": metrics_record,
+            "champion_fixed_test_record": None,
             "last_round_id": state.get(
                 "last_round_id",
                 state.get("last_experiment_id"),
@@ -1382,6 +1391,7 @@ class ResearchWorkspace:
             state["champion_round_id"] = str(pending["round_id"])
             state["last_round_id"] = str(pending["round_id"])
             state["project_revision"] = str(pending["project_revision"])
+            state["champion_fixed_test_record"] = None
         self.champion_next_path.unlink(missing_ok=True)
         state["pending_promotion"] = None
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1472,7 +1482,7 @@ class ResearchWorkspace:
             os.replace(self.champion_next_path, self.champion_path)
             champion_sha256 = _file_sha256(self.champion_path)
         state: dict[str, Any] = {
-            "schema_version": 7,
+            "schema_version": 8,
             "task_id": self.task_id,
             "baseline_mode": baseline_mode,
             "baseline_exclude": list(baseline_exclude),
@@ -1482,6 +1492,7 @@ class ResearchWorkspace:
             "champion_sha256": champion_sha256,
             "champion_round_id": None,
             "champion_metrics_record": None,
+            "champion_fixed_test_record": None,
             "last_round_id": None,
             "pending_promotion": None,
             "development_view_sha256": None,
@@ -1496,7 +1507,7 @@ class ResearchWorkspace:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
-        if state.get("schema_version") != 7:
+        if state.get("schema_version") != 8:
             raise ValueError("research workspace uses an incompatible Champion schema")
         self._strategy_path(state, strategy_path)
         if isinstance(state.get("pending_promotion"), dict):
@@ -1798,6 +1809,7 @@ class ResearchWorkspace:
         state["champion_sha256"] = sha256
         state["champion_number"] = number
         state["champion_round_id"] = round_id
+        state["champion_fixed_test_record"] = None
         state["project_revision"] = state["pending_promotion"]["project_revision"]
         state["pending_promotion"] = None
         self.record_state(state, round_id, metrics_record)

@@ -15,7 +15,9 @@ from quant_core.research.environment import EvaluationEnvironment
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     CandidateBindPreflightError,
+    ParentFixedTestsError,
     _metrics_key,
+    run_parent_fixed_tests,
     run_managed_once,
 )
 from quant_core.research.workspace import ResearchWorkspace
@@ -215,6 +217,135 @@ def test_loop_stops_after_consecutive_failed_rounds(
     assert "[001/003] completed: failed" in output
 
 
+def test_parent_preflight_failure_does_not_allocate_run_or_call_agent(
+    tmp_path: Path,
+) -> None:
+    task_path = _task(tmp_path)
+    agent_called = False
+
+    def agent(*args, **kwargs):
+        nonlocal agent_called
+        agent_called = True
+        raise AssertionError("agent must not run")
+
+    def failing_preflight(task, manager, environment, **kwargs):
+        def fail(command, cwd, log_path, timeout):
+            log_path.write_text("parent baseline failed", encoding="utf-8")
+            return 1
+
+        return run_parent_fixed_tests(
+            task,
+            manager,
+            environment,
+            command_runner=fail,
+            evidence_root=kwargs["evidence_root"],
+        )
+
+    with pytest.raises(ParentFixedTestsError) as raised:
+        run_loop(
+            task_path,
+            workspace=tmp_path,
+            managed_runner=agent,
+            reporter=_reporter,
+            parent_test_preflight=failing_preflight,
+            environment_probe=lambda: ENVIRONMENT,
+        )
+
+    assert raised.value.failure_code == "parent_fixed_tests_failed"
+    assert not agent_called
+    assert not (tmp_path / ".research/loop-test/runs").exists()
+    evidence = json.loads(
+        (raised.value.evidence_path / "failure.json").read_text(encoding="utf-8")
+    )
+    assert evidence["failure_kind"] == "infrastructure"
+    assert (raised.value.evidence_path / "parent-tests.log").read_text(
+        encoding="utf-8"
+    ) == "parent baseline failed"
+
+
+def test_parent_preflight_success_is_reused_before_run_allocation(
+    tmp_path: Path,
+) -> None:
+    task_path = _task(tmp_path, max_rounds=1)
+    test_calls = 0
+
+    def cached_preflight(task, manager, environment, **kwargs):
+        def pass_test(command, cwd, log_path, timeout):
+            nonlocal test_calls
+            test_calls += 1
+            log_path.write_text("", encoding="utf-8")
+            return 0
+
+        return run_parent_fixed_tests(
+            task,
+            manager,
+            environment,
+            command_runner=pass_test,
+            evidence_root=kwargs["evidence_root"],
+        )
+
+    state_path = run_loop(
+        task_path,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=_reporter,
+        parent_test_preflight=cached_preflight,
+        environment_probe=lambda: ENVIRONMENT,
+    )
+
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "rounds_completed"
+    ] == 1
+    assert test_calls == 1
+    champion = json.loads(
+        (tmp_path / ".research/loop-test/champion.json").read_text(encoding="utf-8")
+    )
+    assert champion["champion_fixed_test_record"]["status"] == "passed"
+
+
+def test_parent_preflight_failure_before_next_round_does_not_change_counters(
+    tmp_path: Path,
+) -> None:
+    task_path = _task(tmp_path, max_rounds=3)
+    checks = 0
+
+    def becomes_stale(task, manager, environment, **kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            return None
+        evidence = kwargs["evidence_root"] / "stale-parent"
+        evidence.mkdir(parents=True)
+        (evidence / "parent-tests.log").write_text(
+            "stale parent failed",
+            encoding="utf-8",
+        )
+        raise ParentFixedTestsError(
+            "Parent fixed tests failed",
+            "parent_fixed_tests_failed",
+            evidence,
+        )
+
+    state_path = run_loop(
+        task_path,
+        workspace=tmp_path,
+        managed_runner=_runner(["rejected"]),
+        reporter=_reporter,
+        parent_test_preflight=becomes_stale,
+        environment_probe=lambda: ENVIRONMENT,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert state["stop_reason"] == "infrastructure_failure"
+    assert state["failure_code"] == "parent_fixed_tests_failed"
+    assert state["rounds_completed"] == 1
+    assert state["rejected"] == 1
+    assert state["failed"] == 0
+    assert state["consecutive_failures"] == 0
+    assert state["round_ids"] == ["001"]
+    assert not (state_path.parent / "rounds/002").exists()
+
+
 def test_loop_retain_diagnostics_preserves_event_timeline_and_summary(tmp_path: Path) -> None:
     task = _task(tmp_path, max_rounds=1)
 
@@ -355,6 +486,7 @@ def test_candidate_bind_preflight_failure_does_not_allocate_a_round(
         reporter=_reporter,
         container_preflight=lambda task, root: None,
         provider_preflight=lambda task, root: None,
+        parent_test_preflight=lambda task, manager, environment: None,
         environment_probe=lambda: ENVIRONMENT,
     )
 

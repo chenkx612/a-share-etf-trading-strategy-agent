@@ -30,6 +30,7 @@ from quant_core.research.workspace import (
     copy_runtime_inputs,
     evaluator_contract_sha256_for_commit,
     remove_runtime_inputs,
+    runtime_inputs_sha256,
     validate_development_view,
     write_json_atomic,
     workspace_python_env,
@@ -79,6 +80,17 @@ class CandidateBindPreflightError(AgentContainerInfrastructureError):
 
     def __init__(self, message: str, code: str, evidence_path: Path) -> None:
         super().__init__(message, code)
+        self.evidence_path = evidence_path
+
+
+class ParentFixedTestsError(RuntimeError):
+    """Raised when the immutable Parent cannot satisfy the fixed test contract."""
+
+    def __init__(self, message: str, code: str, evidence_path: Path) -> None:
+        super().__init__(message)
+        self.failure_kind = "infrastructure"
+        self.failure_code = code
+        self.code = code
         self.evidence_path = evidence_path
 
 
@@ -1637,6 +1649,197 @@ def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: 
     return values
 
 
+def _stable_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _parent_test_contract(task: ResearchTask) -> dict[str, Any]:
+    """Describe command expansion without requiring every placeholder to exist."""
+    values = {
+        "python": sys.executable,
+        "universe": str(task.raw["data"]["universe"]),
+        "workspace": "<evaluation-workspace>",
+        "start": task.evaluation_periods["development"]["start"],
+        "end": task.evaluation_periods["development"]["end"],
+        "run_id": "parent-fixed-tests",
+    }
+    if task.strategy_name is not None:
+        values["strategy_name"] = task.strategy_name
+    if task.strategy_module is not None:
+        values["strategy_module"] = task.strategy_module
+    return {
+        "command": list(task.raw["commands"]["test"]),
+        "values": values,
+    }
+
+
+def parent_fixed_test_applicability(
+    task: ResearchTask,
+    manager: ResearchWorkspace,
+    environment: EvaluationEnvironment,
+    state: Mapping[str, Any],
+) -> dict[str, str]:
+    """Return every durable input that makes a Parent test result reusable."""
+    champion_sha256 = state.get("champion_sha256")
+    if not isinstance(champion_sha256, str):
+        raise RuntimeError("research task does not have a Parent Champion")
+    return {
+        "champion_sha256": champion_sha256,
+        "test_command_contract_sha256": _stable_json_sha256(
+            _parent_test_contract(task)
+        ),
+        "evaluator_contract_sha256": manager.evaluator_contract_sha256(
+            task.evaluator_contract_paths,
+            strategy_path=task.strategy_path,
+        ),
+        "evaluation_runtime_inputs_sha256": runtime_inputs_sha256(
+            manager.evaluation_runtime
+        ),
+        "evaluation_environment_sha256": environment.sha256,
+    }
+
+
+def run_parent_fixed_tests(
+    task: ResearchTask,
+    manager: ResearchWorkspace,
+    environment: EvaluationEnvironment,
+    *,
+    command_runner: CommandRunner = _run_command,
+    evidence_root: Path | None = None,
+    force: bool = False,
+    test_run_id: str = "parent-fixed-tests",
+    cache_success: bool = True,
+) -> dict[str, Any]:
+    """Test the immutable Parent in the real Evaluation runtime.
+
+    Only successful results are cached in champion.json. Failures are durable
+    evidence and always raise an infrastructure-classified exception.
+    """
+    state = manager.load_state(task.strategy_path)
+    if not isinstance(state.get("champion_sha256"), str):
+        return {"status": "skipped", "reason": "missing_parent"}
+    applicability = parent_fixed_test_applicability(
+        task,
+        manager,
+        environment,
+        state,
+    )
+    cached = state.get("champion_fixed_test_record")
+    if (
+        not force
+        and isinstance(cached, dict)
+        and cached.get("status") == "passed"
+        and cached.get("applicability") == applicability
+    ):
+        return dict(cached)
+
+    attempt_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        + "-"
+        + uuid.uuid4().hex[:8]
+    )
+    transient_log = manager.root / ".tmp" / "parent-fixed-tests" / f"{attempt_id}.log"
+    transient_log.parent.mkdir(parents=True, exist_ok=True)
+    evaluator_path = manager.test_evaluators / attempt_id
+    command = list(task.raw["commands"]["test"])
+    timeout = int(task.raw["opencode"]["timeout_minutes"]) * 60
+    exit_code = 127
+    try:
+        values = _values(
+            task,
+            task.evaluation_periods["development"],
+            test_run_id,
+            evaluator_path,
+        )
+        command = _format_command(task.raw["commands"]["test"], values)
+        evaluator = manager.create_champion_test_evaluator(attempt_id, state)
+        copy_runtime_inputs(manager.evaluation_runtime, evaluator)
+        exit_code = command_runner(command, evaluator, transient_log, timeout)
+    except Exception as exc:
+        transient_log.write_text(str(exc), encoding="utf-8")
+        exit_code = 127
+    finally:
+        if evaluator_path.exists():
+            try:
+                manager.remove_evaluator(evaluator_path)
+            except Exception as exc:
+                existing = (
+                    transient_log.read_text(encoding="utf-8")
+                    if transient_log.is_file()
+                    else ""
+                )
+                transient_log.write_text(
+                    f"{existing}\nEvaluator cleanup failed: {exc}".lstrip(),
+                    encoding="utf-8",
+                )
+                exit_code = 127
+
+    if exit_code == 0:
+        transient_log.unlink(missing_ok=True)
+        record = {
+            "status": "passed",
+            "tested_at": datetime.now(timezone.utc).isoformat(),
+            "applicability": applicability,
+        }
+        if cache_success:
+            latest = manager.load_state(task.strategy_path)
+            if latest.get("champion_sha256") != applicability["champion_sha256"]:
+                raise RuntimeError("Parent Champion changed while fixed tests were running")
+            latest["champion_fixed_test_record"] = record
+            latest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            write_json_atomic(manager.state_path, latest)
+        return record
+
+    if exit_code == 124:
+        code = "parent_fixed_tests_timeout"
+        message = "Parent fixed tests timed out"
+    elif exit_code == 127:
+        code = "parent_fixed_tests_unavailable"
+        message = "Parent fixed tests could not be executed"
+    else:
+        code = "parent_fixed_tests_failed"
+        message = "Parent fixed tests failed"
+    root = evidence_root or (manager.root / "preflight-failures")
+    evidence_path = root / attempt_id
+    evidence_path.mkdir(parents=True, exist_ok=False)
+    durable_log = evidence_path / "parent-tests.log"
+    if transient_log.is_file():
+        shutil.move(str(transient_log), durable_log)
+    else:
+        durable_log.write_text("", encoding="utf-8")
+    evidence = {
+        "attempt_id": attempt_id,
+        "status": "failed",
+        "failure_kind": "infrastructure",
+        "failure_code": code,
+        "message": message,
+        "command": command,
+        "exit_code": exit_code,
+        "parent_sha256": applicability["champion_sha256"],
+        "evaluation_environment_sha256": applicability[
+            "evaluation_environment_sha256"
+        ],
+        "test_command_contract_sha256": applicability[
+            "test_command_contract_sha256"
+        ],
+        "evaluator_contract_sha256": applicability[
+            "evaluator_contract_sha256"
+        ],
+        "evaluation_runtime_inputs_sha256": applicability[
+            "evaluation_runtime_inputs_sha256"
+        ],
+        "log": durable_log.name,
+    }
+    write_json_atomic(evidence_path / "failure.json", evidence)
+    raise ParentFixedTestsError(message, code, evidence_path)
+
+
 def _evaluation_command(
     task: ResearchTask, task_path: str | Path, label: str, values: Mapping[str, str],
     walk_forward_config: Path | None = None,
@@ -2956,6 +3159,46 @@ def run_managed_once(
     if isinstance(previous_feedback, str):
         _fill_previous_feedback(manager, research_history, previous_feedback)
         write_json_atomic(result_path, result)
+    if (
+        has_champion
+        and result.get("status") == "failed"
+        and result.get("error") == "Tests failed"
+    ):
+        try:
+            run_parent_fixed_tests(
+                task,
+                manager,
+                environment,
+                command_runner=command_runner,
+                evidence_root=experiment / "parent-fixed-test-failures",
+                force=True,
+                test_run_id=f"{execution_id}-development",
+                cache_success=False,
+            )
+        except ParentFixedTestsError as exc:
+            parent_log = exc.evidence_path / "parent-tests.log"
+            if parent_log.is_file():
+                shutil.copy2(parent_log, experiment / "parent-tests.log")
+            failure_evidence = exc.evidence_path / "failure.json"
+            if failure_evidence.is_file():
+                shutil.copy2(
+                    failure_evidence,
+                    experiment / "parent-fixed-tests.json",
+                )
+            result["error"] = str(exc)
+            result["failure_kind"] = "infrastructure"
+            result["failure_code"] = exc.failure_code
+            result["parent_fixed_test_evidence"] = (
+                exc.evidence_path.relative_to(experiment).as_posix()
+            )
+            write_json_atomic(result_path, result)
+            _emit(
+                event_sink,
+                "parent_fixed_tests_failed",
+                round=round_id,
+                failure_code=exc.failure_code,
+                message=str(exc),
+            )
     decision_path = experiment / "decision.json"
     record_id = str(result["experiment_id"])
     if result.get("status") != "completed":

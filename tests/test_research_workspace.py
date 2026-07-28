@@ -16,7 +16,13 @@ import quant_core.research.workspace as workspace_module
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.environment import EvaluationEnvironment
-from quant_core.research.runner import _metrics_key, _run_opencode_container, run_managed_once
+from quant_core.research.runner import (
+    ParentFixedTestsError,
+    _metrics_key,
+    _run_opencode_container,
+    run_managed_once,
+    run_parent_fixed_tests,
+)
 from quant_core.research.workspace import (
     ResearchWorkspace,
     evaluator_contract_sha256_for_commit,
@@ -555,12 +561,30 @@ def test_schema_five_metrics_migrate_to_stale_without_losing_values(
 
     migrated = manager.load_state(strategy_path="strategy.py")
 
-    assert migrated["schema_version"] == 7
+    assert migrated["schema_version"] == 8
+    assert migrated["champion_fixed_test_record"] is None
     assert migrated["champion_metrics_record"]["status"] == "stale"
     assert migrated["champion_metrics_record"]["stale_reasons"] == [
         "legacy_missing_evaluation_environment"
     ]
     assert migrated["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.3
+
+
+def test_schema_seven_migrates_with_empty_fixed_test_record(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    manager = ResearchWorkspace(tmp_path, tmp_path / ".research", "schema-seven")
+    state = manager.initialize(strategy_path="strategy.py")
+    state["schema_version"] = 7
+    state.pop("champion_fixed_test_record")
+    manager.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    migrated = manager.load_state(strategy_path="strategy.py")
+
+    assert migrated["schema_version"] == 8
+    assert migrated["champion_fixed_test_record"] is None
 
 
 def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) -> None:
@@ -604,7 +628,8 @@ def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) ->
     migrated_state = manager.initialize(strategy_path="strategy.py")
     run_number = manager.migrate_legacy_loop()
 
-    assert migrated_state["schema_version"] == 7
+    assert migrated_state["schema_version"] == 8
+    assert migrated_state["champion_fixed_test_record"] is None
     assert manager.champion_path.read_text(encoding="utf-8") == "1.0\n"
     assert "champion_commit" not in migrated_state
     assert not manager.legacy_state_path.exists()
@@ -630,7 +655,8 @@ def test_schema_four_metrics_are_preserved_as_stale_during_migration(
 
     migrated = manager.load_state(strategy_path="strategy.py")
 
-    assert migrated["schema_version"] == 7
+    assert migrated["schema_version"] == 8
+    assert migrated["champion_fixed_test_record"] is None
     assert migrated["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.3
     assert migrated["champion_metrics_record"]["status"] == "stale"
     assert migrated["champion_metrics_record"]["stale_reasons"] == [
@@ -997,6 +1023,14 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
         tmp_path
         / ".research/managed-test/.tmp/worktrees/001/candidates/001"
     ).exists()
+    state["champion_fixed_test_record"] = {
+        "status": "passed",
+        "applicability": {"champion_sha256": baseline_sha256},
+    }
+    (tmp_path / ".research/managed-test/champion.json").write_text(
+        json.dumps(state),
+        encoding="utf-8",
+    )
 
     second_result = run_managed_once(
         task,
@@ -1016,6 +1050,7 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert second_decision["submission"]["submitted_by_timeout"] is False
     assert state["champion_sha256"] == hashlib.sha256(b"1.2\n").hexdigest()
     assert state["champion_round_id"] == "002/001"
+    assert state["champion_fixed_test_record"] is None
     assert state["champion_metrics_record"]["status"] == "valid"
     assert state["champion_metrics_record"]["evaluated_in_round"] == "002/001"
     assert (
@@ -1033,6 +1068,322 @@ def test_managed_run_promotes_only_an_improved_candidate(tmp_path: Path) -> None
     assert "feedback" not in second_record
     assert not (tmp_path / ".research/managed-test/research-memory.json").exists()
     assert _git_text(tmp_path, "for-each-ref", "refs/quant-research") == ""
+
+
+def test_parent_fixed_tests_cache_only_matching_success(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task_path = _task(tmp_path, "parent-test-cache")
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        "parent-test-cache",
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.initialize(strategy_path="strategy.py")
+    calls: list[Path] = []
+
+    def passing(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        calls.append(cwd)
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    first = run_parent_fixed_tests(
+        task,
+        manager,
+        ENVIRONMENT,
+        command_runner=passing,
+    )
+    second = run_parent_fixed_tests(
+        task,
+        manager,
+        ENVIRONMENT,
+        command_runner=passing,
+    )
+
+    assert first["status"] == "passed"
+    assert second == first
+    assert len(calls) == 1
+    state = manager.load_state("strategy.py")
+    assert state["champion_fixed_test_record"] == first
+    assert not list((manager.root / ".tmp/parent-fixed-tests").glob("*.log"))
+
+
+def test_parent_fixed_test_cache_invalidates_for_every_applicability_input(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task_path = _task(tmp_path, "parent-test-invalidation")
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        task.task_id,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.initialize(strategy_path="strategy.py")
+    calls = 0
+
+    def passing(command, cwd, log_path, timeout):
+        nonlocal calls
+        calls += 1
+        log_path.write_text("", encoding="utf-8")
+        return 0
+
+    run_parent_fixed_tests(task, manager, ENVIRONMENT, command_runner=passing)
+    run_parent_fixed_tests(task, manager, ENVIRONMENT, command_runner=passing)
+    assert calls == 1
+
+    task_path.write_text(
+        task_path.read_text(encoding="utf-8").replace(
+            'test = ["test-command"]',
+            'test = ["test-command", "--fixed"]',
+        ),
+        encoding="utf-8",
+    )
+    task = ResearchTask.load(task_path)
+    run_parent_fixed_tests(task, manager, ENVIRONMENT, command_runner=passing)
+    assert calls == 2
+
+    (tmp_path / ".gitignore").write_text(
+        ".research/\ndata/\noutputs/\n# evaluator changed\n",
+        encoding="utf-8",
+    )
+    run_parent_fixed_tests(task, manager, ENVIRONMENT, command_runner=passing)
+    assert calls == 3
+
+    changed_environment = EvaluationEnvironment.from_manifest({
+        "schema_version": 1,
+        "runner": "changed",
+    })
+    run_parent_fixed_tests(
+        task,
+        manager,
+        changed_environment,
+        command_runner=passing,
+    )
+    assert calls == 4
+
+    runtime_data = manager.evaluation_runtime / "data/runtime.csv"
+    runtime_data.parent.mkdir(parents=True, exist_ok=True)
+    runtime_data.write_text("date,value\n2020-01-01,1\n", encoding="utf-8")
+    run_parent_fixed_tests(
+        task,
+        manager,
+        changed_environment,
+        command_runner=passing,
+    )
+    assert calls == 5
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "failure_code"),
+    [
+        (1, "parent_fixed_tests_failed"),
+        (124, "parent_fixed_tests_timeout"),
+        (127, "parent_fixed_tests_unavailable"),
+    ],
+)
+def test_parent_fixed_test_failure_is_durable_and_not_cached(
+    tmp_path: Path,
+    exit_code: int,
+    failure_code: str,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task_path = _task(tmp_path, f"parent-failure-{exit_code}")
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        task.task_id,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.initialize(strategy_path="strategy.py")
+
+    def failing(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        log_path.write_text("complete parent failure output", encoding="utf-8")
+        return exit_code
+
+    with pytest.raises(ParentFixedTestsError) as raised:
+        run_parent_fixed_tests(
+            task,
+            manager,
+            ENVIRONMENT,
+            command_runner=failing,
+        )
+
+    assert raised.value.failure_code == failure_code
+    evidence = json.loads(
+        (raised.value.evidence_path / "failure.json").read_text(encoding="utf-8")
+    )
+    assert evidence["failure_kind"] == "infrastructure"
+    assert evidence["failure_code"] == failure_code
+    assert evidence["exit_code"] == exit_code
+    assert evidence["parent_sha256"] == manager.load_state(
+        "strategy.py"
+    )["champion_sha256"]
+    assert len(evidence["evaluation_environment_sha256"]) == 64
+    assert len(evidence["test_command_contract_sha256"]) == 64
+    assert len(evidence["evaluator_contract_sha256"]) == 64
+    assert len(evidence["evaluation_runtime_inputs_sha256"]) == 64
+    assert (
+        raised.value.evidence_path / "parent-tests.log"
+    ).read_text(encoding="utf-8") == "complete parent failure output"
+    assert manager.load_state("strategy.py")["champion_fixed_test_record"] is None
+
+
+def test_parent_fixed_test_template_error_is_unavailable_with_evidence(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task_path = _task(tmp_path, "parent-template-error")
+    task_path.write_text(
+        task_path.read_text(encoding="utf-8").replace(
+            'test = ["test-command"]',
+            'test = ["test-command", "{strategy_name}"]',
+        ),
+        encoding="utf-8",
+    )
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        task.task_id,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.initialize(strategy_path="strategy.py")
+    command_called = False
+
+    def must_not_run(command, cwd, log_path, timeout):
+        nonlocal command_called
+        command_called = True
+        return 0
+
+    with pytest.raises(ParentFixedTestsError) as raised:
+        run_parent_fixed_tests(
+            task,
+            manager,
+            ENVIRONMENT,
+            command_runner=must_not_run,
+        )
+
+    assert not command_called
+    assert raised.value.failure_code == "parent_fixed_tests_unavailable"
+    evidence = json.loads(
+        (raised.value.evidence_path / "failure.json").read_text(encoding="utf-8")
+    )
+    assert evidence["failure_code"] == "parent_fixed_tests_unavailable"
+    assert evidence["command"] == ["test-command", "{strategy_name}"]
+    assert len(evidence["test_command_contract_sha256"]) == 64
+    assert "strategy_name" in (
+        raised.value.evidence_path / "parent-tests.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_candidate_test_failure_is_compared_with_parent(tmp_path: Path) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task = _task(tmp_path)
+    task.write_text(
+        task.read_text(encoding="utf-8").replace(
+            'test = ["test-command"]',
+            'test = ["test-command", "{run_id}"]',
+        ),
+        encoding="utf-8",
+    )
+    test_workspaces: list[Path] = []
+    test_run_ids: list[str] = []
+
+    def candidate_only_failure(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        if command[0] == "test-command":
+            test_workspaces.append(cwd)
+            test_run_ids.append(command[1])
+            failed = (cwd / "strategy.py").read_text(encoding="utf-8") != "1.0\n"
+            if failed:
+                log_path.write_text("candidate regression", encoding="utf-8")
+                return 1
+            return 0
+        return _command(command, cwd, log_path, timeout)
+
+    result_path = run_managed_once(
+        task,
+        "001",
+        run_number=1,
+        workspace=tmp_path,
+        command_runner=candidate_only_failure,
+        opencode_runner=_opencode_with_signal(1.2),
+        evaluation_environment=ENVIRONMENT,
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    decision = json.loads(
+        (result_path.parent / "decision.json").read_text(encoding="utf-8")
+    )
+
+    assert result["error"] == "Tests failed"
+    assert "failure_kind" not in result
+    assert decision["decision"] == "failed"
+    assert "failure_kind" not in decision
+    assert len(test_workspaces) == 2
+    assert test_run_ids == ["001-001-development", "001-001-development"]
+
+
+def test_candidate_and_parent_test_failure_becomes_infrastructure(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    task = _task(tmp_path)
+
+    def all_tests_fail(
+        command: Sequence[str],
+        cwd: Path,
+        log_path: Path,
+        timeout: int,
+    ) -> int:
+        if command[0] == "test-command":
+            log_path.write_text(
+                "candidate failure"
+                if ".tmp/worktrees/001/candidates" in cwd.as_posix()
+                else "parent failure",
+                encoding="utf-8",
+            )
+            return 1
+        return _command(command, cwd, log_path, timeout)
+
+    result_path = run_managed_once(
+        task,
+        "001",
+        run_number=1,
+        workspace=tmp_path,
+        command_runner=all_tests_fail,
+        opencode_runner=_opencode_with_signal(1.2),
+        evaluation_environment=ENVIRONMENT,
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    decision = json.loads(
+        (result_path.parent / "decision.json").read_text(encoding="utf-8")
+    )
+
+    assert result["failure_kind"] == "infrastructure"
+    assert result["failure_code"] == "parent_fixed_tests_failed"
+    assert decision["failure_kind"] == "infrastructure"
+    assert decision["failure_code"] == "parent_fixed_tests_failed"
+    assert (result_path.parent / "tests.log").is_file()
+    assert (result_path.parent / "parent-tests.log").is_file()
+    assert (result_path.parent / "parent-fixed-tests.json").is_file()
 
 
 def test_unrelated_document_does_not_re_evaluate_champion(tmp_path: Path) -> None:
@@ -1558,7 +1909,8 @@ def test_recovery_finalizes_state_when_champion_file_was_already_replaced(
 
     assert recovered["champion_sha256"] == sha256
     assert recovered["champion_round_id"] == "001/001"
-    assert recovered["schema_version"] == 7
+    assert recovered["schema_version"] == 8
+    assert recovered["champion_fixed_test_record"] is None
     assert recovered["champion_metrics_record"]["status"] == "stale"
     assert recovered["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 2.0
     assert recovered["pending_promotion"] is None
