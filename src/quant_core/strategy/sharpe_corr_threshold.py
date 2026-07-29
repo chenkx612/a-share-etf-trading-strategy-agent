@@ -135,7 +135,7 @@ def select_sharpe_corr_threshold(
     score_col = params.factor_name
     # No listing ffill: pre-list and missing closes stay NaN so returns are undefined.
     prices = df.pivot(index="date", columns="symbol", values="close").sort_index()
-    daily_rets = prices.pct_change(fill_method=None)
+    daily_rets = prices.pct_change()
     rolling_corr = daily_rets.fillna(0.0).rolling(params.corr_window).corr()
 
     rows: list[dict[str, object]] = []
@@ -329,8 +329,7 @@ def _select_soft_corr(
                 continue
             if float(raw.loc[asset]) <= float(raw.loc[best_asset]):
                 continue
-            skipped_pen = _mean_corr_to_selected(asset, selected, curr_corr)
-            if skipped_pen <= 0.0:
+            if best_pen <= 0.0:
                 continue
             filter_events.append({
                 "date": date.date().isoformat(),
@@ -339,7 +338,7 @@ def _select_soft_corr(
                 "filter": "soft_correlation",
                 "condition": "z_sharpe - corr_lambda * mean_corr < selected",
                 "corr_lambda": float(corr_lambda),
-                "mean_corr_to_selected": float(skipped_pen),
+                "mean_corr_to_selected": float(best_pen),
                 "selected_symbol": str(best_asset),
                 "selected_name": names.get(str(best_asset), str(best_asset)),
                 "score": float(raw.loc[asset]),
