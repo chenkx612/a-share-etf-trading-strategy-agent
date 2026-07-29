@@ -2078,6 +2078,64 @@ def test_run_once_accepts_compact_blocked_output(tmp_path: Path) -> None:
     assert result["status"] == "failed"
     assert result["error"] == "OpenCode was blocked: No viable development hypothesis"
     assert result["round_timing"]["timeout_seconds"] == 60 * 60
+    events_path = result_path.parent / "opencode-events.jsonl"
+    assert events_path.is_file()
+    event = json.loads(events_path.read_text(encoding="utf-8"))
+    assert json.loads(event["part"]["text"])["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "expected_error"),
+    [
+        ("tests", "Tests failed"),
+        ("development", "development backtest failed"),
+    ],
+)
+def test_run_once_keeps_agent_events_after_post_agent_failure(
+    tmp_path: Path,
+    failed_stage: str,
+    expected_error: str,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(TASK_TOML, encoding="utf-8")
+
+    def completed_opencode(
+        command: Sequence[str], prompt: str, cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        (cwd / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
+        log_path.write_text(json.dumps({
+            "type": "text",
+            "part": {"text": json.dumps({
+                "status": "completed",
+                **_checkpoint_metadata("post-agent-failure"),
+            })},
+        }) + "\n", encoding="utf-8")
+        return 0
+
+    def failing_command(
+        command: Sequence[str], cwd: Path, log_path: Path, timeout: int,
+    ) -> int:
+        if failed_stage == "tests":
+            return 1
+        if "--run-id" in command:
+            return 1
+        return 0
+
+    result_path = run_once(
+        task_path,
+        f"experiment-{failed_stage}-failure",
+        tmp_path / f"experiment-{failed_stage}-failure",
+        workspace=tmp_path,
+        command_runner=failing_command,
+        opencode_runner=completed_opencode,
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["status"] == "failed"
+    assert result["error"] == expected_error
+    events_path = result_path.parent / "opencode-events.jsonl"
+    assert events_path.is_file()
+    assert "post-agent-failure" in events_path.read_text(encoding="utf-8")
 
 
 def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> None:
@@ -2207,6 +2265,7 @@ def test_run_once_restores_latest_checkpoint_after_deadline(tmp_path: Path) -> N
             acknowledgement = submit(metadata_path, workspace=cwd)
             assert acknowledgement["checkpoint_id"] == f"{value:03d}"
         (cwd / "strategy.py").write_text("VALUE = 999\n", encoding="utf-8")
+        log_path.write_text("checkpoint recovery event\n", encoding="utf-8")
         current_time[0] = 421.0
         return 124
 
@@ -2248,6 +2307,7 @@ def test_run_once_restores_latest_checkpoint_after_deadline(tmp_path: Path) -> N
     assert len(commands) == 3
     assert [event for event, _ in events].count("checkpoint_accepted") == 2
     assert "checkpoint_restored" in [event for event, _ in events]
+    assert not (result_path.parent / "opencode-events.jsonl").exists()
 
 
 def test_run_once_prefers_final_submission_over_checkpoint(tmp_path: Path) -> None:
@@ -2316,6 +2376,7 @@ def test_timeout_checkpoint_test_failure_does_not_fall_back(tmp_path: Path) -> N
             metadata = cwd / RUNTIME_DIR / "metadata.json"
             metadata.write_text(json.dumps(_checkpoint_metadata(str(value))), encoding="utf-8")
             submit(metadata, workspace=cwd)
+        log_path.write_text("checkpoint failure event\n", encoding="utf-8")
         current_time[0] = 421.0
         return 124
 
@@ -2341,3 +2402,6 @@ def test_timeout_checkpoint_test_failure_does_not_fall_back(tmp_path: Path) -> N
     assert result["error"] == "Tests failed"
     assert result["submission"]["checkpoint_id"] == "002"
     assert len(commands) == 1
+    assert (
+        result_path.parent / "opencode-events.jsonl"
+    ).read_text(encoding="utf-8") == "checkpoint failure event\n"

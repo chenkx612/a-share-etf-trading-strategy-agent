@@ -1176,7 +1176,7 @@ class ResearchWorkspace:
                         "champion-gate.log",
                     ):
                         remove(experiment / name)
-                if result.get("status") == "completed" or had_agent_output:
+                if result.get("status") == "completed":
                     remove(experiment / "opencode-events.jsonl")
                     for attempt_log in experiment.glob(
                         "opencode-events.attempt-*.jsonl"

@@ -1719,7 +1719,13 @@ def test_compact_artifacts_removes_success_diagnostics_but_keeps_failure_logs(
         json.dumps({"experiment_id": "001/001", "status": "completed"}),
         encoding="utf-8",
     )
-    for name in ("agent-output.json", "opencode-events.jsonl", "tests.log", "gate.log"):
+    for name in (
+        "agent-output.json",
+        "opencode-events.jsonl",
+        "opencode-events.attempt-001.jsonl",
+        "tests.log",
+        "gate.log",
+    ):
         (completed / name).write_text("diagnostic\n", encoding="utf-8")
 
     failed = manager.rounds / "002"
@@ -1728,15 +1734,27 @@ def test_compact_artifacts_removes_success_diagnostics_but_keeps_failure_logs(
         json.dumps({"experiment_id": "001/002", "status": "failed", "error": "boom"}),
         encoding="utf-8",
     )
+    (failed / "agent-output.json").write_text(
+        json.dumps({"hypothesis": "legacy failed hypothesis"}),
+        encoding="utf-8",
+    )
     (failed / "opencode-events.jsonl").write_text("failure detail\n", encoding="utf-8")
+    (failed / "opencode-events.attempt-001.jsonl").write_text(
+        "retry failure detail\n",
+        encoding="utf-8",
+    )
     (failed / "tests.log").write_text("failure detail\n", encoding="utf-8")
 
     summary = manager.compact_artifacts()
 
-    assert summary["removed_files"] == 4
+    assert summary["removed_files"] == 6
     assert sorted(path.name for path in completed.iterdir()) == ["result.json"]
+    assert not (failed / "agent-output.json").exists()
     assert (failed / "opencode-events.jsonl").exists()
+    assert (failed / "opencode-events.attempt-001.jsonl").exists()
     assert (failed / "tests.log").exists()
+    failed_result = json.loads((failed / "result.json").read_text(encoding="utf-8"))
+    assert failed_result["hypothesis"] == "legacy failed hypothesis"
 
 
 def test_clear_diagnostics_removes_only_diagnostic_cache(tmp_path: Path) -> None:

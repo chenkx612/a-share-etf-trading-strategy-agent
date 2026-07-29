@@ -2583,7 +2583,6 @@ def _run_once_impl(
             message="restored candidate checkpoint after Round deadline",
             **event_details,
         )
-        events_path.unlink(missing_ok=True)
     elif exit_code != 0:
         _emit(event_sink, "agent_failed", message="agent failed", **event_details)
         return _write_failed(
@@ -2602,7 +2601,6 @@ def _run_once_impl(
                 "OpenCode produced invalid agent output",
                 round_timing=round_timing,
             )
-        events_path.unlink(missing_ok=True)
         _emit(event_sink, "agent_completed", message="agent completed", **event_details)
         if agent_output["status"] == "blocked":
             return _write_failed(
@@ -2800,6 +2798,11 @@ def run_once(
     result["evaluation_environment_sha256"] = environment.sha256
     ExperimentResult.from_mapping(result)
     write_json_atomic(result_path, result)
+    if result["status"] == "completed":
+        output = Path(output_dir).resolve()
+        (output / "opencode-events.jsonl").unlink(missing_ok=True)
+        for attempt_log in output.glob("opencode-events.attempt-*.jsonl"):
+            attempt_log.unlink(missing_ok=True)
     return result_path
 
 
