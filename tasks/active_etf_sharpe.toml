@@ -1,5 +1,4 @@
-id = "sharpe-corr-threshold-active-etf-walk-forward"
-aliases = ["active-etf-sharpe"]
+id = "active-etf-sharpe"
 goal = """
 在固定的 universes/active_etf_rotation.csv 候选池上研发并评估
 sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后验收益筛选的股票池。

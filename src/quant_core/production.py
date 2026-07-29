@@ -511,6 +511,17 @@ def _refresh_data(
     return merged
 
 
+def closed_market_data_end(
+    requested: date,
+    *,
+    now: datetime | None = None,
+) -> date:
+    current = now or datetime.now(SHANGHAI)
+    if requested >= current.date() and (current.hour, current.minute) < (15, 0):
+        return current.date() - timedelta(days=1)
+    return requested
+
+
 def resolve_signal_date(
     daily: pd.DataFrame,
     requested: date,
@@ -518,10 +529,7 @@ def resolve_signal_date(
     now: datetime | None = None,
 ) -> pd.Timestamp:
     dates = pd.DatetimeIndex(pd.to_datetime(daily["date"]).dt.normalize().unique()).sort_values()
-    current = now or datetime.now(SHANGHAI)
-    cutoff = pd.Timestamp(requested)
-    if requested >= current.date() and (current.hour, current.minute) < (15, 0):
-        cutoff = pd.Timestamp(current.date()) - pd.Timedelta(days=1)
+    cutoff = pd.Timestamp(closed_market_data_end(requested, now=now))
     eligible = dates[dates <= cutoff]
     if eligible.empty:
         raise RuntimeError(f"no closed trading date is available on or before {requested}")
@@ -834,18 +842,21 @@ def run_recommendation(
     *,
     requested_date: date | None = None,
     skip_refresh: bool = False,
+    now: datetime | None = None,
 ) -> Path:
     context: ProductionContext | None = None
     signal_date: pd.Timestamp | None = None
     try:
         context = load_production_context(root, task_path)
-        requested = requested_date or datetime.now(SHANGHAI).date()
-        daily_raw = _refresh_data(context, requested, skip_refresh=skip_refresh)
+        current = now or datetime.now(SHANGHAI)
+        requested = requested_date or current.date()
+        refresh_end = closed_market_data_end(requested, now=current)
+        daily_raw = _refresh_data(context, refresh_end, skip_refresh=skip_refresh)
         normalized_symbols = daily_raw["symbol"].map(_normalize_symbol)
         universe_raw = daily_raw[
             normalized_symbols.isin(set(context.universe["symbol"]))
         ].copy()
-        signal_date = resolve_signal_date(universe_raw, requested)
+        signal_date = resolve_signal_date(universe_raw, requested, now=current)
         daily = _validate_daily_requirements(daily_raw, context, signal_date)
         universe_daily = daily[daily["symbol"].isin(set(context.universe["symbol"]))]
         all_dates = pd.DatetimeIndex(universe_raw["date"].unique()).sort_values()

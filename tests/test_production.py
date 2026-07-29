@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +18,7 @@ from quant_core.production import (
     StrategyDataRequirements,
     _historical_boundaries,
     _load_requirements,
+    closed_market_data_end,
     is_schedule_boundary,
     next_schedule_boundary,
     resolve_signal_date,
@@ -428,6 +429,68 @@ def test_signal_date_never_uses_an_unclosed_current_session() -> None:
         pd.Timestamp("2026-07-24").date(),
         now=datetime(2026, 7, 24, 14, 59, tzinfo=pd.Timestamp.now(tz="Asia/Shanghai").tz),
     ) == pd.Timestamp("2026-07-23")
+
+
+def test_market_data_refresh_uses_previous_date_before_current_session_closes() -> None:
+    early_morning = datetime(
+        2026,
+        7,
+        30,
+        0,
+        30,
+        tzinfo=pd.Timestamp.now(tz="Asia/Shanghai").tz,
+    )
+
+    assert closed_market_data_end(
+        pd.Timestamp("2026-07-30").date(),
+        now=early_morning,
+    ) == pd.Timestamp("2026-07-29").date()
+    assert closed_market_data_end(
+        pd.Timestamp("2026-07-29").date(),
+        now=early_morning,
+    ) == pd.Timestamp("2026-07-29").date()
+
+
+def test_recommendation_applies_preclose_cutoff_before_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = context(tmp_path)
+    daily = sample_daily()
+    refresh_dates: list[date] = []
+    early_morning = datetime(
+        2026,
+        7,
+        30,
+        0,
+        30,
+        tzinfo=pd.Timestamp.now(tz="Asia/Shanghai").tz,
+    )
+    monkeypatch.setattr(
+        "quant_core.production.load_production_context",
+        lambda root, task_path: ctx,
+    )
+
+    def fake_refresh(
+        production_context: ProductionContext,
+        requested: date,
+        *,
+        skip_refresh: bool,
+    ) -> pd.DataFrame:
+        refresh_dates.append(requested)
+        return daily
+
+    monkeypatch.setattr("quant_core.production._refresh_data", fake_refresh)
+
+    summary_path = run_recommendation(
+        tmp_path,
+        ctx.task_path,
+        now=early_morning,
+    )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    assert refresh_dates == [pd.Timestamp("2026-07-29").date()]
+    assert summary["signal_date"] == "2026-07-24"
 
 
 def test_search_is_deterministic_and_uses_only_data_through_signal(tmp_path: Path) -> None:

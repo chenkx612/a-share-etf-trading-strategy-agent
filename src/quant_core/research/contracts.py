@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import tomllib
 from dataclasses import dataclass
 from datetime import date
@@ -46,7 +47,20 @@ class ResearchTask:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> ResearchTask:
-        _required(data, "id", str, "task")
+        task_id = _required(data, "id", str, "task")
+        name_words = [word for word in re.split(r"[-_.]+", task_id) if word]
+        long_name_reason = data.get("long_name_reason")
+        if len(name_words) > 3 and (
+            not isinstance(long_name_reason, str) or not long_name_reason.strip()
+        ):
+            raise ValueError(
+                "task.id must contain at most three words separated by '-', '_' or '.'; "
+                "exceptional longer names require a non-empty task.long_name_reason"
+            )
+        if long_name_reason is not None and (
+            not isinstance(long_name_reason, str) or not long_name_reason.strip()
+        ):
+            raise ValueError("task.long_name_reason must be a non-empty string when present")
         _required(data, "goal", str, "task")
         budget = _required(data, "budget", dict, "task")
         for key in ("max_rounds", "max_hours", "max_consecutive_failures"):
@@ -76,21 +90,8 @@ class ResearchTask:
         source = _required(data, "data", dict, "task")
         _required(source, "universe", str, "task.data")
 
-        aliases = data.get("aliases", [])
-        if (
-            not isinstance(aliases, list)
-            or not all(
-                isinstance(alias, str)
-                and alias
-                and Path(alias).name == alias
-                and not alias.endswith(".toml")
-                for alias in aliases
-            )
-            or len(set(aliases)) != len(aliases)
-        ):
-            raise ValueError(
-                "task.aliases must contain unique non-empty task-reference names"
-            )
+        if "aliases" in data:
+            raise ValueError("task.aliases is not supported; use task.id directly")
 
         strategy = data.get("strategy")
         if strategy is not None:

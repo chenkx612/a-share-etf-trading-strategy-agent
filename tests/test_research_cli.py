@@ -68,7 +68,7 @@ def test_loop_shortcut_resolves_task_stem_and_enables_diagnostics(
     tasks.mkdir()
     task_path = tasks / "sample_task.toml"
     task_path.write_text(
-        'id = "sample-task"\naliases = ["sample"]\n',
+        'id = "sample-task"\n',
         encoding="utf-8",
     )
     received: list[argparse.Namespace] = []
@@ -97,13 +97,13 @@ def test_loop_shortcut_accepts_task_id_and_explicit_path(
     tasks.mkdir()
     task_path = tasks / "sample_task.toml"
     task_path.write_text(
-        'id = "sample-task"\naliases = ["sample"]\n',
+        'id = "sample-task"\n',
         encoding="utf-8",
     )
     received: list[argparse.Namespace] = []
     monkeypatch.setattr(cli, "command_research_loop", received.append)
 
-    for reference in ("sample-task", "sample", "sample_task.toml", str(task_path)):
+    for reference in ("sample-task", "sample_task.toml", str(task_path)):
         args = cli.build_parser().parse_args([
             "--root",
             str(tmp_path),
@@ -112,7 +112,7 @@ def test_loop_shortcut_accepts_task_id_and_explicit_path(
         ])
         args.func(args)
 
-    assert [args.task for args in received] == [str(task_path.resolve())] * 4
+    assert [args.task for args in received] == [str(task_path.resolve())] * 3
     assert all(args.retain_diagnostics is False for args in received)
 
 
@@ -138,23 +138,6 @@ def test_loop_shortcut_reports_unknown_and_ambiguous_tasks(
             research_root=".research",
             retain_diagnostics=False,
         ))
-
-    (tasks / "first.toml").write_text(
-        'id = "first-task"\naliases = ["short"]\n',
-        encoding="utf-8",
-    )
-    (tasks / "second.toml").write_text(
-        'id = "second-task"\naliases = ["short"]\n',
-        encoding="utf-8",
-    )
-    with pytest.raises(SystemExit, match="task reference is ambiguous: short"):
-        cli.command_loop(argparse.Namespace(
-            task="short",
-            root=str(tmp_path),
-            research_root=".research",
-            retain_diagnostics=False,
-        ))
-
 
 def test_legacy_research_loop_command_remains_available() -> None:
     args = cli.build_parser().parse_args([

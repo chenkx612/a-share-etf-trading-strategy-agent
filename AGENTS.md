@@ -54,6 +54,11 @@ at `.research/<task-id>/champion.py`, its metadata at `champion.json`, and immut
 `.research/<task-id>/runs/<run>/rounds/<round>/`. It must remain isolated from
 normal framework outputs.
 
+Use the canonical `task.id` directly; task aliases are not supported. Keep task IDs
+to at most three words separated by `-`, `_`, or `.`. A longer ID is reserved for
+exceptional compatibility cases and must declare a non-empty `long_name_reason`
+in `task.toml`.
+
 ## Build, Test, and Development Commands
 
 - `conda run --no-capture-output -n quant python -m pip install -e ".[dev]"`:

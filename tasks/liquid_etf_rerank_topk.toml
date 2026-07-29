@@ -1,4 +1,5 @@
 id = "liquid-etf-rerank-topk"
+long_name_reason = "Preserve the established task identity and its managed Champion history."
 goal = """
 继续研发面向 universes/liquid_etf_rotation.csv 的纯多头 ETF 横截面精排策略。本任务已经完成 0→1：当前 Champion 是“中期动量 Top-N + 逆波动 Top-N”的双袖套组合，按 mom_sleeve_weight 合并权重，使用 90/120 日动量、60 日波动率、Top-1/Top-2 和可选收益/波动打分。新一轮必须以任务级 Champion 为父版本做增量研发，不得重新建立无关基线，也不得修改或绕过固定 evaluator。
 

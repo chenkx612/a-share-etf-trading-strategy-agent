@@ -1,4 +1,5 @@
 id = "active-etf-rerank-topk"
+long_name_reason = "Preserve the established task identity and its managed Champion history."
 goal = """
 继续研发 active-etf-rerank-topk 任务管理的当前 Champion。新的 Loop 必须以 `.research/active-etf-rerank-topk/champion.py` 对应的已晋级策略为唯一比较基线，不再回到原 liquid-etf-rerank-topk、迁移前工作区版本或本任务 Run 001 的早期候选。所有候选只与 Harness 在本任务中管理的当前 Champion 比较，Promotion 仍完全由固定 evaluator 决定。
 

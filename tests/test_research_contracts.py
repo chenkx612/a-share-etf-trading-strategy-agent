@@ -202,15 +202,33 @@ def test_task_requires_positive_budget() -> None:
         ResearchTask.from_mapping(payload)
 
 
-@pytest.mark.parametrize(
-    "aliases",
-    [["same", "same"], [""], ["nested/task"], ["task.toml"], "task"],
-)
-def test_task_rejects_invalid_aliases(aliases: object) -> None:
+def test_task_rejects_aliases() -> None:
     payload = fixed_task()
-    payload["aliases"] = aliases
+    payload["aliases"] = ["short-name"]
 
     with pytest.raises(ValueError, match="task.aliases"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_task_limits_id_to_three_words_without_documented_exception() -> None:
+    payload = fixed_task()
+    payload["id"] = "one-two-three-four"
+
+    with pytest.raises(ValueError, match="at most three words"):
+        ResearchTask.from_mapping(payload)
+
+    payload["long_name_reason"] = "Compatibility with existing managed history."
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.task_id == "one-two-three-four"
+
+
+@pytest.mark.parametrize("reason", ["", "   ", 1])
+def test_task_rejects_invalid_long_name_reason(reason: object) -> None:
+    payload = fixed_task()
+    payload["long_name_reason"] = reason
+
+    with pytest.raises(ValueError, match="task.long_name_reason"):
         ResearchTask.from_mapping(payload)
 
 
