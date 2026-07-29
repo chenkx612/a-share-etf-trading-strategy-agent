@@ -33,11 +33,33 @@
 
 | 优先级 | 问题 |
 | --- | --- |
+| P1 | Agent 主动报告 blocked 时会丢失失败会话事件 |
 | P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
 | P2 | 中断或基础设施失败仍会消耗研发轮次 |
 | P2 | 每轮结构归因警告错误地把拒绝候选称为已接受候选 |
 
 ## 一、待解决问题
+
+### P1：推荐解决
+
+#### Agent 主动报告 blocked 时会丢失失败会话事件
+
+- **问题**：`sharpe-corr-threshold-active-etf-walk-forward` Run 003 Round 002 的 OpenCode 进程正常
+  退出并返回 `status=blocked`，Round 因 `finalization_reserve_reached` 记为 failed；耐久目录保留了
+  Development 异常栈和两个 checkpoint，却没有 `opencode-events.jsonl`。相邻的 Round 003 因外层
+  deadline 失败时则保留了完整事件流。代码中正常退出分支在解析 Agent 输出后、检查 `blocked` 之前
+  立即删除事件文件；即使前一处改为保留，`compact_artifacts()` 也会因曾存在 `agent-output.json`
+  而再次删除失败事件。结果是模型主动报告失败这一合法路径只剩模型撰写的摘要，无法复核其工具调用、
+  finalization reserve 前的预算使用、最后 checkpoint 处理或失败分类；同任务 Run 002 的类似 failed
+  Round 也呈现相同缺口。
+- **方案**：以最终 Round 状态而不是 OpenCode 进程退出码或 `agent-output.json` 是否存在决定事件
+  保留。仅在 Round 成功完成且必要耐久事实已冻结后清理 Agent 事件；`blocked`、无效输出、越界修改、
+  测试/评测失败及其他 failed 路径均保留经脱敏的事件流。同步修改终局压缩条件，避免二次删除失败日志。
+- **验证**：覆盖“进程退出 0 + Agent 返回 blocked”会保留事件且经过 `compact_artifacts()` 后仍存在，
+  completed Round 仍清理冗余事件；另覆盖带 `agent-output.json` 的测试/评测失败、deadline、
+  infrastructure failure 和认证信息脱敏，确保所有失败路径都有足以重建阶段与工具调用的日志。
+- **风险**：失败会话可能较大并含 Provider 输出，因此仍需沿用认证信息脱敏和失败工件保留策略；本问题
+  未改变 Run 003 的 Gate 指标、Promotion 或最终 Champion，但削弱了失败轮的诊断与审计完整性。
 
 ### P2：有时间时优化
 
