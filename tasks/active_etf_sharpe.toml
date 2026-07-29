@@ -1,10 +1,21 @@
 id = "active-etf-sharpe"
 goal = """
-在固定的 universes/active_etf_rotation.csv 候选池上研发并评估
+在固定的 universes/active_etf_rotation.csv 候选池上继续研发并评估
 sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后验收益筛选的股票池。
 本任务使用独立 task id；不得继承旧 sector_rotation.csv 股票池下的 Champion、参数结论、
-Gate 指标或研究记忆。首次运行以工作区当前策略为基线，并由 Harness 在本任务的固定契约下
-重新评估。
+Gate 指标或研究记忆。后续 Run 必须以 Harness 管理并同步到工作区的本任务当前 Champion
+作为 Parent，不得重置为任务创建前的工作区基线。
+
+当前 Parent 是滚动 Sharpe、sticky 再平衡、max_gross 槽位等权、止损和 soft-correlation
+贪心选择的组合结构。该结构来自多项同时变化的已接受候选，只能作为待继续改进的整体，
+不得把历史表现归因于其中任一单独机制。后续每轮只改变一个可证伪的主要机制，保持其余
+Parent 逻辑不变，并用最小补丁和小型、确定的参数网格建立清晰对照。
+
+下一阶段优先改善 Development walk-forward 的跨折稳健性和训练窗参数可行性，避免结果依赖
+少数可行折、单个参数点或全区间回测。减少 no_feasible_parameter_folds 是诊断目标，不是
+绕过晋级条件的替代指标；候选仍须先满足硬约束，并在 Development 中显示相对 Parent 的
+可解释改善，才值得提交 Gate。Harness 会提供不含精确 Gate 指标的既往研究历史；不得原样
+重复已拒绝的实现，除非新假设、作用路径和参数化方式均有实质区别。
 
 active_etf_rotation.csv 只决定允许参与的 symbol 集合。fund_size 是当前时点的审计字段，
 不得进入历史打分、权重、阈值或参数选择。该 CSV 是当前成分快照，因此仍存在幸存者偏差；
@@ -33,7 +44,7 @@ symbol、target_weight 的 DataFrame。权重必须有限、非负且每日总�
 
 [budget]
 max_rounds = 10
-max_hours = 4
+max_hours = 6
 max_consecutive_failures = 3
 round_minutes = 30
 
