@@ -202,6 +202,18 @@ def test_task_requires_positive_budget() -> None:
         ResearchTask.from_mapping(payload)
 
 
+@pytest.mark.parametrize(
+    "aliases",
+    [["same", "same"], [""], ["nested/task"], ["task.toml"], "task"],
+)
+def test_task_rejects_invalid_aliases(aliases: object) -> None:
+    payload = fixed_task()
+    payload["aliases"] = aliases
+
+    with pytest.raises(ValueError, match="task.aliases"):
+        ResearchTask.from_mapping(payload)
+
+
 def test_task_requires_positive_round_minutes_when_present() -> None:
     payload = fixed_task()
     payload["budget"]["round_minutes"] = 0
@@ -214,6 +226,53 @@ def test_task_accepts_strict_production_contract() -> None:
     task = ResearchTask.from_mapping(production_task())
     assert task.production is not None
     assert task.production["schedule"]["period"] == "calendar_month"
+
+
+def test_task_accepts_explicit_production_data_requirements() -> None:
+    payload = production_task()
+    payload["production"]["data_requirements"] = {
+        "required_columns": ["date", "symbol", "open", "close"],
+        "min_history": 125,
+    }
+
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.production is not None
+    assert task.production["data_requirements"]["min_history"] == 125
+
+
+@pytest.mark.parametrize(
+    ("requirements", "message"),
+    [
+        (
+            {"required_columns": ["date", "symbol", "open"], "min_history": 125},
+            "must include date, symbol, open, and close",
+        ),
+        (
+            {
+                "required_columns": ["date", "symbol", "open", "close", "close"],
+                "min_history": 125,
+            },
+            "unique non-empty strings",
+        ),
+        (
+            {
+                "required_columns": ["date", "symbol", "open", "close"],
+                "min_history": 0,
+            },
+            "positive integer",
+        ),
+    ],
+)
+def test_task_rejects_invalid_production_data_requirements(
+    requirements: dict[str, object],
+    message: str,
+) -> None:
+    payload = production_task()
+    payload["production"]["data_requirements"] = requirements
+
+    with pytest.raises(ValueError, match=message):
+        ResearchTask.from_mapping(payload)
 
 
 def test_walk_forward_rejects_legacy_start_anchored_frequency_fields() -> None:

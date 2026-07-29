@@ -17,6 +17,7 @@ from quant_core.production import (
     SearchResult,
     StrategyDataRequirements,
     _historical_boundaries,
+    _load_requirements,
     is_schedule_boundary,
     next_schedule_boundary,
     resolve_signal_date,
@@ -131,6 +132,54 @@ def context(root: Path) -> ProductionContext:
         hashes={"strategy": "a", "champion": "a"},
         champion={"champion_number": 1, "champion_round_id": "001/001"},
     )
+
+
+def test_load_requirements_accepts_explicit_task_contract() -> None:
+    requirements = _load_requirements(
+        SimpleNamespace(),
+        {
+            "required_columns": ["date", "symbol", "open", "close"],
+            "min_history": 125,
+        },
+    )
+
+    assert requirements == StrategyDataRequirements(
+        ("date", "symbol", "open", "close"),
+        125,
+    )
+
+
+def test_load_requirements_prefers_fixed_task_contract() -> None:
+    strategy = SimpleNamespace(
+        data_requirements=lambda: {
+            "required_columns": ["date", "symbol", "open", "close"],
+            "min_history": 1,
+        }
+    )
+
+    requirements = _load_requirements(
+        strategy,
+        {
+            "required_columns": [
+                "date",
+                "symbol",
+                "name",
+                "open",
+                "close",
+            ],
+            "min_history": 125,
+        },
+    )
+
+    assert requirements == StrategyDataRequirements(
+        ("date", "symbol", "name", "open", "close"),
+        125,
+    )
+
+
+def test_load_requirements_requires_strategy_or_task_declaration() -> None:
+    with pytest.raises(ValueError, match="must be declared"):
+        _load_requirements(SimpleNamespace())
 
 
 def test_cli_recommend_is_task_action_and_old_today_options_are_rejected() -> None:

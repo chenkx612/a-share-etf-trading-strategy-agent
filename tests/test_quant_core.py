@@ -22,6 +22,7 @@ from quant_core.data.market_data import (
 from quant_core.factors import compute_factors
 from quant_core.strategy.sharpe_corr_threshold import (
     SharpeCorrThresholdParams,
+    _select_soft_corr,
     select_sharpe_corr_threshold,
 )
 
@@ -146,7 +147,12 @@ def test_sharpe_corr_threshold_leaves_cash_and_can_liquidate() -> None:
         0.8, -0.2,
         -0.1, -0.3,
     ]
-    params = SharpeCorrThresholdParams(top_n=2, corr_window=1)
+    params = SharpeCorrThresholdParams(
+        top_n=2,
+        corr_window=1,
+        rebalance_every=1,
+        max_gross=1.0,
+    )
 
     selected = select_sharpe_corr_threshold(
         factors,
@@ -163,6 +169,68 @@ def test_sharpe_corr_threshold_leaves_cash_and_can_liquidate() -> None:
 
     result = run_backtest(daily, selected, fee_rate=0.0)
     assert dates[3] not in set(result.positions["date"])
+
+
+def test_sharpe_corr_threshold_does_not_fill_missing_closes() -> None:
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    factors = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": ["510300"] * 3,
+            "name": ["ETF510300"] * 3,
+            "close": [100.0, float("nan"), 80.0],
+            "sharpe_25": [1.0, 1.0, 1.0],
+        }
+    )
+
+    selected = select_sharpe_corr_threshold(
+        factors,
+        SharpeCorrThresholdParams(
+            top_n=1,
+            corr_window=1,
+            rebalance_every=10,
+            max_gross=1.0,
+        ),
+        start=dates[0],
+        end=dates[-1],
+        universe_symbols={"510300"},
+    )
+
+    assert selected["date"].tolist() == list(dates)
+    assert selected.attrs["filter_events"] == []
+
+
+def test_soft_corr_diagnostic_uses_skipped_asset_penalty() -> None:
+    candidates = pd.Series(
+        [3.0, 2.0, 1.0],
+        index=["A", "B", "C"],
+    )
+    corr = pd.DataFrame(
+        [
+            [1.0, 0.9, 0.0],
+            [0.9, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        index=["A", "B", "C"],
+        columns=["A", "B", "C"],
+    )
+    events: list[dict[str, object]] = []
+
+    selected = _select_soft_corr(
+        candidates,
+        corr,
+        top_n=2,
+        corr_lambda=2.0,
+        filter_events=events,
+        date=pd.Timestamp("2026-07-24"),
+        names={"A": "A", "B": "B", "C": "C"},
+    )
+
+    assert selected == ["A", "C"]
+    assert len(events) == 1
+    assert events[0]["symbol"] == "B"
+    assert events[0]["selected_symbol"] == "C"
+    assert events[0]["mean_corr_to_selected"] == pytest.approx(0.9)
 
 
 def test_sharpe_corr_threshold_stop_loss_filters_single_day_candidates() -> None:

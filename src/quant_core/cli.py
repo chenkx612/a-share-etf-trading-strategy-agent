@@ -537,7 +537,7 @@ def command_research_loop(args: argparse.Namespace) -> None:
 
 
 def resolve_research_task_reference(reference: str, workspace: str | Path = ".") -> Path:
-    """Resolve a task path, tasks/<stem>.toml, or a task id."""
+    """Resolve a task path, tasks/<stem>.toml, task id, or configured alias."""
     explicit = Path(reference).expanduser()
     workspace_path = Path(workspace).resolve()
     tasks_dir = workspace_path / "tasks"
@@ -552,21 +552,28 @@ def resolve_research_task_reference(reference: str, workspace: str | Path = ".")
                 return path.resolve()
         raise ValueError(f"task file does not exist: {reference}")
 
-    candidates: list[tuple[Path, str]] = []
+    candidates: list[tuple[Path, str, tuple[str, ...]]] = []
     if tasks_dir.is_dir():
         for path in sorted(tasks_dir.glob("*.toml")):
             try:
                 with path.open("rb") as handle:
-                    task_id = tomllib.load(handle).get("id")
+                    payload = tomllib.load(handle)
+                    task_id = payload.get("id")
+                    raw_aliases = payload.get("aliases", [])
             except (OSError, tomllib.TOMLDecodeError):
                 continue
             if isinstance(task_id, str) and task_id:
-                candidates.append((path.resolve(), task_id))
+                aliases = tuple(
+                    alias
+                    for alias in raw_aliases
+                    if isinstance(alias, str) and alias
+                ) if isinstance(raw_aliases, list) else ()
+                candidates.append((path.resolve(), task_id, aliases))
 
     matches = {
         path
-        for path, task_id in candidates
-        if reference == path.stem or reference == task_id
+        for path, task_id, aliases in candidates
+        if reference == path.stem or reference == task_id or reference in aliases
     }
     if len(matches) == 1:
         return matches.pop()
@@ -574,7 +581,7 @@ def resolve_research_task_reference(reference: str, workspace: str | Path = ".")
         matched = ", ".join(str(path.relative_to(workspace_path)) for path in sorted(matches))
         raise ValueError(f"task reference is ambiguous: {reference} ({matched})")
 
-    available = ", ".join(path.stem for path, _task_id in candidates) or "none"
+    available = ", ".join(path.stem for path, _task_id, _aliases in candidates) or "none"
     raise ValueError(f"unknown task: {reference}; available tasks: {available}")
 
 
@@ -832,7 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recommend.add_argument(
         "task",
-        help="task file, tasks/<name>.toml stem, or task id",
+        help="task file, tasks/<name>.toml stem, task id, or configured alias",
     )
     recommend.add_argument("--date", help="requested ISO date; defaults to today in Shanghai")
     recommend.add_argument(

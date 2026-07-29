@@ -43,7 +43,7 @@ from quant_core.schedule import (
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 PRODUCTION_SCHEMA_VERSION = 1
 EXECUTION_SEMANTICS = "close-signal/next-open-trade/open-to-open-return/v1"
-REQUIRED_STRATEGY_FUNCTIONS = ("parameter_grid", "select_with_params", "data_requirements")
+REQUIRED_STRATEGY_FUNCTIONS = ("parameter_grid", "select_with_params")
 
 
 class ParameterSearchError(RuntimeError):
@@ -138,8 +138,20 @@ def _load_grid(module: ModuleType, maximum: int) -> tuple[dict[str, object], ...
     return tuple(result)
 
 
-def _load_requirements(module: ModuleType) -> StrategyDataRequirements:
-    value = module.data_requirements()
+def _load_requirements(
+    module: ModuleType,
+    configured: Mapping[str, object] | None = None,
+) -> StrategyDataRequirements:
+    provider = getattr(module, "data_requirements", None)
+    if configured is not None:
+        value = dict(configured)
+    elif callable(provider):
+        value = provider()
+    else:
+        raise ValueError(
+            "production data requirements must be declared by strategy "
+            "data_requirements() or task.production.data_requirements"
+        )
     if not isinstance(value, dict) or set(value) != {"required_columns", "min_history"}:
         raise ValueError(
             "data_requirements() must return exactly required_columns and min_history"
@@ -208,7 +220,13 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
             raise ValueError(f"production strategy must define callable {name}()")
     maximum = int(production["max_parameter_sets"])
     grid = _load_grid(module, maximum)
-    requirements = _load_requirements(module)
+    configured_requirements = production.get("data_requirements")
+    requirements = _load_requirements(
+        module,
+        configured_requirements
+        if isinstance(configured_requirements, Mapping)
+        else None,
+    )
 
     universe_path = root_path / str(task.raw["data"]["universe"])
     universe = load_universe(universe_path)

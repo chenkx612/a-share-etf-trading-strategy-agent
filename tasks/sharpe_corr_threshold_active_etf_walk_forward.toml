@@ -1,4 +1,5 @@
 id = "sharpe-corr-threshold-active-etf-walk-forward"
+aliases = ["active-etf-sharpe"]
 goal = """
 在固定的 universes/active_etf_rotation.csv 候选池上研发并评估
 sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后验收益筛选的股票池。
@@ -51,6 +52,38 @@ mode = "workspace"
 
 [data]
 universe = "universes/active_etf_rotation.csv"
+
+[production]
+train_months = 12
+objective = "sortino"
+max_parameter_sets = 64
+curve_months = 12
+benchmark = "510300"
+
+[production.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
+
+[production.constraints]
+annual_return = { operator = ">=", threshold = 0.05 }
+max_drawdown = { operator = "abs<=", threshold = 0.15 }
+avg_turnover = { operator = "<=", threshold = 0.30 }
+
+[production.data_requirements]
+required_columns = [
+  "date",
+  "symbol",
+  "name",
+  "open",
+  "high",
+  "low",
+  "close",
+  "volume",
+  "amount",
+  "turnover",
+]
+min_history = 125
 
 [scope]
 editable = [

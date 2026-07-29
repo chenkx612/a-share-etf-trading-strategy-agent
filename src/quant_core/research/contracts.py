@@ -76,6 +76,22 @@ class ResearchTask:
         source = _required(data, "data", dict, "task")
         _required(source, "universe", str, "task.data")
 
+        aliases = data.get("aliases", [])
+        if (
+            not isinstance(aliases, list)
+            or not all(
+                isinstance(alias, str)
+                and alias
+                and Path(alias).name == alias
+                and not alias.endswith(".toml")
+                for alias in aliases
+            )
+            or len(set(aliases)) != len(aliases)
+        ):
+            raise ValueError(
+                "task.aliases must contain unique non-empty task-reference names"
+            )
+
         strategy = data.get("strategy")
         if strategy is not None:
             if not isinstance(strategy, dict) or set(strategy) != {"name", "module"}:
@@ -100,10 +116,12 @@ class ResearchTask:
                 "curve_months",
                 "benchmark",
             }
-            if set(production) != expected:
+            optional = {"data_requirements"}
+            if not expected.issubset(production) or set(production) - expected - optional:
                 raise ValueError(
-                    "task.production must contain exactly schedule, train_months, "
-                    "objective, constraints, max_parameter_sets, curve_months, and benchmark"
+                    "task.production must contain schedule, train_months, objective, "
+                    "constraints, max_parameter_sets, curve_months, and benchmark, with "
+                    "optional data_requirements"
                 )
             schedule = validate_schedule(
                 _required(production, "schedule", dict, "task.production"),
@@ -162,6 +180,42 @@ class ResearchTask:
                     raise ValueError(
                         f"task.production.constraints.{name}.threshold must be numeric "
                         "and finite"
+                    )
+            requirements = production.get("data_requirements")
+            if requirements is not None:
+                if not isinstance(requirements, dict) or set(requirements) != {
+                    "required_columns",
+                    "min_history",
+                }:
+                    raise ValueError(
+                        "task.production.data_requirements must contain exactly "
+                        "required_columns and min_history"
+                    )
+                columns = requirements.get("required_columns")
+                if (
+                    not isinstance(columns, list)
+                    or not columns
+                    or not all(isinstance(column, str) and column for column in columns)
+                    or len(set(columns)) != len(columns)
+                ):
+                    raise ValueError(
+                        "task.production.data_requirements.required_columns must be "
+                        "unique non-empty strings"
+                    )
+                if not {"date", "symbol", "open", "close"}.issubset(columns):
+                    raise ValueError(
+                        "task.production.data_requirements.required_columns must include "
+                        "date, symbol, open, and close"
+                    )
+                min_history = requirements.get("min_history")
+                if (
+                    not isinstance(min_history, int)
+                    or isinstance(min_history, bool)
+                    or min_history < 1
+                ):
+                    raise ValueError(
+                        "task.production.data_requirements.min_history must be a "
+                        "positive integer"
                     )
 
         scope = _required(data, "scope", dict, "task")
