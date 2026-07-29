@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -96,20 +97,23 @@ end = "2025-12-31"
 """
 
 WALK_FORWARD_TASK_TOML = TASK_TOML.replace(
-    'mode = "fixed"',
+    '[evaluation]\nmode = "fixed"\nobjective = "sortino"',
+    '[parameter_selection]\n'
+    'train_months = 36\n'
+    'objective = "sortino"\n'
+    'max_parameter_sets = 64\n\n'
+    '[parameter_selection.schedule]\n'
+    'period = "calendar_month"\n'
+    'interval = 1\n'
+    'trigger = "start"\n\n'
+    '[evaluation]\n'
     'mode = "walk_forward"',
 ).replace(
+    "[evaluation.constraints]",
+    "[parameter_selection.constraints]",
+).replace(
     "[evaluation.fixed.development]",
-    """[evaluation.walk_forward]
-train_months = 36
-max_parameter_sets = 64
-
-[evaluation.walk_forward.schedule]
-period = "calendar_month"
-interval = 1
-trigger = "start"
-
-[evaluation.walk_forward.development]""",
+    "[evaluation.walk_forward.development]",
 ).replace(
     "[evaluation.fixed.gate]",
     "[evaluation.walk_forward.gate]",
@@ -2037,8 +2041,10 @@ def test_walk_forward_metrics_cache_key_changes_with_objective_and_constraints()
     first_payload = tomllib.loads(WALK_FORWARD_TASK_TOML)
     objective_payload = tomllib.loads(WALK_FORWARD_TASK_TOML)
     constraint_payload = tomllib.loads(WALK_FORWARD_TASK_TOML)
-    objective_payload["evaluation"]["objective"] = "sharpe"
-    constraint_payload["evaluation"]["constraints"]["max_drawdown"]["threshold"] = 0.15
+    objective_payload["parameter_selection"]["objective"] = "sharpe"
+    constraint_payload["parameter_selection"]["constraints"]["max_drawdown"][
+        "threshold"
+    ] = 0.15
 
     first = ResearchTask.from_mapping(first_payload)
     objective_changed = ResearchTask.from_mapping(objective_payload)
@@ -2046,6 +2052,31 @@ def test_walk_forward_metrics_cache_key_changes_with_objective_and_constraints()
 
     assert _metrics_key(first) != _metrics_key(objective_changed)
     assert _metrics_key(first) != _metrics_key(constraint_changed)
+
+
+def test_walk_forward_metrics_cache_key_preserves_legacy_semantic_shape() -> None:
+    task = ResearchTask.from_mapping(tomllib.loads(WALK_FORWARD_TASK_TOML))
+    assert task.parameter_selection is not None
+    legacy_periods = {
+        key: task.parameter_selection[key]
+        for key in ("train_months", "max_parameter_sets", "schedule")
+    } | dict(task.evaluation_periods)
+    relevant = {
+        "strategy": task.raw.get("strategy"),
+        "data": task.raw["data"],
+        "commands": task.raw["commands"],
+        "evaluation": {
+            "mode": "walk_forward",
+            "objective": task.objective,
+            "constraints": task.constraints,
+            "periods": legacy_periods,
+        },
+    }
+    legacy_key = hashlib.sha256(
+        json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    assert _metrics_key(task) == legacy_key
 
 
 def test_run_once_accepts_compact_blocked_output(tmp_path: Path) -> None:

@@ -353,8 +353,8 @@ def generate_loop_report(
             "id": task.task_id,
             "goal": task.raw["goal"],
             "strategy": task.raw.get("strategy"),
-            "objective": task.raw["evaluation"]["objective"],
-            "constraints": task.raw["evaluation"]["constraints"],
+            "objective": task.objective,
+            "constraints": task.constraints,
             "minimum_improvement": (
                 task.raw["evaluation"].get("acceptance", {}).get("minimum_improvement", 0.0)
             ),

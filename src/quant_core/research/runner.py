@@ -1895,14 +1895,14 @@ def _prompt(
         else "(no prior experiments)"
     )
     comparison_guidance = (
-        f"Gate objective used to compare candidate with champion: {evaluation['objective']}\n"
+        f"Gate objective used to compare candidate with champion: {task.objective}\n"
         f"Minimum objective improvement required for acceptance: {minimum_improvement}\n"
         "A candidate must pass every hard gate constraint. A feasible candidate replaces an "
         "infeasible champion without needing relative objective improvement. Once the champion is "
         "feasible, a candidate must also improve the gate objective by the required amount."
         if has_champion
         else
-        f"There is no champion yet. The first candidate with a numeric gate {evaluation['objective']} "
+        f"There is no champion yet. The first candidate with a numeric gate {task.objective} "
         "that passes every hard gate constraint becomes the initial champion. The configured minimum "
         "improvement does not apply until a champion exists."
     )
@@ -1962,7 +1962,7 @@ def _prompt(
         "The development backtest is silent on success; read the metrics file directly instead "
         "of searching the workspace or treating empty stdout as a failure.",
         comparison_guidance,
-        f"Hard gate constraints: {json.dumps(_constraint_descriptions(evaluation['constraints']), ensure_ascii=False)}",
+        f"Hard gate constraints: {json.dumps(_constraint_descriptions(task.constraints), ensure_ascii=False)}",
         f"Optional absolute target for stopping the loop: {target if target is not None else '(none)'}",
         "Use only the development period. Do not inspect gate or test periods.",
         "If completed, your final response must be exactly one JSON object with string fields status, previous_feedback, hypothesis, attempts, development_effect, and candidate.",
@@ -2371,18 +2371,19 @@ def _run_once_impl(
     development_config: Path | None = None
     agent_development_config: Path | None = None
     if task.evaluation_mode == "walk_forward":
+        assert task.parameter_selection is not None
         base_development_config = {
             "period": dict(task.development_period),
             "walk_forward": {
-                key: task.evaluation_periods[key]
+                key: task.parameter_selection[key]
                 for key in (
                     "train_months",
                     "max_parameter_sets",
                     "schedule",
                 )
             },
-            "constraints": task.raw["evaluation"]["constraints"],
-            "objective": task.raw["evaluation"]["objective"],
+            "constraints": task.constraints,
+            "objective": task.objective,
         }
         development_config = root / ".quant-research-development.json"
         write_json_atomic(development_config, base_development_config)
@@ -2904,14 +2905,13 @@ def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> boo
         gate = gate.get("aggregate")
     if not isinstance(gate, Mapping):
         return False
-    evaluation = task.raw["evaluation"]
-    objective = gate.get(str(evaluation["objective"]))
+    objective = gate.get(task.objective)
     threshold = target["objective_at_least"]
     if not _is_finite_number(objective):
         return False
     return float(objective) >= float(threshold) and all(
         _constraint_passes(gate.get(name), constraint)
-        for name, constraint in evaluation["constraints"].items()
+        for name, constraint in task.constraints.items()
     )
 
 
@@ -2921,7 +2921,8 @@ def _decide(
     candidate: Mapping[str, Any],
 ) -> dict[str, Any]:
     evaluation = task.raw["evaluation"]
-    objective = str(evaluation["objective"])
+    objective = task.objective
+
     def gate_metrics(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
         if not isinstance(value, Mapping):
             return {}
@@ -2939,7 +2940,7 @@ def _decide(
         and champion_gate_is_feasible
         and all(
             _constraint_passes(champion_gate.get(name), constraint)
-            for name, constraint in evaluation["constraints"].items()
+            for name, constraint in task.constraints.items()
         )
     )
     champion_objective_is_finite = _is_finite_number(champion_value)
@@ -2947,7 +2948,7 @@ def _decide(
     minimum_improvement = float(acceptance.get("minimum_improvement", 0.0))
     constraints: dict[str, Any] = {}
     constraints_passed = True
-    for name, constraint in evaluation["constraints"].items():
+    for name, constraint in task.constraints.items():
         actual = candidate_gate.get(name)
         operator, threshold = _constraint_rule(constraint)
         passed = _constraint_passes(actual, constraint)
@@ -2997,15 +2998,22 @@ def _decide(
 
 
 def _metrics_key(task: ResearchTask) -> str:
+    periods = dict(task.evaluation_periods)
+    if task.evaluation_mode == "walk_forward":
+        assert task.parameter_selection is not None
+        periods = {
+            key: task.parameter_selection[key]
+            for key in ("train_months", "max_parameter_sets", "schedule")
+        } | periods
     relevant = {
         "strategy": task.raw.get("strategy"),
         "data": task.raw["data"],
         "commands": task.raw["commands"],
         "evaluation": {
             "mode": task.evaluation_mode,
-            "objective": task.raw["evaluation"]["objective"],
-            "constraints": task.raw["evaluation"]["constraints"],
-            "periods": task.evaluation_periods,
+            "objective": task.objective,
+            "constraints": task.constraints,
+            "periods": periods,
         },
     }
     encoded = json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()

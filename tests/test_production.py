@@ -83,7 +83,7 @@ def sample_daily() -> pd.DataFrame:
 
 
 def context(root: Path) -> ProductionContext:
-    production = {
+    parameter_selection = {
         "schedule": {
             "period": "calendar_month",
             "interval": 1,
@@ -95,12 +95,16 @@ def context(root: Path) -> ProductionContext:
             "max_drawdown": {"operator": "abs<=", "threshold": 0.5},
         },
         "max_parameter_sets": 4,
+    }
+    production = {
         "curve_months": 3,
         "benchmark": "B",
     }
     task = SimpleNamespace(
         task_id="fake-task",
         production=production,
+        parameter_selection=parameter_selection,
+        objective="sortino",
         raw={"data": {"universe": "universes/fake.csv"}},
     )
     task_path = root / "tasks" / "fake.toml"
@@ -533,7 +537,7 @@ def test_success_writes_holdings_summary_curve_and_png(
     assert summary["status"] == "completed"
     assert summary["search_status"] == "searched"
     assert summary["parameter_train_months"] == 3
-    assert summary["parameter_schedule"] == ctx.task.production["schedule"]
+    assert summary["parameter_schedule"] == ctx.task.parameter_selection["schedule"]
     assert summary["last_tuning_date"] == "2026-07-01"
     assert summary["next_tuning_date"] == "2026-08-03"
     assert recommendation["target_weight"].sum() == pytest.approx(1.0)
@@ -756,7 +760,7 @@ def test_failed_search_writes_audit_without_recommendation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ctx = context(tmp_path)
-    ctx.task.production["constraints"]["annual_return"] = {
+    ctx.task.parameter_selection["constraints"]["annual_return"] = {
         "operator": ">=",
         "threshold": 100.0,
     }

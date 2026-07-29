@@ -143,34 +143,29 @@ def walk_forward_task() -> dict:
     }
     payload["commands"]["backtest"].append("{strategy_module}")
     fixed = payload["evaluation"].pop("fixed")
+    objective = payload["evaluation"].pop("objective")
+    constraints = payload["evaluation"].pop("constraints")
     payload["evaluation"]["mode"] = "walk_forward"
-    payload["evaluation"]["walk_forward"] = {
+    payload["parameter_selection"] = {
         "train_months": 36,
+        "objective": objective,
+        "constraints": constraints,
         "max_parameter_sets": 256,
         "schedule": {
             "period": "calendar_month",
             "interval": 1,
             "trigger": "start",
         },
-        **fixed,
     }
+    payload["evaluation"]["walk_forward"] = fixed
     return payload
 
 
 def production_task() -> dict:
     payload = walk_forward_task()
+    payload["parameter_selection"]["train_months"] = 18
+    payload["parameter_selection"]["max_parameter_sets"] = 128
     payload["production"] = {
-        "schedule": {
-            "period": "calendar_month",
-            "interval": 1,
-            "trigger": "start",
-        },
-        "train_months": 18,
-        "objective": "sortino",
-        "constraints": {
-            "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
-        },
-        "max_parameter_sets": 128,
         "curve_months": 12,
         "benchmark": "510300",
     }
@@ -243,7 +238,8 @@ def test_task_requires_positive_round_minutes_when_present() -> None:
 def test_task_accepts_strict_production_contract() -> None:
     task = ResearchTask.from_mapping(production_task())
     assert task.production is not None
-    assert task.production["schedule"]["period"] == "calendar_month"
+    assert task.parameter_selection is not None
+    assert task.parameter_selection["schedule"]["period"] == "calendar_month"
 
 
 def test_task_accepts_explicit_production_data_requirements() -> None:
@@ -303,17 +299,17 @@ def test_walk_forward_rejects_legacy_start_anchored_frequency_fields() -> None:
 
 def test_walk_forward_requires_month_start_schedule() -> None:
     payload = walk_forward_task()
-    payload["evaluation"]["walk_forward"]["schedule"]["trigger"] = "end"
+    payload["parameter_selection"]["schedule"]["trigger"] = "end"
 
     with pytest.raises(ValueError, match="trigger must be start"):
         ResearchTask.from_mapping(payload)
 
 
-def test_production_schedule_must_match_walk_forward_schedule() -> None:
+def test_production_requires_parameter_selection() -> None:
     payload = production_task()
-    payload["production"]["schedule"]["interval"] = 2
+    del payload["parameter_selection"]
 
-    with pytest.raises(ValueError, match="must equal"):
+    with pytest.raises(ValueError, match="parameter_selection is required"):
         ResearchTask.from_mapping(payload)
 
 
@@ -326,18 +322,34 @@ def test_production_schedule_must_match_walk_forward_schedule() -> None:
         (("train_months",), 0, "train_months"),
         (("objective",), "calmar", "objective"),
         (("max_parameter_sets",), 0, "max_parameter_sets"),
-        (("curve_months",), 0, "curve_months"),
-        (("benchmark",), "", "benchmark"),
     ],
 )
-def test_task_rejects_invalid_production_contract(
+def test_task_rejects_invalid_parameter_selection_contract(
     path: tuple[str, ...], value: object, message: str
 ) -> None:
     payload = production_task()
-    target = payload["production"]
+    target = payload["parameter_selection"]
     for key in path[:-1]:
         target = target[key]
     target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
+        ResearchTask.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("curve_months", 0, "curve_months"),
+        ("benchmark", "", "benchmark"),
+        ("objective", "sortino", "parameter search policy belongs"),
+    ],
+)
+def test_task_rejects_invalid_or_legacy_production_contract(
+    key: str, value: object, message: str
+) -> None:
+    payload = production_task()
+    payload["production"][key] = value
+
     with pytest.raises(ValueError, match=message):
         ResearchTask.from_mapping(payload)
 
@@ -440,6 +452,35 @@ def test_task_exposes_evaluator_contract_paths() -> None:
     task = ResearchTask.from_mapping(fixed_task())
 
     assert task.evaluator_contract_paths == ["README.md"]
+
+
+@pytest.mark.parametrize(
+    "task_name",
+    [
+        "active_etf_rerank_topk.toml",
+        "active_etf_sharpe.toml",
+        "liquid_etf_rerank_topk.toml",
+        "sharpe_corr_threshold_optimization.toml",
+    ],
+)
+def test_repository_walk_forward_tasks_use_shared_parameter_selection(
+    task_name: str,
+) -> None:
+    task = ResearchTask.load(REPOSITORY_ROOT / "tasks" / task_name)
+
+    assert task.evaluation_mode == "walk_forward"
+    assert task.parameter_selection is not None
+    assert "objective" not in task.raw["evaluation"]
+    assert "constraints" not in task.raw["evaluation"]
+    assert set(task.evaluation_periods) == {"development", "gate"}
+    if task.production is not None:
+        assert not {
+            "schedule",
+            "train_months",
+            "objective",
+            "constraints",
+            "max_parameter_sets",
+        } & set(task.production)
 
 
 @pytest.mark.parametrize(
@@ -691,6 +732,19 @@ def test_task_accepts_explicit_lower_and_absolute_constraints() -> None:
     }
 
     ResearchTask.from_mapping(payload)
+
+
+def test_fixed_task_accepts_custom_backtest_metrics() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["objective"] = "custom_quality"
+    payload["evaluation"]["constraints"] = {
+        "custom_risk": {"operator": "<=", "threshold": 0.20},
+    }
+
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.objective == "custom_quality"
+    assert "custom_risk" in task.constraints
 
 
 def test_task_rejects_unknown_constraint_operator() -> None:

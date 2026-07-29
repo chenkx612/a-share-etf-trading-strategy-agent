@@ -182,6 +182,8 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
     production = task.production
     if production is None:
         raise ValueError(f"task {task.task_id!r} does not define [production]")
+    parameter_selection = task.parameter_selection
+    assert parameter_selection is not None
     if task.strategy_module is None:
         raise ValueError("production task must define task.strategy.module")
 
@@ -218,7 +220,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
     for name in REQUIRED_STRATEGY_FUNCTIONS:
         if not callable(getattr(module, name, None)):
             raise ValueError(f"production strategy must define callable {name}()")
-    maximum = int(production["max_parameter_sets"])
+    maximum = int(parameter_selection["max_parameter_sets"])
     grid = _load_grid(module, maximum)
     configured_requirements = production.get("data_requirements")
     requirements = _load_requirements(
@@ -247,7 +249,10 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
         "champion": champion_hash,
         "strategy": strategy_hash,
         "universe": _sha256_file(universe_path),
-        "production_policy": _sha256_json(production),
+        "production_policy": _sha256_json({
+            **dict(parameter_selection),
+            **dict(production),
+        }),
         "parameter_grid": _sha256_json(grid),
         "backtest_contract": backtest_contract,
         "execution_contract": _sha256_bytes(
@@ -293,14 +298,16 @@ def search_parameters(
     daily: pd.DataFrame,
     signal_date: pd.Timestamp,
 ) -> SearchResult:
-    production = context.task.production
-    assert production is not None
+    parameter_selection = context.task.parameter_selection
+    assert parameter_selection is not None
     signal = pd.Timestamp(signal_date).normalize()
-    train_start = signal - pd.DateOffset(months=int(production["train_months"]))
+    train_start = signal - pd.DateOffset(
+        months=int(parameter_selection["train_months"])
+    )
     rows: list[dict[str, object]] = []
     feasible: list[tuple[float, str, dict[str, object], dict[str, float]]] = []
-    objective = str(production["objective"])
-    constraints = production["constraints"]
+    objective = str(parameter_selection["objective"])
+    constraints = parameter_selection["constraints"]
     assert isinstance(constraints, Mapping)
     for params in context.grid:
         _, result = evaluate_candidate(
@@ -368,9 +375,13 @@ def _freeze_path(
     signal_date: pd.Timestamp,
     trading_dates: Sequence[pd.Timestamp],
 ) -> Path:
-    production = context.task.production
-    assert production is not None
-    bucket = schedule_bucket(signal_date, production["schedule"], trading_dates)
+    parameter_selection = context.task.parameter_selection
+    assert parameter_selection is not None
+    bucket = schedule_bucket(
+        signal_date,
+        parameter_selection["schedule"],
+        trading_dates,
+    )
     safe_bucket = bucket.replace(":", "-")
     return _parameter_store(context) / f"{safe_bucket}.json"
 
@@ -380,6 +391,8 @@ def _freeze_search(
     result: SearchResult,
     trading_dates: Sequence[pd.Timestamp],
 ) -> Path:
+    parameter_selection = context.task.parameter_selection
+    assert parameter_selection is not None
     path = _freeze_path(context, result.signal_date, trading_dates)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -390,7 +403,7 @@ def _freeze_search(
         "train_end": result.train_end.date().isoformat(),
         "parameters": result.parameters,
         "metrics": result.metrics,
-        "objective": context.task.production["objective"] if context.task.production else None,
+        "objective": str(parameter_selection["objective"]),
         "input_hashes": dict(context.hashes),
         "search_rows": result.rows,
     }
@@ -475,6 +488,8 @@ def _refresh_data(
 
     production = context.task.production
     assert production is not None
+    parameter_selection = context.task.parameter_selection
+    assert parameter_selection is not None
     benchmark = _normalize_symbol(production["benchmark"])
     refresh_universe = context.universe.copy()
     if benchmark not in set(refresh_universe["symbol"]):
@@ -486,7 +501,11 @@ def _refresh_data(
             ignore_index=True,
         )
     history_years = math.ceil(
-        (int(production["train_months"]) + int(production["curve_months"])) / 12
+        (
+            int(parameter_selection["train_months"])
+            + int(production["curve_months"])
+        )
+        / 12
     ) + 1
     try:
         start = requested.replace(year=requested.year - history_years)
@@ -671,6 +690,8 @@ def causal_replay(
 ) -> tuple[pd.DataFrame, Mapping[str, float], list[Mapping[str, object]]]:
     production = context.task.production
     assert production is not None
+    parameter_selection = context.task.parameter_selection
+    assert parameter_selection is not None
     curve_start = signal_date - pd.DateOffset(months=int(production["curve_months"]))
     symbols = set(context.universe["symbol"])
     strategy_daily = daily[daily["symbol"].isin(symbols)].copy()
@@ -684,7 +705,7 @@ def causal_replay(
     all_strategy_dates = pd.DatetimeIndex(strategy_daily["date"].unique()).sort_values()
     boundaries = _historical_boundaries(
         all_strategy_dates[all_strategy_dates <= signal_date],
-        production["schedule"],
+        parameter_selection["schedule"],
         pd.Timestamp(curve_dates[0]),
     )
     selections: list[pd.DataFrame] = []
@@ -863,10 +884,12 @@ def run_recommendation(
         visible_dates = pd.DatetimeIndex(universe_daily["date"].unique()).sort_values()
         production = context.task.production
         assert production is not None
+        parameter_selection = context.task.parameter_selection
+        assert parameter_selection is not None
 
         schedule_boundary = latest_schedule_boundary(
             signal_date,
-            production["schedule"],
+            parameter_selection["schedule"],
             visible_dates,
         )
         expected_path = _freeze_path(context, schedule_boundary, visible_dates)
@@ -907,7 +930,7 @@ def run_recommendation(
         last_tuning_date = pd.Timestamp(freeze_payload["searched_on"]).normalize()
         next_tuning_date = next_schedule_boundary(
             signal_date,
-            production["schedule"],
+            parameter_selection["schedule"],
             visible_dates,
         )
         holdings = _target_holdings(
@@ -949,8 +972,8 @@ def run_recommendation(
                 "signal_date": signal_date.date().isoformat(),
                 "trade_date": trade_date.date().isoformat(),
                 "search_status": search_status,
-                "parameter_train_months": int(production["train_months"]),
-                "parameter_schedule": dict(production["schedule"]),
+                "parameter_train_months": int(parameter_selection["train_months"]),
+                "parameter_schedule": dict(parameter_selection["schedule"]),
                 "last_tuning_date": last_tuning_date.date().isoformat(),
                 "next_tuning_date": next_tuning_date.date().isoformat(),
                 "parameters": parameters,

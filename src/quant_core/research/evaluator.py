@@ -465,9 +465,15 @@ def main() -> None:
             period = dict(task.evaluation_periods[args.stage])
         else:
             period = dict(config["period"])
-        walk_forward = dict(task.evaluation_periods) if task is not None else dict(config["walk_forward"])
-        constraints = dict(task.raw["evaluation"]["constraints"]) if task is not None else dict(config["constraints"])
-        objective = str(task.raw["evaluation"]["objective"]) if task is not None else str(config["objective"])
+        if task is not None:
+            assert task.parameter_selection is not None
+            walk_forward = dict(task.parameter_selection)
+            constraints = dict(task.constraints)
+            objective = task.objective
+        else:
+            walk_forward = dict(config["walk_forward"])
+            constraints = dict(config["constraints"])
+            objective = str(config["objective"])
         grid, selector = _parameterized_contract(args.candidate_module)
         execution: WalkForwardExecutionControl | None = None
         if config is not None and isinstance(config.get("execution"), dict):

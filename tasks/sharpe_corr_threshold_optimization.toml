@@ -33,6 +33,21 @@ mode = "workspace"
 [data]
 universe = "universes/sector_rotation.csv"
 
+[parameter_selection]
+train_months = 18
+objective = "sortino"
+max_parameter_sets = 256
+
+[parameter_selection.schedule]
+period = "calendar_month"
+interval = 1
+trigger = "start"
+
+[parameter_selection.constraints]
+annual_return = { operator = ">=", threshold = 0.05 }
+max_drawdown = { operator = "abs<=", threshold = 0.15 }
+avg_turnover = { operator = "<=", threshold = 0.30 }
+
 [scope]
 editable = [
   "src/quant_core/strategy/sharpe_corr_threshold.py",
@@ -64,7 +79,6 @@ metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
 [evaluation]
 mode = "walk_forward"
-objective = "sortino"
 
 [evaluation.contract]
 paths = [
@@ -81,22 +95,8 @@ paths = [
   "universes/sector_rotation.csv",
 ]
 
-[evaluation.constraints]
-annual_return = { operator = ">=", threshold = 0.05 }
-max_drawdown = { operator = "abs<=", threshold = 0.15 }
-avg_turnover = { operator = "<=", threshold = 0.30 }
-
 [evaluation.acceptance]
 minimum_improvement = 0.03
-
-[evaluation.walk_forward]
-train_months = 18
-max_parameter_sets = 256
-
-[evaluation.walk_forward.schedule]
-period = "calendar_month"
-interval = 1
-trigger = "start"
 
 [evaluation.walk_forward.development]
 start = "2021-07-19"

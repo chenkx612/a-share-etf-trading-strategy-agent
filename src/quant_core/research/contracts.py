@@ -12,6 +12,17 @@ from typing import Any, Mapping
 from quant_core.schedule import validate_schedule
 
 
+SUPPORTED_BACKTEST_METRICS = {
+    "total_return",
+    "annual_return",
+    "annual_volatility",
+    "sharpe",
+    "sortino",
+    "max_drawdown",
+    "avg_turnover",
+}
+
+
 def _required(data: Mapping[str, Any], key: str, expected: type, context: str) -> Any:
     value = data.get(key)
     if not isinstance(value, expected) or (expected is str and not value.strip()):
@@ -34,6 +45,50 @@ def _period(data: Mapping[str, Any], context: str) -> tuple[date, date]:
     if start > end:
         raise ValueError(f"{context}.start must not be after end")
     return start, end
+
+
+def _validate_objective_and_constraints(
+    policy: Mapping[str, Any],
+    context: str,
+    *,
+    restrict_metrics: bool = False,
+) -> tuple[str, Mapping[str, Any]]:
+    objective = _required(policy, "objective", str, context)
+    if restrict_metrics and objective not in SUPPORTED_BACKTEST_METRICS:
+        raise ValueError(f"{context}.objective is not a supported backtest metric")
+    constraints = _required(policy, "constraints", dict, context)
+    if not constraints:
+        raise ValueError(f"{context}.constraints must not be empty")
+    for name, constraint in constraints.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{context}.constraints must use non-empty metric names")
+        if restrict_metrics and name not in SUPPORTED_BACKTEST_METRICS:
+            raise ValueError(
+                f"{context}.constraints.{name} is not a supported backtest metric"
+            )
+        if not isinstance(constraint, dict):
+            raise ValueError(
+                f"{context}.constraints.{name} must be an operator/threshold table"
+            )
+        if set(constraint) != {"operator", "threshold"}:
+            raise ValueError(
+                f"{context}.constraints.{name} must contain exactly operator and threshold"
+            )
+        operator = constraint.get("operator")
+        if operator not in {">=", "<=", "abs<="}:
+            raise ValueError(
+                f"{context}.constraints.{name}.operator must be one of >=, <=, abs<="
+            )
+        threshold = constraint.get("threshold")
+        if (
+            not isinstance(threshold, (int, float))
+            or isinstance(threshold, bool)
+            or not math.isfinite(float(threshold))
+        ):
+            raise ValueError(
+                f"{context}.constraints.{name}.threshold must be numeric and finite"
+            )
+    return objective, constraints
 
 
 @dataclass(frozen=True)
@@ -102,86 +157,72 @@ class ResearchTask:
             if not all(part.isidentifier() for part in module.split(".")):
                 raise ValueError("task.strategy.module must be a Python module path")
 
+        parameter_selection = data.get("parameter_selection")
+        if parameter_selection is not None:
+            if not isinstance(parameter_selection, dict):
+                raise ValueError("task.parameter_selection must be a table")
+            expected_selection = {
+                "schedule",
+                "train_months",
+                "objective",
+                "constraints",
+                "max_parameter_sets",
+            }
+            if set(parameter_selection) != expected_selection:
+                raise ValueError(
+                    "task.parameter_selection must contain exactly schedule, train_months, "
+                    "objective, constraints, and max_parameter_sets"
+                )
+            for key in ("train_months", "max_parameter_sets"):
+                value = parameter_selection.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ValueError(
+                        f"task.parameter_selection.{key} must be a positive integer"
+                    )
+            validate_schedule(
+                _required(
+                    parameter_selection,
+                    "schedule",
+                    dict,
+                    "task.parameter_selection",
+                ),
+                context="task.parameter_selection.schedule",
+                require_start=True,
+            )
+            _validate_objective_and_constraints(
+                parameter_selection,
+                "task.parameter_selection",
+                restrict_metrics=True,
+            )
+
         production = data.get("production")
         if production is not None:
             if strategy is None:
                 raise ValueError("task.strategy is required when production is configured")
             if not isinstance(production, dict):
                 raise ValueError("task.production must be a table")
-            expected = {
-                "schedule",
-                "train_months",
-                "objective",
-                "constraints",
-                "max_parameter_sets",
-                "curve_months",
-                "benchmark",
-            }
+            expected = {"curve_months", "benchmark"}
             optional = {"data_requirements"}
             if not expected.issubset(production) or set(production) - expected - optional:
                 raise ValueError(
-                    "task.production must contain schedule, train_months, objective, "
-                    "constraints, max_parameter_sets, curve_months, and benchmark, with "
-                    "optional data_requirements"
+                    "task.production must contain curve_months and benchmark, with optional "
+                    "data_requirements; parameter search policy belongs in "
+                    "task.parameter_selection"
                 )
-            schedule = validate_schedule(
-                _required(production, "schedule", dict, "task.production"),
-                context="task.production.schedule",
-            )
-            for key in ("train_months", "max_parameter_sets", "curve_months"):
-                value = production.get(key)
-                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                    raise ValueError(f"task.production.{key} must be a positive integer")
-            objective = _required(production, "objective", str, "task.production")
-            supported_metrics = {
-                "total_return",
-                "annual_return",
-                "annual_volatility",
-                "sharpe",
-                "sortino",
-                "max_drawdown",
-                "avg_turnover",
-            }
-            if objective not in supported_metrics:
-                raise ValueError("task.production.objective is not a supported backtest metric")
+            if parameter_selection is None:
+                raise ValueError(
+                    "task.parameter_selection is required when production is configured"
+                )
+            curve_months = production.get("curve_months")
+            if (
+                not isinstance(curve_months, int)
+                or isinstance(curve_months, bool)
+                or curve_months < 1
+            ):
+                raise ValueError("task.production.curve_months must be a positive integer")
             benchmark = _required(production, "benchmark", str, "task.production")
             if not benchmark.isdigit():
                 raise ValueError("task.production.benchmark must be a numeric security code")
-            constraints = _required(production, "constraints", dict, "task.production")
-            if not constraints:
-                raise ValueError("task.production.constraints must not be empty")
-            for name, constraint in constraints.items():
-                if not isinstance(name, str) or not name:
-                    raise ValueError(
-                        "task.production.constraints must use non-empty metric names"
-                    )
-                if name not in supported_metrics:
-                    raise ValueError(
-                        f"task.production.constraints.{name} is not a supported backtest metric"
-                    )
-                if not isinstance(constraint, dict) or set(constraint) != {
-                    "operator",
-                    "threshold",
-                }:
-                    raise ValueError(
-                        f"task.production.constraints.{name} must contain exactly "
-                        "operator and threshold"
-                    )
-                if constraint.get("operator") not in {">=", "<=", "abs<="}:
-                    raise ValueError(
-                        f"task.production.constraints.{name}.operator must be one of "
-                        ">=, <=, abs<="
-                    )
-                threshold = constraint.get("threshold")
-                if (
-                    not isinstance(threshold, (int, float))
-                    or isinstance(threshold, bool)
-                    or not math.isfinite(float(threshold))
-                ):
-                    raise ValueError(
-                        f"task.production.constraints.{name}.threshold must be numeric "
-                        "and finite"
-                    )
             requirements = production.get("data_requirements")
             if requirements is not None:
                 if not isinstance(requirements, dict) or set(requirements) != {
@@ -249,6 +290,17 @@ class ResearchTask:
             raise ValueError("task.evaluation.mode must be 'fixed' or 'walk_forward'")
         if mode == "walk_forward" and strategy is None:
             raise ValueError("task.strategy is required for walk_forward evaluation")
+        if mode == "walk_forward" and parameter_selection is None:
+            raise ValueError(
+                "task.parameter_selection is required for walk_forward evaluation"
+            )
+        if mode == "walk_forward" and (
+            "objective" in evaluation or "constraints" in evaluation
+        ):
+            raise ValueError(
+                "walk_forward objective and constraints belong in "
+                "task.parameter_selection"
+            )
         contract = _required(evaluation, "contract", dict, "task.evaluation")
         if set(contract) != {"paths"}:
             raise ValueError("task.evaluation.contract must contain exactly paths")
@@ -318,35 +370,8 @@ class ResearchTask:
         if "{run_id}" not in metrics_path:
             raise ValueError("task.commands.metrics_path must contain {run_id}")
 
-        _required(evaluation, "objective", str, "task.evaluation")
-        constraints = _required(evaluation, "constraints", dict, "task.evaluation")
-        if not constraints:
-            raise ValueError("task.evaluation.constraints must not be empty")
-        for name, constraint in constraints.items():
-            if not isinstance(name, str) or not name:
-                raise ValueError("task.evaluation.constraints must use non-empty metric names")
-            if not isinstance(constraint, dict):
-                raise ValueError(
-                    f"task.evaluation.constraints.{name} must be an operator/threshold table"
-                )
-            if set(constraint) != {"operator", "threshold"}:
-                raise ValueError(
-                    f"task.evaluation.constraints.{name} must contain exactly operator and threshold"
-                )
-            operator = constraint.get("operator")
-            threshold = constraint.get("threshold")
-            if operator not in {">=", "<=", "abs<="}:
-                raise ValueError(
-                    f"task.evaluation.constraints.{name}.operator must be one of >=, <=, abs<="
-                )
-            if (
-                not isinstance(threshold, (int, float))
-                or isinstance(threshold, bool)
-                or not math.isfinite(float(threshold))
-            ):
-                raise ValueError(
-                    f"task.evaluation.constraints.{name}.threshold must be numeric and finite"
-                )
+        if mode == "fixed":
+            _validate_objective_and_constraints(evaluation, "task.evaluation")
         acceptance = evaluation.get("acceptance")
         if acceptance is not None:
             if not isinstance(acceptance, dict):
@@ -377,36 +402,11 @@ class ResearchTask:
         periods_key = "fixed" if mode == "fixed" else "walk_forward"
         periods = _required(evaluation, periods_key, dict, "task.evaluation")
         if mode == "walk_forward":
-            expected_walk_forward = {
-                "train_months",
-                "max_parameter_sets",
-                "schedule",
-                "development",
-                "gate",
-            }
+            expected_walk_forward = {"development", "gate"}
             if set(periods) != expected_walk_forward:
                 raise ValueError(
-                    "task.evaluation.walk_forward must contain exactly train_months, "
-                    "max_parameter_sets, schedule, development, and gate"
-                )
-            for key in ("train_months", "max_parameter_sets"):
-                value = periods.get(key)
-                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                    raise ValueError(f"task.evaluation.walk_forward.{key} must be a positive integer")
-            evaluation_schedule = validate_schedule(
-                _required(
-                    periods,
-                    "schedule",
-                    dict,
-                    "task.evaluation.walk_forward",
-                ),
-                context="task.evaluation.walk_forward.schedule",
-                require_start=True,
-            )
-            if production is not None and evaluation_schedule != schedule:
-                raise ValueError(
-                    "task.production.schedule must equal "
-                    "task.evaluation.walk_forward.schedule"
+                    "task.evaluation.walk_forward must contain exactly development and gate; "
+                    "parameter search policy belongs in task.parameter_selection"
                 )
         development = _period(
             _required(periods, "development", dict, f"task.evaluation.{periods_key}"),
@@ -444,6 +444,33 @@ class ResearchTask:
     @property
     def evaluation_mode(self) -> str:
         return str(self.raw["evaluation"]["mode"])
+
+    @property
+    def parameter_selection(self) -> Mapping[str, Any] | None:
+        value = self.raw.get("parameter_selection")
+        return value if isinstance(value, Mapping) else None
+
+    @property
+    def objective(self) -> str:
+        policy = (
+            self.parameter_selection
+            if self.evaluation_mode == "walk_forward"
+            else self.raw["evaluation"]
+        )
+        assert policy is not None
+        return str(policy["objective"])
+
+    @property
+    def constraints(self) -> Mapping[str, Any]:
+        policy = (
+            self.parameter_selection
+            if self.evaluation_mode == "walk_forward"
+            else self.raw["evaluation"]
+        )
+        assert policy is not None
+        value = policy["constraints"]
+        assert isinstance(value, Mapping)
+        return value
 
     @property
     def evaluation_periods(self) -> Mapping[str, Any]:

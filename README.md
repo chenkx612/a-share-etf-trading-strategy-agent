@@ -110,14 +110,15 @@ quant-agent loop active_etf_rerank_topk -d
   `{strategy_name}` 和 `{strategy_module}` 占位符；指标路径必须包含 `{run_id}`。
 - `evaluation.mode = "fixed"` 保持原有的不重叠 Development/Gate 评测；
   `"walk_forward"` 用最近训练窗口逐折选参、在后续不重叠验证折评测。调参边界由
-  `evaluation.walk_forward.schedule` 显式声明，而不再锚定 Development/Gate 的
+  顶层 `parameter_selection.schedule` 显式声明，而不再锚定 Development/Gate 的
   `start`；同频任务因此共享相同交易日边界。当前月频契约使用自然月首个交易日收盘
   选参、下一交易日开盘生效。参数网格由策略模块的 `parameter_grid()` 声明，固定
   evaluator 通过 `select_with_params(...)` 评分并选参。评分区间若从月中开始，
   evaluator 会从此前最近的调参边界预热持仓和路径状态，但只统计配置区间内的指标。
-- 配置了 `[production]` 的 Walk-Forward 任务必须使 `production.schedule` 与
-  `evaluation.walk_forward.schedule` 完全一致。逐日推荐、生产因果曲线和 Research
-  共用该调度；策略调用内的迟滞等路径状态在调参边界重置，并在同一周期内连续回放。
+- Walk-Forward 任务通过顶层 `[parameter_selection]` 唯一声明 `train_months`、
+  `objective`、`constraints`、`max_parameter_sets` 和 `schedule`。Research、逐日推荐
+  与生产因果曲线共用该政策；`[production]` 只声明曲线窗口、基准和可选数据要求。
+  策略调用内的迟滞等路径状态在调参边界重置，并在同一周期内连续回放。
 - 硬约束运算符为 `>=`、`<=` 和 `abs<=`；可选 Test 区间必须位于 Gate 之后，使用
   `research test --task path/to/task.toml` 对当前 Champion 单独评测，结果不参与晋级。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
