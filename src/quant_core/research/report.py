@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.periods import bind_persisted_periods
 from quant_core.research.environment import (
     EvaluationEnvironment,
     capture_evaluation_environment,
@@ -309,6 +310,14 @@ def generate_loop_report(
     agent_runner: ReportAgentRunner = _run_opencode_report_read_only,
 ) -> Path:
     task = ResearchTask.load(task_path)
+    if task.relative_period_config is not None:
+        persisted = _read_json(manager.resolved_periods_path)
+        if persisted is None:
+            raise ReportInfrastructureError(
+                "Run resolved period contract is unavailable",
+                "resolved_periods_unavailable",
+            )
+        task = bind_persisted_periods(task, persisted)
     task_state = manager.load_state(task.strategy_path)
     manager.refresh_champion_metrics_status(
         task_state,
@@ -360,6 +369,8 @@ def generate_loop_report(
             ),
             "development_period": task.development_period,
             "gate_period": task.gate_period,
+            "test_period": task.test_period,
+            "period_resolution": task.period_resolution,
         },
         "loop": loop_payload,
         "experiments": experiments,
@@ -540,6 +551,14 @@ def regenerate_loop_report(
     if selected is None or selected not in available:
         raise FileNotFoundError("Research run does not exist")
     manager = base_manager.for_run(selected)
+    if task.relative_period_config is not None:
+        persisted = _read_json(manager.resolved_periods_path)
+        if persisted is None:
+            raise ReportInfrastructureError(
+                "Run resolved period contract is unavailable",
+                "resolved_periods_unavailable",
+            )
+        task = bind_persisted_periods(task, persisted)
     loop_state_path = manager.loop_state_path
     loop_state = _read_json(loop_state_path)
     if loop_state is None:
@@ -553,6 +572,7 @@ def regenerate_loop_report(
         task.baseline_mode,
         task.baseline_exclude,
         task.strategy_path,
+        evaluation_runtime=manager.evaluation_runtime,
     )
 
     def restore_runtime_layout() -> None:

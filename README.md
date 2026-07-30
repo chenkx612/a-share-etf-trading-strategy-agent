@@ -115,6 +115,15 @@ quant-agent loop active_etf_rerank_topk -d
   选参、下一交易日开盘生效。参数网格由策略模块的 `parameter_grid()` 声明，固定
   evaluator 通过 `select_with_params(...)` 评分并选参。评分区间若从月中开始，
   evaluator 会从此前最近的调参边界预热持仓和路径状态，但只统计配置区间内的指标。
+- Walk-Forward 区间既可继续使用绝对 `development`/`gate` 和可选
+  `[evaluation.test]`，也可通过 `[evaluation.walk_forward.relative]` 声明
+  `anchor = "latest_complete_universe_date"` 以及可配置的
+  `development_months`、`gate_months`、可选 `test_months`。相对区间在新 Run
+  启动时按本地行情最新日期解析；该日期必须覆盖当前 Universe 的全部 symbol。
+  Harness 会为 Run 冻结内容寻址的完整评测输入、解析后的绝对区间和 Development
+  视图，恢复及后续 Round 不受工作区数据更新影响。历史不足以覆盖首个 Development
+  折训练窗、最新日数据不完整或任一区间没有交易日时会在研究开始前明确失败，不会
+  自动回退日期或缩短区间。
 - Walk-Forward 任务通过顶层 `[parameter_selection]` 唯一声明 `train_months`、
   `objective`、`constraints`、`max_parameter_sets` 和 `schedule`。Research、逐日推荐
   与生产因果曲线共用该政策；`[production]` 只声明曲线窗口、基准和可选数据要求。

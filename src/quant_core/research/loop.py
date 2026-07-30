@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.periods import (
+    bind_persisted_periods,
+    resolve_relative_periods,
+)
 from quant_core.research.environment import (
     EvaluationEnvironment,
     capture_evaluation_environment,
@@ -30,6 +34,7 @@ from quant_core.research.runner import (
     target_reached,
 )
 from quant_core.research.workspace import (
+    build_evaluation_view,
     DevelopmentInputsError,
     ResearchWorkspace,
     write_json_atomic,
@@ -61,6 +66,8 @@ def _new_state(
     diagnostics_enabled: bool,
     development_view_sha256: str,
     development_end: str,
+    evaluation_inputs_sha256: str | None = None,
+    resolved_periods: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = _timestamp()
     return {
@@ -90,6 +97,8 @@ def _new_state(
         "diagnostics_enabled": diagnostics_enabled,
         "development_view_sha256": development_view_sha256,
         "development_end": development_end,
+        "evaluation_inputs_sha256": evaluation_inputs_sha256,
+        "resolved_periods": resolved_periods,
     }
 
 
@@ -280,30 +289,6 @@ def run_loop(
         task.task_id,
         evaluation_environment_sha256=environment.sha256,
     )
-    evaluator_contract_sha256 = base_manager.evaluator_contract_sha256(
-        task.evaluator_contract_paths,
-        strategy_path=task.strategy_path,
-    )
-    persist_evaluation_environment(base_manager.root, environment)
-    development_end = task.development_period["end"]
-    base_manager.initialize(
-        date.fromisoformat(development_end),
-        task.baseline_mode,
-        task.baseline_exclude,
-        task.strategy_path,
-    )
-    development_manifest = base_manager.development_manifest()
-    development_view_sha256 = str(
-        development_manifest["development_view_sha256"]
-    )
-    metrics_key = _metrics_key(task)
-    task_state = base_manager.load_state(task.strategy_path)
-    base_manager.refresh_champion_metrics_status(
-        task_state,
-        metrics_key,
-        task.evaluator_contract_paths,
-        evaluator_contract_sha256=evaluator_contract_sha256,
-    )
     base_manager.migrate_legacy_loop()
     fingerprint = _task_fingerprint(task_file)
     active_runs: list[tuple[int, dict[str, Any]]] = []
@@ -317,6 +302,65 @@ def run_loop(
             active_runs.append((run_number, candidate_state))
     if len(active_runs) > 1:
         raise RuntimeError("multiple active research runs exist for the same task")
+
+    evaluation_view: Path | None = None
+    evaluation_manifest: dict[str, Any] | None = None
+    resolved_payload: dict[str, Any] | None = None
+    if task.relative_period_config is not None:
+        if active_runs:
+            active_manager = base_manager.for_run(active_runs[0][0])
+            try:
+                evaluation_manifest = json.loads(
+                    active_manager.evaluation_inputs_path.read_text(encoding="utf-8")
+                )
+                resolved_payload = json.loads(
+                    active_manager.resolved_periods_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DevelopmentInputsError(
+                    "Active Run relative input contracts are unavailable"
+                ) from exc
+            task = bind_persisted_periods(task, resolved_payload)
+            evaluation_view = active_manager.evaluation_runtime
+        else:
+            evaluation_view, evaluation_manifest = build_evaluation_view(
+                source, base_manager.evaluation_views
+            )
+            task = resolve_relative_periods(
+                task, source=source, runtime=evaluation_view
+            )
+            resolved_payload = {
+                "schema_version": 1,
+                "periods": dict(task.resolved_periods or {}),
+                "resolution": dict(task.period_resolution or {}),
+            }
+        base_manager.evaluation_runtime_override = evaluation_view
+    evaluator_contract_sha256 = base_manager.evaluator_contract_sha256(
+        task.evaluator_contract_paths,
+        strategy_path=task.strategy_path,
+    )
+    persist_evaluation_environment(base_manager.root, environment)
+    development_end = task.development_period["end"]
+    base_manager.initialize(
+        date.fromisoformat(development_end),
+        task.baseline_mode,
+        task.baseline_exclude,
+        task.strategy_path,
+        evaluation_runtime=evaluation_view,
+    )
+    development_manifest = base_manager.development_manifest()
+    development_view_sha256 = str(
+        development_manifest["development_view_sha256"]
+    )
+    metrics_key = _metrics_key(task)
+    task_state = base_manager.load_state(task.strategy_path)
+    base_manager.refresh_champion_metrics_status(
+        task_state,
+        metrics_key,
+        task.evaluator_contract_paths,
+        evaluator_contract_sha256=evaluator_contract_sha256,
+        gate_runtime=evaluation_view,
+    )
     if active_runs:
         run_number, state = active_runs[0]
         state = _normalize_state(state)
@@ -471,12 +515,12 @@ def run_loop(
         if accepts_evidence:
             fixed_test_preflight(
                 task,
-                base_manager,
+                manager,
                 environment,
                 evidence_root=evidence_root,
             )
         else:
-            fixed_test_preflight(task, base_manager, environment)
+            fixed_test_preflight(task, manager, environment)
 
     parent_checked_before_lifecycle = False
     if not active_runs:
@@ -489,6 +533,10 @@ def run_loop(
         lifecycle_event = ("run_resumed", "resumed")
     else:
         manager.run_root.mkdir(parents=True, exist_ok=False)
+        if evaluation_manifest is not None and resolved_payload is not None:
+            manager.freeze_run_evaluation_inputs(
+                evaluation_manifest, resolved_payload
+            )
         manager.freeze_run_development_inputs()
         manager.rounds.mkdir(parents=True, exist_ok=False)
         state = _new_state(
@@ -499,6 +547,16 @@ def run_loop(
             diagnostics_enabled,
             development_view_sha256,
             development_end,
+            (
+                str(evaluation_manifest["evaluation_inputs_sha256"])
+                if evaluation_manifest is not None
+                else None
+            ),
+            (
+                dict(resolved_payload["periods"])
+                if resolved_payload is not None
+                else None
+            ),
         )
         lifecycle_event = ("run_started", "started")
     loop_state_path = manager.loop_state_path

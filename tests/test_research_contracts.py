@@ -472,7 +472,12 @@ def test_repository_walk_forward_tasks_use_shared_parameter_selection(
     assert task.parameter_selection is not None
     assert "objective" not in task.raw["evaluation"]
     assert "constraints" not in task.raw["evaluation"]
-    assert set(task.evaluation_periods) == {"development", "gate"}
+    assert task.relative_period_config == {
+        "anchor": "latest_complete_universe_date",
+        "development_months": 30,
+        "gate_months": 12,
+        "test_months": 6,
+    }
     if task.production is not None:
         assert not {
             "schedule",

@@ -41,7 +41,9 @@ from quant_core.research.environment import (
     capture_evaluation_environment,
     persist_evaluation_environment,
 )
+from quant_core.research.periods import resolve_relative_periods
 from quant_core.research.workspace import (
+    build_evaluation_view,
     ResearchWorkspace,
     copy_runtime_inputs,
     runtime_inputs_manifest,
@@ -700,22 +702,40 @@ def command_research_test(args: argparse.Namespace) -> None:
         task.task_id,
         evaluation_environment_sha256=environment.sha256,
     )
+    evaluation_runtime = source
+    relative_manifest: dict[str, object] | None = None
+    if task.relative_period_config is not None:
+        evaluation_runtime, input_manifest = build_evaluation_view(
+            source, manager.evaluation_views
+        )
+        task = resolve_relative_periods(
+            task, source=source, runtime=evaluation_runtime
+        )
+        relative_manifest = {
+            "schema_version": 1,
+            "periods": dict(task.resolved_periods or {}),
+            "resolution": dict(task.period_resolution or {}),
+            "evaluation_inputs": input_manifest,
+        }
     persist_evaluation_environment(manager.root, environment)
     state = manager.initialize(
         date.fromisoformat(task.evaluation_periods["development"]["end"]),
         task.baseline_mode, task.baseline_exclude, task.strategy_path,
+        evaluation_runtime=evaluation_runtime,
     )
     if not isinstance(state.get("champion_sha256"), str):
         raise RuntimeError("research task does not have a champion yet")
-    test = task.raw["evaluation"].get("test")
+    test = task.test_period
     if not isinstance(test, dict):
         raise ValueError("task.evaluation.test is required")
     test_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     evaluator = manager.create_champion_test_evaluator(test_id, state)
     output = manager.root / "tests" / test_id
     output.mkdir(parents=True)
+    if relative_manifest is not None:
+        write_json_atomic(output / "resolved-periods.json", relative_manifest)
     try:
-        copy_runtime_inputs(source, evaluator)
+        copy_runtime_inputs(evaluation_runtime, evaluator)
         runtime_inputs = runtime_inputs_manifest(evaluator)
         run_id = f"test-{test_id}"
         values = {"python": sys.executable, "universe": str(task.raw["data"]["universe"]),
@@ -727,6 +747,11 @@ def command_research_test(args: argparse.Namespace) -> None:
                        "--universe", str(task.raw["data"]["universe"]), "--start", str(test["start"]),
                        "--end", str(test["end"]), "--run-id", run_id, "--candidate-module", str(task.strategy_module),
                        "--task", str(task_file), "--stage", "test", "--metrics-path", metrics_relative]
+            if relative_manifest is not None:
+                command.extend([
+                    "--resolved-periods",
+                    str(output / "resolved-periods.json"),
+                ])
         else:
             command = [part.format_map(values) for part in task.raw["commands"]["backtest"]]
         completed = subprocess.run(command, cwd=evaluator, env=workspace_python_env(evaluator), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
@@ -742,6 +767,12 @@ def command_research_test(args: argparse.Namespace) -> None:
             "strategy_sha256": state["champion_sha256"],
             "evaluation_environment_sha256": environment.sha256,
             "runtime_inputs": runtime_inputs,
+            "test_period": dict(test),
+            "period_resolution": (
+                dict(task.period_resolution)
+                if task.period_resolution is not None
+                else None
+            ),
             "metrics": metrics,
         })
     finally:

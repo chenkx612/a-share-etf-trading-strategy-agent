@@ -103,10 +103,8 @@ paths = [
 [evaluation.acceptance]
 minimum_improvement = 0.03
 
-[evaluation.walk_forward.development]
-start = "2023-01-22"
-end = "2025-07-21"
-
-[evaluation.walk_forward.gate]
-start = "2025-07-22"
-end = "2026-07-21"
+[evaluation.walk_forward.relative]
+anchor = "latest_complete_universe_date"
+development_months = 30
+gate_months = 12
+test_months = 6

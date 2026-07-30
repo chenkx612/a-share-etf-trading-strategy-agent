@@ -94,6 +94,8 @@ def _validate_objective_and_constraints(
 @dataclass(frozen=True)
 class ResearchTask:
     raw: Mapping[str, Any]
+    resolved_periods: Mapping[str, Any] | None = None
+    period_resolution: Mapping[str, Any] | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> ResearchTask:
@@ -402,11 +404,55 @@ class ResearchTask:
         periods_key = "fixed" if mode == "fixed" else "walk_forward"
         periods = _required(evaluation, periods_key, dict, "task.evaluation")
         if mode == "walk_forward":
-            expected_walk_forward = {"development", "gate"}
-            if set(periods) != expected_walk_forward:
+            absolute_keys = {"development", "gate"}
+            if set(periods) == {"relative"}:
+                relative = _required(
+                    periods, "relative", dict, "task.evaluation.walk_forward"
+                )
+                allowed = {
+                    "anchor",
+                    "development_months",
+                    "gate_months",
+                    "test_months",
+                }
+                if not {"anchor", "development_months", "gate_months"} <= set(relative):
+                    raise ValueError(
+                        "task.evaluation.walk_forward.relative must contain anchor, "
+                        "development_months, and gate_months"
+                    )
+                if not set(relative) <= allowed:
+                    raise ValueError(
+                        "task.evaluation.walk_forward.relative contains unknown fields"
+                    )
+                if relative["anchor"] != "latest_complete_universe_date":
+                    raise ValueError(
+                        "task.evaluation.walk_forward.relative.anchor must be "
+                        "latest_complete_universe_date"
+                    )
+                for key in ("development_months", "gate_months", "test_months"):
+                    if key not in relative:
+                        continue
+                    value = relative[key]
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value <= 0
+                    ):
+                        raise ValueError(
+                            f"task.evaluation.walk_forward.relative.{key} "
+                            "must be a positive integer"
+                        )
+                if evaluation.get("test") is not None:
+                    raise ValueError(
+                        "relative walk-forward periods must declare test_months "
+                        "instead of task.evaluation.test"
+                    )
+                return cls(raw=dict(data))
+            if set(periods) != absolute_keys:
                 raise ValueError(
-                    "task.evaluation.walk_forward must contain exactly development and gate; "
-                    "parameter search policy belongs in task.parameter_selection"
+                    "task.evaluation.walk_forward must contain exactly development "
+                    "and gate, or exactly relative; parameter search policy belongs "
+                    "in task.parameter_selection"
                 )
         development = _period(
             _required(periods, "development", dict, f"task.evaluation.{periods_key}"),
@@ -474,8 +520,63 @@ class ResearchTask:
 
     @property
     def evaluation_periods(self) -> Mapping[str, Any]:
+        if self.relative_period_config is not None:
+            if self.resolved_periods is None:
+                raise RuntimeError(
+                    "relative evaluation periods must be resolved against a frozen "
+                    "runtime input snapshot"
+                )
+            return {
+                key: value
+                for key, value in self.resolved_periods.items()
+                if key in {"development", "gate"}
+            }
         evaluation = self.raw["evaluation"]
         return evaluation["fixed" if self.evaluation_mode == "fixed" else "walk_forward"]
+
+    @property
+    def relative_period_config(self) -> Mapping[str, Any] | None:
+        if self.evaluation_mode != "walk_forward":
+            return None
+        value = self.raw["evaluation"]["walk_forward"].get("relative")
+        return value if isinstance(value, Mapping) else None
+
+    def with_resolved_periods(
+        self,
+        periods: Mapping[str, Any],
+        resolution: Mapping[str, Any],
+    ) -> ResearchTask:
+        if self.relative_period_config is None:
+            raise ValueError("only relative tasks can bind resolved periods")
+        expected = {"development", "gate"}
+        if "test_months" in self.relative_period_config:
+            expected.add("test")
+        if set(periods) != expected:
+            raise ValueError(
+                f"resolved periods must contain exactly {sorted(expected)}"
+            )
+        development = _period(
+            _required(periods, "development", dict, "resolved periods"),
+            "resolved periods.development",
+        )
+        gate = _period(
+            _required(periods, "gate", dict, "resolved periods"),
+            "resolved periods.gate",
+        )
+        if development[1] >= gate[0]:
+            raise ValueError("resolved development and gate periods must not overlap")
+        if "test" in expected:
+            test = _period(
+                _required(periods, "test", dict, "resolved periods"),
+                "resolved periods.test",
+            )
+            if gate[1] >= test[0]:
+                raise ValueError("resolved gate and test periods must not overlap")
+        return ResearchTask(
+            raw=self.raw,
+            resolved_periods=dict(periods),
+            period_resolution=dict(resolution),
+        )
 
     @property
     def development_period(self) -> Mapping[str, Any]:
@@ -487,6 +588,14 @@ class ResearchTask:
 
     @property
     def test_period(self) -> Mapping[str, Any] | None:
+        if self.relative_period_config is not None:
+            if self.resolved_periods is None:
+                raise RuntimeError(
+                    "relative evaluation periods must be resolved against a frozen "
+                    "runtime input snapshot"
+                )
+            value = self.resolved_periods.get("test")
+            return value if isinstance(value, Mapping) else None
         value = self.raw["evaluation"].get("test")
         return value if isinstance(value, Mapping) else None
 

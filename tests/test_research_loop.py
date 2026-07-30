@@ -142,6 +142,56 @@ def _runner(decisions: list[str]):
     return run
 
 
+def test_legacy_interrupted_loop_is_migrated_before_active_run_scan(
+    tmp_path: Path,
+) -> None:
+    task_path = _task(tmp_path)
+    task = ResearchTask.load(task_path)
+    manager = ResearchWorkspace(
+        tmp_path,
+        tmp_path / ".research",
+        task.task_id,
+        evaluation_environment_sha256=ENVIRONMENT.sha256,
+    )
+    manager.initialize(
+        date.fromisoformat(task.development_period["end"]),
+        strategy_path=task.strategy_path,
+    )
+    fingerprint = hashlib.sha256(task_path.read_bytes()).hexdigest()
+    manager.root.mkdir(parents=True, exist_ok=True)
+    (manager.root / "loop-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_id": task.task_id,
+                "status": "interrupted",
+                "task_fingerprint": fingerprint,
+                "rounds_completed": 0,
+                "experiment_ids": [],
+                "current_experiment_id": None,
+                "last_experiment_id": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = tmp_path / "report.md"
+    result = run_loop(
+        task_path,
+        workspace=tmp_path,
+        research_root=tmp_path / ".research",
+        managed_runner=lambda *args, **kwargs: pytest.fail(
+            "an incompatible migrated Run must not allocate a new Round"
+        ),
+        environment_probe=lambda: ENVIRONMENT,
+        reporter=lambda *args: report,
+    )
+
+    assert result == manager.for_run(1).loop_state_path
+    assert manager.run_numbers() == [1]
+    assert not (manager.root / "runs/002").exists()
+
+
 def _reporter(task_path: Path, manager: ResearchWorkspace, state: dict[str, object]) -> Path:
     report = manager.report_path
     report.write_text("# Test report\n", encoding="utf-8")

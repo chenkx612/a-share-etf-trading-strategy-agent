@@ -27,7 +27,9 @@ from quant_core.research.runner import (
     _candidate_evaluator_facade,
     _docker_opencode_command,
     _development_finalization_reserve,
+    _evaluation_command,
     _metrics_key,
+    _persist_resolved_periods,
     _load_research_history,
     _RoundClock,
     _run_opencode_with_permissions,
@@ -95,6 +97,41 @@ end = "2024-12-31"
 start = "2025-01-01"
 end = "2025-12-31"
 """
+
+
+def test_relative_gate_command_receives_frozen_period_manifest(
+    tmp_path: Path,
+) -> None:
+    task = ResearchTask.load(
+        Path(__file__).resolve().parents[1] / "tasks/active_etf_sharpe.toml"
+    ).with_resolved_periods(
+        {
+            "development": {"start": "2022-08-01", "end": "2025-01-31"},
+            "gate": {"start": "2025-02-01", "end": "2026-01-31"},
+            "test": {"start": "2026-02-01", "end": "2026-07-31"},
+        },
+        {"anchor": "2026-07-31"},
+    )
+    manifest = _persist_resolved_periods(task, tmp_path)
+    assert manifest is not None
+
+    command = _evaluation_command(
+        task,
+        tmp_path / "task.toml",
+        "gate",
+        {
+            "workspace": str(tmp_path),
+            "universe": "universe.csv",
+            "start": "2025-02-01",
+            "end": "2026-01-31",
+            "run_id": "candidate-gate",
+        },
+        resolved_periods_path=manifest,
+    )
+
+    assert command[-2:] == ["--resolved-periods", str(manifest)]
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))
+    assert persisted["periods"]["gate"] == task.gate_period
 
 WALK_FORWARD_TASK_TOML = TASK_TOML.replace(
     '[evaluation]\nmode = "fixed"\nobjective = "sortino"',

@@ -25,6 +25,7 @@ from quant_core.research.environment import (
     EvaluationEnvironment,
     capture_evaluation_environment,
 )
+from quant_core.research.periods import bind_persisted_periods
 from quant_core.research.workspace import (
     ResearchWorkspace,
     copy_runtime_inputs,
@@ -1843,6 +1844,7 @@ def run_parent_fixed_tests(
 def _evaluation_command(
     task: ResearchTask, task_path: str | Path, label: str, values: Mapping[str, str],
     walk_forward_config: Path | None = None,
+    resolved_periods_path: Path | None = None,
 ) -> list[str]:
     if task.evaluation_mode == "fixed":
         return _format_command(task.raw["commands"]["backtest"], values)
@@ -1858,7 +1860,32 @@ def _evaluation_command(
         command.extend(["--walk-forward-config", str(walk_forward_config)])
     else:
         command.extend(["--task", str(Path(task_path).resolve()), "--stage", label])
+        if resolved_periods_path is not None:
+            command.extend(["--resolved-periods", str(resolved_periods_path)])
     return command
+
+
+def _persist_resolved_periods(
+    task: ResearchTask,
+    output_dir: Path,
+) -> Path | None:
+    if task.relative_period_config is None:
+        return None
+    if task.resolved_periods is None or task.period_resolution is None:
+        raise RuntimeError("relative task periods were not resolved")
+    path = output_dir / "resolved-periods.json"
+    payload = {
+        "schema_version": 1,
+        "periods": dict(task.resolved_periods),
+        "resolution": dict(task.period_resolution),
+    }
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != payload:
+            raise RuntimeError("resolved period evidence changed")
+    else:
+        write_json_atomic(path, payload)
+    return path
 
 
 def _constraint_rule(constraint: Mapping[str, Any]) -> tuple[str, float]:
@@ -2340,6 +2367,7 @@ def _run_once_impl(
     monotonic: Callable[[], float] = time.monotonic,
     development_view_sha256: str | None = None,
     development_end: str | None = None,
+    resolved_task: ResearchTask | None = None,
 ) -> Path:
     from quant_core.research.checkpoint import (
         CheckpointReceiver,
@@ -2348,7 +2376,7 @@ def _run_once_impl(
     )
     from quant_core.research.attempt import DevelopmentAttemptReceiver
 
-    task = ResearchTask.load(task_path)
+    task = resolved_task or ResearchTask.load(task_path)
     root = Path(workspace).resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Workspace does not exist: {root}")
@@ -2358,6 +2386,7 @@ def _run_once_impl(
             "Research output directory must differ from the candidate workspace"
         )
     out.mkdir(parents=True, exist_ok=True)
+    resolved_periods_path = _persist_resolved_periods(task, out)
 
     raw = task.raw
     fixed = task.evaluation_periods
@@ -2677,7 +2706,13 @@ def _run_once_impl(
         command = (
             development_command
             if label == "development"
-            else _evaluation_command(task, task_path, label, values)
+            else _evaluation_command(
+                task,
+                task_path,
+                label,
+                values,
+                resolved_periods_path=resolved_periods_path,
+            )
         )
         _emit(
             event_sink,
@@ -2768,6 +2803,7 @@ def run_once(
     evaluation_environment: EvaluationEnvironment | None = None,
     development_view_sha256: str | None = None,
     development_end: str | None = None,
+    resolved_task: ResearchTask | None = None,
 ) -> Path:
     environment = evaluation_environment or capture_evaluation_environment()
     result_path = _run_once_impl(
@@ -2786,6 +2822,7 @@ def run_once(
         monotonic=monotonic,
         development_view_sha256=development_view_sha256,
         development_end=development_end,
+        resolved_task=resolved_task,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if development_view_sha256 is not None:
@@ -2824,6 +2861,7 @@ def _evaluate_existing(
     metrics: dict[str, Any] = {}
     copy_runtime_inputs(runtime_source, workspace)
     details: dict[str, Any] = {"round": round_id} if round_id is not None else {}
+    resolved_periods_path = _persist_resolved_periods(task, output_dir)
     if stale_reasons:
         details["stale_reasons"] = list(stale_reasons)
     _emit(event_sink, "champion_reevaluation_started", message="champion reevaluation started", **details)
@@ -2834,7 +2872,13 @@ def _evaluate_existing(
             f"{experiment_id}-champion-{label}",
             workspace,
         )
-        command = _evaluation_command(task, task_path, label, values)
+        command = _evaluation_command(
+            task,
+            task_path,
+            label,
+            values,
+            resolved_periods_path=resolved_periods_path,
+        )
         _emit(event_sink, f"champion_{label}_started", message=f"champion {label} started", **details)
         if _run_with_failure_log(
             command_runner,
@@ -3078,7 +3122,6 @@ def run_managed_once(
     managed_root = Path(research_root)
     if not managed_root.is_absolute():
         managed_root = source / managed_root
-    development_end = task.development_period["end"]
     if (
         not round_id.isdigit()
         or int(round_id) < 1
@@ -3093,6 +3136,15 @@ def run_managed_once(
         run_number=run_number,
         evaluation_environment_sha256=environment.sha256,
     )
+    if task.relative_period_config is not None:
+        try:
+            persisted = json.loads(
+                manager.resolved_periods_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Run resolved period contract is unavailable") from exc
+        task = bind_persisted_periods(task, persisted)
+    development_end = task.development_period["end"]
     if prepared_candidate is None:
         manager.evaluator_contract_sha256(
             task.evaluator_contract_paths,
@@ -3160,6 +3212,7 @@ def run_managed_once(
             if isinstance(state.get("development_end"), str)
             else None
         ),
+        resolved_task=task,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["experiment_id"] = f"{manager.run_id}/{round_id}"

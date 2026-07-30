@@ -22,6 +22,7 @@ from quant_core.research.candidate_evaluator import (
     validate_selection,
 )
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.periods import bind_persisted_periods
 from quant_core.research.workspace import write_json_atomic
 from quant_core.schedule import latest_schedule_boundary, schedule_boundaries
 
@@ -443,6 +444,7 @@ def main() -> None:
     parser.add_argument("--candidate-module", default="quant_core.strategy.research_candidate")
     parser.add_argument("--task")
     parser.add_argument("--walk-forward-config")
+    parser.add_argument("--resolved-periods")
     parser.add_argument("--metrics-path")
     parser.add_argument("--stage", choices=["development", "gate", "test"])
     args = parser.parse_args()
@@ -450,6 +452,11 @@ def main() -> None:
     paths = ProjectPaths(Path(args.root))
     paths.ensure()
     task = ResearchTask.load(args.task) if args.task else None
+    if task is not None and args.resolved_periods:
+        payload = json.loads(
+            Path(args.resolved_periods).read_text(encoding="utf-8")
+        )
+        task = bind_persisted_periods(task, payload)
     config: dict[str, object] | None = None
     if args.walk_forward_config:
         config = json.loads(Path(args.walk_forward_config).read_text(encoding="utf-8"))

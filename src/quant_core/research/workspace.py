@@ -382,6 +382,58 @@ def runtime_inputs_sha256(root: Path) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def validate_evaluation_view(
+    view: Path,
+    manifest: Mapping[str, Any],
+) -> None:
+    expected = manifest.get("inputs")
+    digest = manifest.get("evaluation_inputs_sha256")
+    if not isinstance(expected, Mapping) or not isinstance(digest, str):
+        raise DevelopmentInputsError("Evaluation input manifest is invalid")
+    actual = runtime_inputs_manifest(view)
+    if actual != dict(expected) or runtime_inputs_sha256(view) != digest:
+        raise DevelopmentInputsError(
+            "Evaluation input view does not match its frozen manifest"
+        )
+
+
+def build_evaluation_view(
+    source: Path,
+    views_root: Path,
+) -> tuple[Path, dict[str, Any]]:
+    """Create one immutable, content-addressed full evaluation input view."""
+    views_root.mkdir(parents=True, exist_ok=True)
+    before = runtime_inputs_manifest(source)
+    if not before:
+        raise DevelopmentInputsError("No runtime market-data inputs are available")
+    temporary = Path(tempfile.mkdtemp(prefix=".building-", dir=views_root))
+    try:
+        copy_runtime_inputs(source, temporary)
+        after = runtime_inputs_manifest(source)
+        copied = runtime_inputs_manifest(temporary)
+        if before != after or copied != before:
+            raise DevelopmentInputsError(
+                "Evaluation inputs changed while the frozen view was being built"
+            )
+        digest = runtime_inputs_sha256(temporary)
+        manifest = {
+            "schema_version": 1,
+            "evaluation_inputs_sha256": digest,
+            "inputs": copied,
+        }
+        write_json_atomic(temporary / "manifest.json", manifest)
+        destination = views_root / digest
+        if destination.exists():
+            validate_evaluation_view(destination, manifest)
+            shutil.rmtree(temporary)
+        else:
+            os.replace(temporary, destination)
+        return destination, manifest
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
 def _evaluator_contract_digest(paths: Sequence[str], listing: str) -> str:
     payload = {
         "schema_version": 1,
@@ -442,6 +494,7 @@ class ResearchWorkspace:
     run_number: int | None = None
     evaluation_environment_sha256: str | None = None
     diagnostics_enabled: bool = False
+    evaluation_runtime_override: Path | None = None
 
     def __post_init__(self) -> None:
         self.source = self.source.resolve()
@@ -559,6 +612,10 @@ class ResearchWorkspace:
         return self.runtime / "development-views"
 
     @property
+    def evaluation_views(self) -> Path:
+        return self.runtime / "evaluation-views"
+
+    @property
     def development_runtime(self) -> Path:
         try:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -574,8 +631,65 @@ class ResearchWorkspace:
         return self.run_root / "development-inputs.json"
 
     @property
+    def evaluation_inputs_path(self) -> Path:
+        return self.run_root / "evaluation-inputs.json"
+
+    @property
+    def resolved_periods_path(self) -> Path:
+        return self.run_root / "resolved-periods.json"
+
+    @property
     def evaluation_runtime(self) -> Path:
+        if self.evaluation_runtime_override is not None:
+            return self.evaluation_runtime_override
+        if self.run_number is not None and self.evaluation_inputs_path.is_file():
+            try:
+                manifest = json.loads(
+                    self.evaluation_inputs_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DevelopmentInputsError(
+                    "Run evaluation input manifest is unreadable"
+                ) from exc
+            digest = manifest.get("evaluation_inputs_sha256")
+            if not isinstance(digest, str):
+                raise DevelopmentInputsError(
+                    "Run evaluation input manifest is invalid"
+                )
+            view = self.evaluation_views / digest
+            validate_evaluation_view(view, manifest)
+            return view
         return self.runtime / "evaluation"
+
+    def freeze_run_evaluation_inputs(
+        self,
+        manifest: Mapping[str, Any],
+        resolved_periods: Mapping[str, Any],
+    ) -> None:
+        if self.run_number is None:
+            raise RuntimeError("cannot freeze Evaluation inputs without a Run")
+        self.run_root.mkdir(parents=True, exist_ok=True)
+        if self.evaluation_inputs_path.exists():
+            existing = json.loads(
+                self.evaluation_inputs_path.read_text(encoding="utf-8")
+            )
+            if existing != dict(manifest):
+                raise DevelopmentInputsError(
+                    "Run Evaluation inputs differ from the frozen manifest"
+                )
+        else:
+            write_json_atomic(self.evaluation_inputs_path, manifest)
+        if self.resolved_periods_path.exists():
+            existing_periods = json.loads(
+                self.resolved_periods_path.read_text(encoding="utf-8")
+            )
+            if existing_periods != dict(resolved_periods):
+                raise DevelopmentInputsError(
+                    "Run resolved periods differ from the frozen manifest"
+                )
+        else:
+            write_json_atomic(self.resolved_periods_path, resolved_periods)
+        validate_evaluation_view(self.evaluation_runtime, manifest)
 
     def for_run(self, run_number: int) -> ResearchWorkspace:
         return ResearchWorkspace(
@@ -585,6 +699,7 @@ class ResearchWorkspace:
             run_number=run_number,
             evaluation_environment_sha256=self.evaluation_environment_sha256,
             diagnostics_enabled=self.diagnostics_enabled,
+            evaluation_runtime_override=self.evaluation_runtime_override,
         )
 
     def next_run_number(self) -> int:
@@ -793,6 +908,7 @@ class ResearchWorkspace:
         *,
         champion_sha256: str | None = None,
         evaluator_contract_sha256: str | None = None,
+        gate_runtime: Path | None = None,
     ) -> dict[str, str | None]:
         if self.evaluation_environment_sha256 is None:
             raise RuntimeError("fixed evaluation environment was not configured")
@@ -812,7 +928,9 @@ class ResearchWorkspace:
                 if isinstance(state.get("development_view_sha256"), str)
                 else None
             ),
-            "gate_inputs_sha256": runtime_inputs_sha256(self.evaluation_runtime),
+            "gate_inputs_sha256": runtime_inputs_sha256(
+                gate_runtime or self.evaluation_runtime
+            ),
             "evaluator_contract_sha256": contract,
             "evaluation_environment_sha256": self.evaluation_environment_sha256,
         }
@@ -824,6 +942,7 @@ class ResearchWorkspace:
         evaluator_contract_paths: Sequence[str],
         *,
         evaluator_contract_sha256: str | None = None,
+        gate_runtime: Path | None = None,
     ) -> dict[str, str | None]:
         """Refresh validity without discarding the last durable metrics value."""
         expected = self.metrics_applicability(
@@ -831,6 +950,7 @@ class ResearchWorkspace:
             metrics_key,
             evaluator_contract_paths,
             evaluator_contract_sha256=evaluator_contract_sha256,
+            gate_runtime=gate_runtime,
         )
         record = state.get("champion_metrics_record")
         if not isinstance(record, dict):
@@ -1398,16 +1518,22 @@ class ResearchWorkspace:
         write_json_atomic(self.state_path, state)
         return state
 
-    def _prepare_runtime(self, state: dict[str, Any], development_end: date | None) -> None:
-        if not self.evaluation_runtime.exists():
-            copy_runtime_inputs(self.source, self.evaluation_runtime)
+    def _prepare_runtime(
+        self,
+        state: dict[str, Any],
+        development_end: date | None,
+        evaluation_runtime: Path | None = None,
+    ) -> None:
+        runtime = evaluation_runtime or self.evaluation_runtime
+        if not runtime.exists():
+            copy_runtime_inputs(self.source, runtime)
         legacy = self.runtime / "development"
         if os.path.lexists(legacy):
             shutil.rmtree(legacy, ignore_errors=True)
         if development_end is None:
             development_end = date.max
         view, manifest = build_development_view(
-            self.evaluation_runtime,
+            runtime,
             self.development_views,
             development_end,
         )
@@ -1455,6 +1581,7 @@ class ResearchWorkspace:
         baseline_mode: str = "workspace",
         baseline_exclude: Sequence[str] = (),
         strategy_path: str | None = None,
+        evaluation_runtime: Path | None = None,
     ) -> dict[str, Any]:
         self._migrate_champion_layout(strategy_path)
         self._migrate_transient_layout()
@@ -1467,7 +1594,7 @@ class ResearchWorkspace:
             if self.run_number is not None:
                 self._cleanup_worktrees(self.candidates, remove_root=False)
                 self._cleanup_worktrees(self.evaluators, remove_root=False)
-            self._prepare_runtime(state, development_end)
+            self._prepare_runtime(state, development_end, evaluation_runtime)
             return state
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1499,7 +1626,7 @@ class ResearchWorkspace:
             "development_end": None,
         }
         write_json_atomic(self.state_path, state)
-        self._prepare_runtime(state, development_end)
+        self._prepare_runtime(state, development_end, evaluation_runtime)
         return state
 
     def load_state(self, strategy_path: str | None = None) -> dict[str, Any]:
