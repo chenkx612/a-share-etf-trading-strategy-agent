@@ -185,7 +185,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
     parameter_selection = task.parameter_selection
     assert parameter_selection is not None
     if task.strategy_module is None:
-        raise ValueError("production task must define task.strategy.module")
+        raise ValueError("production task must define task.strategy")
 
     strategy_path = root_path / task.strategy_path
     research_dir = root_path / ".research" / task.task_id

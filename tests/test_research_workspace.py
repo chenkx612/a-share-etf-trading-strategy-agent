@@ -56,19 +56,14 @@ universe = "universe.csv"
 
 [scope]
 editable = ["strategy.py"]
-forbidden = ["evaluator.py"]
 
 [commands]
-test = ["test-command"]
+tests = ["tests/test_strategy.py"]
 backtest = ["backtest", "--start", "{{start}}", "--end", "{{end}}", "--run-id", "{{run_id}}"]
-metrics_path = "outputs/backtests/{{run_id}}/metrics.json"
 
 [evaluation]
 mode = "fixed"
 objective = "sortino"
-
-[evaluation.contract]
-paths = [".gitignore"]
 
 [evaluation.constraints]
 max_drawdown = {{ operator = "abs<=", threshold = 0.20 }}
@@ -1141,8 +1136,8 @@ def test_parent_fixed_test_cache_invalidates_for_every_applicability_input(
 
     task_path.write_text(
         task_path.read_text(encoding="utf-8").replace(
-            'test = ["test-command"]',
-            'test = ["test-command", "--fixed"]',
+            'tests = ["tests/test_strategy.py"]',
+            'tests = ["tests/test_strategy.py", "tests/test_fixed.py"]',
         ),
         encoding="utf-8",
     )
@@ -1249,8 +1244,8 @@ def test_parent_fixed_test_template_error_is_unavailable_with_evidence(
     task_path = _task(tmp_path, "parent-template-error")
     task_path.write_text(
         task_path.read_text(encoding="utf-8").replace(
-            'test = ["test-command"]',
-            'test = ["test-command", "{strategy_name}"]',
+            'tests = ["tests/test_strategy.py"]',
+            'tests = ["tests/{strategy_name}.py"]',
         ),
         encoding="utf-8",
     )
@@ -1283,7 +1278,12 @@ def test_parent_fixed_test_template_error_is_unavailable_with_evidence(
         (raised.value.evidence_path / "failure.json").read_text(encoding="utf-8")
     )
     assert evidence["failure_code"] == "parent_fixed_tests_unavailable"
-    assert evidence["command"] == ["test-command", "{strategy_name}"]
+    assert evidence["command"][1:] == [
+        "-m",
+        "pytest",
+        "-q",
+        "tests/{strategy_name}.py",
+    ]
     assert len(evidence["test_command_contract_sha256"]) == 64
     assert "strategy_name" in (
         raised.value.evidence_path / "parent-tests.log"
@@ -1295,8 +1295,8 @@ def test_candidate_test_failure_is_compared_with_parent(tmp_path: Path) -> None:
     task = _task(tmp_path)
     task.write_text(
         task.read_text(encoding="utf-8").replace(
-            'test = ["test-command"]',
-            'test = ["test-command", "{run_id}"]',
+            'tests = ["tests/test_strategy.py"]',
+            'tests = ["tests/{run_id}.py"]',
         ),
         encoding="utf-8",
     )
@@ -1309,9 +1309,9 @@ def test_candidate_test_failure_is_compared_with_parent(tmp_path: Path) -> None:
         log_path: Path,
         timeout: int,
     ) -> int:
-        if command[0] == "test-command":
+        if command[1:4] == ["-m", "pytest", "-q"]:
             test_workspaces.append(cwd)
-            test_run_ids.append(command[1])
+            test_run_ids.append(Path(command[4]).stem)
             failed = (cwd / "strategy.py").read_text(encoding="utf-8") != "1.0\n"
             if failed:
                 log_path.write_text("candidate regression", encoding="utf-8")
@@ -1353,7 +1353,7 @@ def test_candidate_and_parent_test_failure_becomes_infrastructure(
         log_path: Path,
         timeout: int,
     ) -> int:
-        if command[0] == "test-command":
+        if command[1:4] == ["-m", "pytest", "-q"]:
             log_path.write_text(
                 "candidate failure"
                 if ".tmp/worktrees/001/candidates" in cwd.as_posix()
@@ -1386,7 +1386,7 @@ def test_candidate_and_parent_test_failure_becomes_infrastructure(
     assert (result_path.parent / "parent-fixed-tests.json").is_file()
 
 
-def test_unrelated_document_does_not_re_evaluate_champion(tmp_path: Path) -> None:
+def test_fixed_task_repository_change_re_evaluates_champion(tmp_path: Path) -> None:
     (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
     task = _task(tmp_path)
     evaluation_run_ids: list[str] = []
@@ -1426,7 +1426,7 @@ def test_unrelated_document_does_not_re_evaluate_champion(tmp_path: Path) -> Non
     assert json.loads(
         (unrelated.parent / "decision.json").read_text(encoding="utf-8")
     )["decision"] == "rejected"
-    assert not any("-champion-" in run_id for run_id in evaluation_run_ids)
+    assert any("-champion-" in run_id for run_id in evaluation_run_ids)
 
     (tmp_path / ".gitignore").write_text(
         ".research/\ndata/\noutputs/\n# evaluator contract changed\n",

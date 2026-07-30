@@ -124,17 +124,23 @@ def load_task_contract(
         raise ValueError(f"Task id must be {TASK_ID!r}, got {task_id!r}")
 
     strategy = task.get("strategy", {})
-    strategy_module = str(strategy.get("module", ""))
     strategy_name = str(strategy.get("name", ""))
-    if not strategy_module or not strategy_name:
-        raise ValueError("Task configuration must define strategy.name and strategy.module")
-    expected_relative = f"src/{strategy_module.replace('.', '/')}.py"
     editable = [str(value) for value in task.get("scope", {}).get("editable", [])]
-    if expected_relative not in editable:
+    if not strategy_name or len(editable) != 1:
         raise ValueError(
-            "Task strategy module is not the task's editable production strategy path: "
-            f"{expected_relative}"
+            "Task configuration must define strategy.name and exactly one editable path"
         )
+    expected_relative = editable[0]
+    strategy_path_parts = Path(expected_relative).parts
+    if (
+        len(strategy_path_parts) < 3
+        or strategy_path_parts[0] != "src"
+        or Path(expected_relative).suffix != ".py"
+    ):
+        raise ValueError("Task editable strategy must be a Python module below src/")
+    strategy_module = ".".join(
+        (*strategy_path_parts[1:-1], Path(expected_relative).stem)
+    )
     strategy_path, strategy_relative = _repo_file(
         repo_root,
         expected_relative,

@@ -25,7 +25,6 @@ timeout_minutes = 30
 
 [strategy]
 name = "sharpe-corr-threshold"
-module = "quant_core.strategy.sharpe_corr_threshold"
 
 [baseline]
 mode = "workspace"
@@ -52,48 +51,12 @@ avg_turnover = { operator = "<=", threshold = 0.30 }
 editable = [
   "src/quant_core/strategy/sharpe_corr_threshold.py",
 ]
-forbidden = [
-  "src/quant_core/backtest/",
-  "src/quant_core/data/",
-  "src/quant_core/research/",
-  "src/quant_core/cli.py",
-  "src/quant_core/config.py",
-  "tests/",
-  "data/",
-  "outputs/",
-  ".agents/",
-  ".research/",
-]
 
 [commands]
-test = ["{python}", "-m", "pytest", "-q", "tests/test_sector_rotation_research.py"]
-backtest = [
-  "{python}", "-m", "quant_core.research.evaluator",
-  "--universe", "{universe}",
-  "--start", "{start}",
-  "--end", "{end}",
-  "--run-id", "{run_id}",
-  "--candidate-module", "{strategy_module}",
-]
-metrics_path = "outputs/backtests/{run_id}/metrics.json"
+tests = ["tests/test_sector_rotation_research.py"]
 
 [evaluation]
 mode = "walk_forward"
-
-[evaluation.contract]
-paths = [
-  "pyproject.toml",
-  "src/quant_core/__init__.py",
-  "src/quant_core/backtest",
-  "src/quant_core/config.py",
-  "src/quant_core/data",
-  "src/quant_core/factors",
-  "src/quant_core/research",
-  "src/quant_core/schedule.py",
-  "src/quant_core/strategy/__init__.py",
-  "tests/test_sector_rotation_research.py",
-  "universes/sector_rotation.csv",
-]
 
 [evaluation.acceptance]
 minimum_improvement = 0.03

@@ -58,29 +58,23 @@ timeout_minutes = 60
 
 [strategy]
 name = "runner-strategy"
-module = "strategy"
 
 [data]
 universe = "universe.csv"
 
 [scope]
 editable = ["strategy.py"]
-forbidden = ["evaluator.py"]
 
 [commands]
-test = ["{python}", "-m", "pytest", "-q"]
+tests = ["tests/test_runner_strategy.py"]
 backtest = [
   "backtest", "--candidate-module", "{strategy_module}",
   "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}"
 ]
-metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
 [evaluation]
 mode = "fixed"
 objective = "sortino"
-
-[evaluation.contract]
-paths = [".gitignore"]
 
 [evaluation.constraints]
 max_drawdown = { operator = "abs<=", threshold = 0.20 }
@@ -154,6 +148,12 @@ WALK_FORWARD_TASK_TOML = TASK_TOML.replace(
 ).replace(
     "[evaluation.fixed.gate]",
     "[evaluation.walk_forward.gate]",
+).replace(
+    'backtest = [\n'
+    '  "backtest", "--candidate-module", "{strategy_module}",\n'
+    '  "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}"\n'
+    ']\n',
+    "",
 )
 
 
@@ -658,7 +658,7 @@ def test_agent_read_only_paths_preserve_generated_output_directory(tmp_path: Pat
 
     paths = _agent_read_only_paths(
         tmp_path,
-        ["tests/", "outputs/", ".research/"],
+        "strategy.py",
         "outputs/backtests/run/metrics.json",
     )
 
@@ -2063,7 +2063,7 @@ def test_metrics_cache_key_changes_with_strategy_module() -> None:
     first_payload = tomllib.loads(TASK_TOML)
     second_payload = tomllib.loads(TASK_TOML)
     third_payload = tomllib.loads(TASK_TOML)
-    second_payload["strategy"]["module"] = "other_strategy"
+    second_payload["scope"]["editable"] = ["other_strategy.py"]
     third_payload["evaluation"]["fixed"]["gate"]["end"] = "2024-11-30"
 
     first = ResearchTask.from_mapping(first_payload)
@@ -2091,7 +2091,7 @@ def test_walk_forward_metrics_cache_key_changes_with_objective_and_constraints()
     assert _metrics_key(first) != _metrics_key(constraint_changed)
 
 
-def test_walk_forward_metrics_cache_key_preserves_legacy_semantic_shape() -> None:
+def test_walk_forward_metrics_cache_key_uses_expanded_harness_contract() -> None:
     task = ResearchTask.from_mapping(tomllib.loads(WALK_FORWARD_TASK_TOML))
     assert task.parameter_selection is not None
     legacy_periods = {
@@ -2099,9 +2099,16 @@ def test_walk_forward_metrics_cache_key_preserves_legacy_semantic_shape() -> Non
         for key in ("train_months", "max_parameter_sets", "schedule")
     } | dict(task.evaluation_periods)
     relevant = {
-        "strategy": task.raw.get("strategy"),
+        "strategy": {
+            "name": task.strategy_name,
+            "module": task.strategy_module,
+        },
         "data": task.raw["data"],
-        "commands": task.raw["commands"],
+        "commands": {
+            **task.raw["commands"],
+            "test_prefix": [sys.executable, "-m", "pytest", "-q"],
+            "metrics_path": task.metrics_path_template,
+        },
         "evaluation": {
             "mode": "walk_forward",
             "objective": task.objective,
@@ -2109,11 +2116,11 @@ def test_walk_forward_metrics_cache_key_preserves_legacy_semantic_shape() -> Non
             "periods": legacy_periods,
         },
     }
-    legacy_key = hashlib.sha256(
+    expanded_key = hashlib.sha256(
         json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
-    assert _metrics_key(task) == legacy_key
+    assert _metrics_key(task) == expanded_key
 
 
 def test_run_once_accepts_compact_blocked_output(tmp_path: Path) -> None:

@@ -32,16 +32,12 @@ universe = "universe.csv"
 editable = ["strategy.py"]
 
 [commands]
-test = ["pytest"]
+tests = ["tests/test_strategy.py"]
 backtest = ["fake-backtest", "{start}", "{end}", "{run_id}"]
-metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
 [evaluation]
 mode = "fixed"
 objective = "sortino"
-
-[evaluation.contract]
-paths = [".gitignore"]
 
 [evaluation.constraints]
 max_drawdown = { operator = "abs<=", threshold = 0.20 }

@@ -35,7 +35,6 @@ timeout_minutes = 30
 
 [strategy]
 name = "liquid-etf-rerank-topk"
-module = "quant_core.strategy.etf_rerank_topk"
 
 [baseline]
 mode = "none"
@@ -62,43 +61,12 @@ avg_turnover = { operator = "<=", threshold = 0.35 }
 editable = [
   "src/quant_core/strategy/etf_rerank_topk.py",
 ]
-forbidden = [
-  "src/quant_core/backtest/",
-  "src/quant_core/data/",
-  "src/quant_core/factors/",
-  "src/quant_core/research/",
-  "src/quant_core/cli.py",
-  "src/quant_core/config.py",
-  "tests/",
-  "universes/",
-  "data/",
-  "outputs/",
-  ".agents/",
-  ".research/",
-]
 
 [commands]
-test = ["{python}", "-m", "pytest", "-q", "tests/test_research_evaluator.py"]
-metrics_path = "outputs/backtests/{run_id}/metrics.json"
+tests = ["tests/test_research_evaluator.py"]
 
 [evaluation]
 mode = "walk_forward"
-
-[evaluation.contract]
-paths = [
-  "pyproject.toml",
-  "src/quant_core/__init__.py",
-  "src/quant_core/backtest",
-  "src/quant_core/config.py",
-  "src/quant_core/data",
-  "src/quant_core/factors",
-  "src/quant_core/research",
-  "src/quant_core/schedule.py",
-  "src/quant_core/strategy/__init__.py",
-  "src/quant_core/strategy/sharpe_corr_threshold.py",
-  "tests/test_research_evaluator.py",
-  "universes/liquid_etf_rotation.csv",
-]
 
 [evaluation.acceptance]
 minimum_improvement = 0.03

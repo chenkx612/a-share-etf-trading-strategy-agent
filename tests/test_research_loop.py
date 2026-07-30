@@ -48,19 +48,14 @@ universe = "universe.csv"
 
 [scope]
 editable = ["strategy.py"]
-forbidden = ["evaluator.py"]
 
 [commands]
-test = ["test-command"]
+tests = ["tests/test_strategy.py"]
 backtest = ["backtest", "--start", "{{start}}", "--end", "{{end}}", "--run-id", "{{run_id}}"]
-metrics_path = "outputs/backtests/{{run_id}}/metrics.json"
 
 [evaluation]
 mode = "fixed"
 objective = "sortino"
-
-[evaluation.contract]
-paths = [".gitignore"]
 
 [evaluation.constraints]
 max_drawdown = {{ operator = "abs<=", threshold = 0.20 }}

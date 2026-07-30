@@ -1612,12 +1612,47 @@ def _containerize_prompt_command(command: Sequence[str], workspace: Path) -> lis
     return translated
 
 
+_HARNESS_READ_ONLY_PATHS = (
+    "pyproject.toml",
+    "src/quant_core/backtest",
+    "src/quant_core/config.py",
+    "src/quant_core/data",
+    "src/quant_core/factors",
+    "src/quant_core/research",
+    "src/quant_core/cli.py",
+    "tests",
+    "universes",
+    "data",
+    "outputs/factors",
+    ".agents",
+    ".research",
+)
+
+
 def _agent_read_only_paths(
     workspace: Path,
-    forbidden: Sequence[str],
+    editable: str,
     generated_dir: str,
 ) -> list[Path]:
-    candidates = ["data", "outputs/factors", *forbidden]
+    candidates = list(_HARNESS_READ_ONLY_PATHS)
+    editable_path = Path(editable)
+    ancestor = workspace
+    for part in editable_path.parts:
+        child = ancestor / part
+        if ancestor.is_dir():
+            for sibling in ancestor.iterdir():
+                if sibling == child:
+                    continue
+                relative = sibling.relative_to(workspace).as_posix()
+                if (
+                    relative.startswith(".quant-research")
+                    or relative == ".research"
+                    or relative.startswith(".research/")
+                    or _is_within(generated_dir, [relative])
+                ):
+                    continue
+                candidates.append(relative)
+        ancestor = child
     paths: list[Path] = []
     for candidate in candidates:
         normalized = candidate.rstrip("/")
@@ -1675,7 +1710,7 @@ def _parent_test_contract(task: ResearchTask) -> dict[str, Any]:
     if task.strategy_module is not None:
         values["strategy_module"] = task.strategy_module
     return {
-        "command": list(task.raw["commands"]["test"]),
+        "command": [sys.executable, "-m", "pytest", "-q", *task.test_paths],
         "values": values,
     }
 
@@ -1748,7 +1783,7 @@ def run_parent_fixed_tests(
     transient_log = manager.root / ".tmp" / "parent-fixed-tests" / f"{attempt_id}.log"
     transient_log.parent.mkdir(parents=True, exist_ok=True)
     evaluator_path = manager.test_evaluators / attempt_id
-    command = list(task.raw["commands"]["test"])
+    command = [sys.executable, "-m", "pytest", "-q", *task.test_paths]
     timeout = int(task.raw["opencode"]["timeout_minutes"]) * 60
     exit_code = 127
     try:
@@ -1758,7 +1793,7 @@ def run_parent_fixed_tests(
             test_run_id,
             evaluator_path,
         )
-        command = _format_command(task.raw["commands"]["test"], values)
+        command = _format_command(command, values)
         evaluator = manager.create_champion_test_evaluator(attempt_id, state)
         copy_runtime_inputs(manager.evaluation_runtime, evaluator)
         exit_code = command_runner(command, evaluator, transient_log, timeout)
@@ -1854,7 +1889,7 @@ def _evaluation_command(
         "--start", values["start"], "--end", values["end"], "--run-id", values["run_id"],
         "--candidate-module", str(task.strategy_module),
     ]
-    metrics_path = str(task.raw["commands"]["metrics_path"]).format_map(values)
+    metrics_path = task.metrics_path_template.format_map(values)
     command.extend(["--metrics-path", metrics_path])
     if walk_forward_config is not None:
         command.extend(["--walk-forward-config", str(walk_forward_config)])
@@ -1980,7 +2015,7 @@ def _prompt(
         "mechanism only when the history supports one specific, pre-declared corrective change; "
         "do not perform local threshold mining around the rejected candidate.",
         f"Editable paths: {', '.join(raw['scope']['editable'])}",
-        f"Forbidden paths: {', '.join(raw['scope'].get('forbidden', [])) or '(none)'}",
+        f"Harness read-only paths: {', '.join(_HARNESS_READ_ONLY_PATHS)}",
         "The universe and cached market data are fixed for this task. Do not load or run ETF "
         "discovery, pool-selection, data-refresh, or recommendation skills/workflows.",
         f"Test command: {' '.join(test_command)}",
@@ -2391,8 +2426,11 @@ def _run_once_impl(
     raw = task.raw
     fixed = task.evaluation_periods
     development_values = _values(task, fixed["development"], f"{experiment_id}-development", root)
-    development_metrics_path = str(raw["commands"]["metrics_path"]).format_map(development_values)
-    test_command = _format_command(raw["commands"]["test"], development_values)
+    development_metrics_path = task.metrics_path_template.format_map(development_values)
+    test_command = _format_command(
+        [sys.executable, "-m", "pytest", "-q", *task.test_paths],
+        development_values,
+    )
     opencode = raw["opencode"]
     command_timeout = int(opencode["timeout_minutes"]) * 60
     round_timeout = int(raw["budget"].get("round_minutes", opencode["timeout_minutes"])) * 60
@@ -2517,7 +2555,7 @@ def _run_once_impl(
             generated_dir = Path(development_metrics_path).parent.as_posix()
             agent_read_only_paths = _agent_read_only_paths(
                 root,
-                raw["scope"].get("forbidden", []),
+                task.strategy_path,
                 generated_dir,
             )
             agent_read_only_paths.append(checkpoint_receiver.trusted_runtime)
@@ -2656,11 +2694,12 @@ def _run_once_impl(
 
     after = _snapshot(root, out)
     changed = _changed_files(before, after)
-    generated_dir = Path(str(raw["commands"]["metrics_path"]).format_map(development_values)).parent.as_posix()
+    generated_dir = Path(
+        task.metrics_path_template.format_map(development_values)
+    ).parent.as_posix()
     changed = [path for path in changed if not _is_within(path, [generated_dir])]
     editable = raw["scope"]["editable"]
-    forbidden = raw["scope"].get("forbidden", [])
-    invalid = [path for path in changed if not _is_within(path, editable) or _is_within(path, forbidden)]
+    invalid = [path for path in changed if not _is_within(path, editable)]
     if invalid:
         return _write_failed(
             out,
@@ -2740,7 +2779,7 @@ def _run_once_impl(
                 agent_output,
                 round_timing,
             )
-        metrics_path = evaluation_root / str(raw["commands"]["metrics_path"]).format_map(values)
+        metrics_path = evaluation_root / task.metrics_path_template.format_map(values)
         if not metrics_path.exists():
             return _write_failed(
                 out,
@@ -2889,7 +2928,7 @@ def _evaluate_existing(
         ) != 0:
             _emit(event_sink, f"champion_{label}_failed", message=f"champion {label} failed", **details)
             raise RuntimeError(f"champion {label} backtest failed")
-        metrics_path = workspace / str(raw["commands"]["metrics_path"]).format_map(values)
+        metrics_path = workspace / task.metrics_path_template.format_map(values)
         try:
             metrics[label] = json.loads(metrics_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
@@ -3050,9 +3089,16 @@ def _metrics_key(task: ResearchTask) -> str:
             for key in ("train_months", "max_parameter_sets", "schedule")
         } | periods
     relevant = {
-        "strategy": task.raw.get("strategy"),
+        "strategy": {
+            "name": task.strategy_name,
+            "module": task.strategy_module,
+        },
         "data": task.raw["data"],
-        "commands": task.raw["commands"],
+        "commands": {
+            **task.raw["commands"],
+            "test_prefix": [sys.executable, "-m", "pytest", "-q"],
+            "metrics_path": task.metrics_path_template,
+        },
         "evaluation": {
             "mode": task.evaluation_mode,
             "objective": task.objective,

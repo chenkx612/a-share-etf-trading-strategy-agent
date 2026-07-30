@@ -94,20 +94,21 @@ quant-agent loop active_etf_rerank_topk -d
 ### Task and candidate contract
 
 研究任务在 `task.toml` 中声明目标、数据、Development/Gate 区间、允许修改的范围、
-固定评测命令、硬约束、Champion 改善要求、模型配置和运行预算。每次调用自动分配新的
+专项测试、硬约束、Champion 改善要求、模型配置和运行预算。每次调用自动分配新的
 编号 Run；重复研发时继续使用默认 `.research`，无需显式传入 `--research-root`。`tasks/`
 目录中的 TOML 文件是可直接运行的任务配置示例，字段由
 `src/quant_core/research/contracts.py` 验证。
 
 - `scope.editable` 当前只能声明一个仓库相对策略文件。
-- `evaluation.contract.paths` 必须显式列出固定测试、回测及其导入或读取的仓库文件和目录。
-  路径必须是规范化的仓库相对字面量，不能使用 glob、运行时目录或包含 editable 策略；Harness
-  会哈希这些路径下已跟踪改动及非 ignored 的未跟踪文件。README、`ISSUES.md` 和无关 Skill 等
-  未声明内容不会使 Champion 指标失效。新增评测依赖时必须同时扩充该清单。
+- 策略模块由唯一的 `scope.editable` Python 文件确定性推导，无需重复声明。
+- Walk-Forward 的 evaluator contract 由 Harness 固定代码路径、整个 `tests/` 和
+  `data.universe` 自动组成；Fixed 模式对 editable 策略之外的仓库内容整体取指纹。
 - `baseline.mode = "workspace"` 从工作区策略初始化 Champion；`"none"` 用于 0→1 研发，
   可配合 `baseline.exclude` 从候选基座排除旧策略实现。
+- `commands.tests` 只声明 pytest 文件或节点；Harness 自动添加 Python、pytest 和静默参数。
 - 回测命令支持 `{python}`、`{universe}`、`{start}`、`{end}`、`{run_id}`、
-  `{strategy_name}` 和 `{strategy_module}` 占位符；指标路径必须包含 `{run_id}`。
+  `{strategy_name}` 和 `{strategy_module}` 占位符。Walk-Forward 评测命令及
+  `outputs/backtests/{run_id}/metrics.json` 指标路径由 Harness 固定生成。
 - `evaluation.mode = "fixed"` 保持原有的不重叠 Development/Gate 评测；
   `"walk_forward"` 用最近训练窗口逐折选参、在后续不重叠验证折评测。调参边界由
   顶层 `parameter_selection.schedule` 显式声明，而不再锚定 Development/Gate 的
@@ -160,15 +161,16 @@ quant-agent loop active_etf_rerank_topk -d
   历史 Champion 指标变为 stale，并在下一次晋级比较前重评。完整清单保存在
   `.research/<task-id>/environments/<sha256>.json`。
 
-运行前还应确认 OpenCode 模型与认证可用，并且任务声明的测试和回测命令可以在仓库根目录运行。
+运行前还应确认 OpenCode 模型与认证可用，并且任务声明的测试及 Fixed 模式回测命令可以在仓库根目录运行。
 Provider 模型名、推理档位、认证和价格属于外部状态，不在仓库中维护静态清单。
 
 ### Candidate Agent container
 
 候选研发阶段必须通过 Docker 执行，不会在 Docker 不可用或镜像缺失时回退到宿主机
 OpenCode。容器只挂载当前候选 worktree；worktree 的父级 Research Root、Gate runtime 和
-主工作区不会进入容器。候选中的 `data/`、`outputs/factors/` 以及不承载回测生成输出的
-`scope.forbidden` 路径会以只读方式重新挂载。候选代码和回测生成目录保持可写。
+主工作区不会进入容器。候选中的框架、测试、universe、`data/`、`outputs/factors/`、
+`.agents/` 和 `.research/` 等 Harness 固定保护路径会以只读方式重新挂载。
+editable 策略和回测生成目录保持可写。
 Harness 还会把宿主临时身份文件只读挂载到
 `/run/quant-research/candidate-container`，并继续使用 `cap-drop=ALL` 和
 `no-new-privileges`。真正的执行边界由另一个 OS 级只读 bind mount 提供：候选工作区中的

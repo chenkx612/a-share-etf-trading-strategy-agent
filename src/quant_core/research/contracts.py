@@ -22,6 +22,14 @@ SUPPORTED_BACKTEST_METRICS = {
     "avg_turnover",
 }
 
+METRICS_PATH_TEMPLATE = "outputs/backtests/{run_id}/metrics.json"
+
+EVALUATOR_CONTRACT_BASE_PATHS = (
+    "pyproject.toml",
+    "src/quant_core",
+    "tests",
+)
+
 
 def _required(data: Mapping[str, Any], key: str, expected: type, context: str) -> Any:
     value = data.get(key)
@@ -152,12 +160,12 @@ class ResearchTask:
 
         strategy = data.get("strategy")
         if strategy is not None:
-            if not isinstance(strategy, dict) or set(strategy) != {"name", "module"}:
-                raise ValueError("task.strategy must contain exactly name and module")
+            if not isinstance(strategy, dict) or set(strategy) != {"name"}:
+                raise ValueError(
+                    "task.strategy must contain exactly name; module is derived "
+                    "from task.scope.editable"
+                )
             _required(strategy, "name", str, "task.strategy")
-            module = _required(strategy, "module", str, "task.strategy")
-            if not all(part.isidentifier() for part in module.split(".")):
-                raise ValueError("task.strategy.module must be a Python module path")
 
         parameter_selection = data.get("parameter_selection")
         if parameter_selection is not None:
@@ -263,6 +271,12 @@ class ResearchTask:
                     )
 
         scope = _required(data, "scope", dict, "task")
+        if set(scope) != {"editable"}:
+            if "forbidden" in scope:
+                raise ValueError(
+                    "task.scope.forbidden is Harness-owned; declare only editable"
+                )
+            raise ValueError("task.scope must contain exactly editable")
         cls._string_list(scope, "editable", required=True)
         editable = scope["editable"]
         if len(editable) != 1:
@@ -274,7 +288,8 @@ class ResearchTask:
             or editable[0].endswith("/")
         ):
             raise ValueError("task.scope.editable must be a repository-relative file path")
-        cls._string_list(scope, "forbidden", required=False)
+        if strategy is not None:
+            cls._module_from_strategy_path(editable[0])
 
         baseline = data.get("baseline")
         if baseline is not None:
@@ -303,53 +318,44 @@ class ResearchTask:
                 "walk_forward objective and constraints belong in "
                 "task.parameter_selection"
             )
-        contract = _required(evaluation, "contract", dict, "task.evaluation")
-        if set(contract) != {"paths"}:
-            raise ValueError("task.evaluation.contract must contain exactly paths")
-        cls._string_list(contract, "paths", required=True)
-        normalized_contract_paths: list[str] = []
-        for value in contract["paths"]:
-            if (
-                "\\" in value
-                or value.endswith("/")
-                or PurePosixPath(value).is_absolute()
-                or value in {"", "."}
-                or value != value.strip()
-                or PurePosixPath(value).as_posix() != value
-                or ".." in PurePosixPath(value).parts
-            ):
-                raise ValueError(
-                    "task.evaluation.contract.paths must contain normalized "
-                    "repository-relative files or directories"
-                )
-            normalized = PurePosixPath(value).as_posix()
-            root = PurePosixPath(normalized).parts[0]
-            if root in {"data", "outputs", ".research", ".tmp", ".cache"}:
-                raise ValueError(
-                    "task.evaluation.contract.paths must not include runtime "
-                    "or independently fingerprinted paths"
-                )
-            if normalized in normalized_contract_paths:
-                raise ValueError("task.evaluation.contract.paths must not contain duplicates")
-            normalized_contract_paths.append(normalized)
-        strategy_posix = PurePosixPath(editable[0])
-        for index, path in enumerate(normalized_contract_paths):
-            contract_path = PurePosixPath(path)
-            if contract_path == strategy_posix or contract_path in strategy_posix.parents:
-                raise ValueError(
-                    "task.evaluation.contract.paths must not include the editable strategy"
-                )
-            for other in normalized_contract_paths[index + 1:]:
-                other_path = PurePosixPath(other)
-                if contract_path in other_path.parents or other_path in contract_path.parents:
-                    raise ValueError(
-                        "task.evaluation.contract.paths must not contain overlapping paths"
-                    )
+        if "contract" in evaluation:
+            raise ValueError(
+                "task.evaluation.contract is Harness-owned and must not be configured"
+            )
 
         commands = _required(data, "commands", dict, "task")
-        cls._string_list(commands, "test", required=True)
+        allowed_commands = {"tests", "backtest"} if mode == "fixed" else {"tests"}
+        if set(commands) != allowed_commands:
+            legacy = set(commands) & {"test", "metrics_path"}
+            if legacy:
+                fields = ", ".join(sorted(legacy))
+                raise ValueError(
+                    f"task.commands fields are Harness-owned or obsolete: {fields}"
+                )
+            if mode == "walk_forward" and "backtest" in commands:
+                raise ValueError(
+                    "task.commands.backtest is Harness-owned for walk_forward evaluation"
+                )
+            raise ValueError(
+                f"task.commands must contain exactly {sorted(allowed_commands)}"
+            )
+        cls._string_list(commands, "tests", required=True)
+        for test_path in commands["tests"]:
+            path_part = test_path.split("::", 1)[0]
+            normalized = PurePosixPath(path_part)
+            if (
+                "\\" in test_path
+                or test_path != test_path.strip()
+                or normalized.is_absolute()
+                or ".." in normalized.parts
+                or not path_part.startswith("tests/")
+                or not path_part.endswith(".py")
+            ):
+                raise ValueError(
+                    "task.commands.tests must contain repository-relative "
+                    "pytest files or nodes below tests/"
+                )
         cls._string_list(commands, "backtest", required=mode == "fixed")
-        metrics_path = _required(commands, "metrics_path", str, "task.commands")
         if mode == "fixed":
             backtest_template = " ".join(commands["backtest"])
             for placeholder in ("{start}", "{end}", "{run_id}"):
@@ -369,8 +375,6 @@ class ResearchTask:
                     "task.commands.backtest must reference {strategy_name} or {strategy_module} "
                     "when task.strategy is configured"
                 )
-        if "{run_id}" not in metrics_path:
-            raise ValueError("task.commands.metrics_path must contain {run_id}")
 
         if mode == "fixed":
             _validate_objective_and_constraints(evaluation, "task.evaluation")
@@ -482,6 +486,23 @@ class ResearchTask:
             return
         if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
             raise ValueError(f"{key} must be a non-empty list of strings")
+
+    @staticmethod
+    def _module_from_strategy_path(path: str) -> str:
+        strategy_path = PurePosixPath(path)
+        if strategy_path.suffix != ".py":
+            raise ValueError(
+                "task.scope.editable must be a Python module file "
+                "when task.strategy is configured"
+            )
+        module_parts = [*strategy_path.parts[:-1], strategy_path.stem]
+        if len(module_parts) > 1 and module_parts[0] == "src":
+            module_parts = module_parts[1:]
+        if not all(part.isidentifier() for part in module_parts):
+            raise ValueError(
+                "task.scope.editable must map to a valid Python module path"
+            )
+        return ".".join(module_parts)
 
     @property
     def task_id(self) -> str:
@@ -613,7 +634,16 @@ class ResearchTask:
 
     @property
     def evaluator_contract_paths(self) -> list[str]:
-        return list(self.raw["evaluation"]["contract"]["paths"])
+        if (
+            self.evaluation_mode == "fixed"
+            or not self.strategy_path.startswith("src/quant_core/strategy/")
+        ):
+            return ["."]
+        paths = [
+            *EVALUATOR_CONTRACT_BASE_PATHS,
+            str(self.raw["data"]["universe"]),
+        ]
+        return list(dict.fromkeys(paths))
 
     @property
     def strategy_name(self) -> str | None:
@@ -623,7 +653,19 @@ class ResearchTask:
     @property
     def strategy_module(self) -> str | None:
         strategy = self.raw.get("strategy")
-        return str(strategy["module"]) if isinstance(strategy, Mapping) else None
+        return (
+            self._module_from_strategy_path(self.strategy_path)
+            if isinstance(strategy, Mapping)
+            else None
+        )
+
+    @property
+    def test_paths(self) -> list[str]:
+        return list(self.raw["commands"]["tests"])
+
+    @property
+    def metrics_path_template(self) -> str:
+        return METRICS_PATH_TEMPLATE
 
     @property
     def production(self) -> Mapping[str, Any] | None:

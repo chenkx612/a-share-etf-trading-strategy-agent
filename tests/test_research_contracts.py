@@ -109,20 +109,17 @@ def fixed_task() -> dict:
         "data": {"universe": "universe.csv"},
         "scope": {
             "editable": ["src/quant_core/strategy/etf_momentum.py"],
-            "forbidden": ["data/"],
         },
         "commands": {
-            "test": ["pytest"],
+            "tests": ["tests/test_etf_momentum.py"],
             "backtest": [
                 "python3", "-m", "quant_core.cli",
                 "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}",
             ],
-            "metrics_path": "outputs/backtests/{run_id}/metrics.json",
         },
         "evaluation": {
             "mode": "fixed",
             "objective": "sortino",
-            "contract": {"paths": ["README.md"]},
             "constraints": {
                 "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
             },
@@ -139,9 +136,8 @@ def walk_forward_task() -> dict:
     payload = fixed_task()
     payload["strategy"] = {
         "name": "etf-momentum",
-        "module": "quant_core.strategy.etf_momentum",
     }
-    payload["commands"]["backtest"].append("{strategy_module}")
+    payload["commands"].pop("backtest")
     fixed = payload["evaluation"].pop("fixed")
     objective = payload["evaluation"].pop("objective")
     constraints = payload["evaluation"].pop("constraints")
@@ -414,44 +410,97 @@ def test_task_requires_exactly_one_editable_strategy_script() -> None:
         ResearchTask.from_mapping(payload)
 
 
-def test_task_requires_explicit_evaluator_contract_paths() -> None:
+def test_task_rejects_explicit_evaluator_contract_paths() -> None:
     payload = fixed_task()
-    del payload["evaluation"]["contract"]
+    payload["evaluation"]["contract"] = {"paths": ["README.md"]}
 
-    with pytest.raises(ValueError, match="evaluation.contract"):
+    with pytest.raises(ValueError, match="Harness-owned"):
         ResearchTask.from_mapping(payload)
 
 
 @pytest.mark.parametrize(
-    "paths",
+    ("field", "value", "message"),
     [
-        [],
-        ["/absolute/path"],
-        ["../outside.py"],
-        ["src\\evaluator.py"],
-        ["src/evaluator/"],
-        ["src//evaluator.py"],
-        ["./src/evaluator.py"],
-        [" src/evaluator.py"],
-        ["."],
-        ["outputs/metrics.json"],
-        ["src/quant_core/strategy/etf_momentum.py"],
-        ["src/quant_core", "src/quant_core/config.py"],
-        ["README.md", "README.md"],
+        ("strategy", {"name": "etf-momentum", "module": "legacy.module"}, "module is derived"),
+        (
+            "scope",
+            {
+                "editable": ["src/quant_core/strategy/etf_momentum.py"],
+                "forbidden": ["data/"],
+            },
+            "Harness-owned",
+        ),
+        (
+            "commands",
+            {
+                "test": ["pytest"],
+                "backtest": ["backtest", "{start}", "{end}", "{run_id}"],
+            },
+            "obsolete",
+        ),
+        (
+            "commands",
+            {
+                "tests": ["tests/test_etf_momentum.py"],
+                "backtest": ["backtest", "{start}", "{end}", "{run_id}"],
+                "metrics_path": "outputs/backtests/{run_id}/metrics.json",
+            },
+            "Harness-owned",
+        ),
     ],
 )
-def test_task_rejects_unsafe_evaluator_contract_paths(paths: list[str]) -> None:
+def test_task_rejects_removed_task_fields(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
     payload = fixed_task()
-    payload["evaluation"]["contract"]["paths"] = paths
+    payload[field] = value
 
-    with pytest.raises(ValueError, match="contract.paths|paths must"):
+    with pytest.raises(ValueError, match=message):
+        ResearchTask.from_mapping(payload)
+
+
+@pytest.mark.parametrize(
+    "test_path",
+    ["--collect-only", "../test_strategy.py", "/tmp/test_strategy.py", "README.md"],
+)
+def test_task_rejects_non_test_command_targets(test_path: str) -> None:
+    payload = fixed_task()
+    payload["commands"]["tests"] = [test_path]
+
+    with pytest.raises(ValueError, match="pytest files"):
         ResearchTask.from_mapping(payload)
 
 
 def test_task_exposes_evaluator_contract_paths() -> None:
+    payload = walk_forward_task()
+    payload["commands"]["tests"] = [
+        "tests/test_etf_momentum.py::test_selection",
+    ]
+    task = ResearchTask.from_mapping(payload)
+
+    assert "src/quant_core" in task.evaluator_contract_paths
+    assert "tests" in task.evaluator_contract_paths
+    assert "universe.csv" in task.evaluator_contract_paths
+    assert task.strategy_path not in task.evaluator_contract_paths
+
+
+def test_strategy_module_preserves_root_level_src_filename() -> None:
+    payload = fixed_task()
+    payload["strategy"] = {"name": "root-strategy"}
+    payload["scope"]["editable"] = ["src.py"]
+    payload["commands"]["backtest"].append("{strategy_module}")
+
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.strategy_module == "src"
+
+
+def test_fixed_task_fingerprints_the_repository_around_the_editable_strategy() -> None:
     task = ResearchTask.from_mapping(fixed_task())
 
-    assert task.evaluator_contract_paths == ["README.md"]
+    assert task.evaluator_contract_paths == ["."]
 
 
 @pytest.mark.parametrize(
@@ -596,7 +645,6 @@ def test_task_supports_explicit_strategy_metadata() -> None:
     payload = fixed_task()
     payload["strategy"] = {
         "name": "etf-momentum",
-        "module": "quant_core.strategy.etf_momentum",
     }
     payload["commands"]["backtest"].extend([
         "--candidate-module",
@@ -613,22 +661,19 @@ def test_task_rejects_unused_strategy_metadata() -> None:
     payload = fixed_task()
     payload["strategy"] = {
         "name": "etf-momentum",
-        "module": "quant_core.strategy.etf_momentum",
     }
 
     with pytest.raises(ValueError, match="must reference"):
         ResearchTask.from_mapping(payload)
 
 
-def test_task_rejects_invalid_strategy_module() -> None:
+def test_task_rejects_strategy_path_that_is_not_a_python_module() -> None:
     payload = fixed_task()
-    payload["strategy"] = {
-        "name": "etf-momentum",
-        "module": "quant_core.strategy.etf-momentum",
-    }
+    payload["strategy"] = {"name": "etf-momentum"}
+    payload["scope"]["editable"] = ["src/quant_core/strategy/etf-momentum.txt"]
     payload["commands"]["backtest"].append("{strategy_module}")
 
-    with pytest.raises(ValueError, match="Python module path"):
+    with pytest.raises(ValueError, match="Python module"):
         ResearchTask.from_mapping(payload)
 
 
@@ -683,7 +728,6 @@ def test_walk_forward_task_is_accepted() -> None:
 
 def test_walk_forward_task_does_not_require_unused_backtest_template() -> None:
     payload = walk_forward_task()
-    del payload["commands"]["backtest"]
 
     task = ResearchTask.from_mapping(payload)
 

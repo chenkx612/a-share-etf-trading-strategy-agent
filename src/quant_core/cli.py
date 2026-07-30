@@ -741,7 +741,7 @@ def command_research_test(args: argparse.Namespace) -> None:
         values = {"python": sys.executable, "universe": str(task.raw["data"]["universe"]),
                   "workspace": str(evaluator), "start": str(test["start"]), "end": str(test["end"]), "run_id": run_id,
                   "strategy_name": task.strategy_name or "", "strategy_module": task.strategy_module or ""}
-        metrics_relative = str(task.raw["commands"]["metrics_path"]).format_map(values)
+        metrics_relative = task.metrics_path_template.format_map(values)
         if task.evaluation_mode == "walk_forward":
             command = [sys.executable, "-m", "quant_core.research.evaluator", "--root", str(evaluator),
                        "--universe", str(task.raw["data"]["universe"]), "--start", str(test["start"]),

@@ -39,7 +39,6 @@ timeout_minutes = 30
 
 [strategy]
 name = "example"
-module = "quant_core.strategy.example"
 
 [data]
 universe = "universe.csv"
@@ -48,19 +47,15 @@ universe = "universe.csv"
 editable = ["src/quant_core/strategy/example.py"]
 
 [commands]
-test = ["test-command"]
+tests = ["tests/test_example.py"]
 backtest = [
   "backtest", "--candidate-module", "{strategy_module}",
   "--start", "{start}", "--end", "{end}", "--run-id", "{run_id}"
 ]
-metrics_path = "outputs/backtests/{run_id}/metrics.json"
 
 [evaluation]
 mode = "fixed"
 objective = "sortino"
-
-[evaluation.contract]
-paths = ["fixed_evaluator.py"]
 
 [evaluation.constraints]
 max_drawdown = { operator = "abs<=", threshold = 0.15 }
