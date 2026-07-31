@@ -23,6 +23,8 @@ STANDARD_COLUMNS = [
 ]
 
 DEFAULT_ADJUST = "qfq"
+REFRESH_HISTORY_YEARS = 5
+REFRESH_START_BUFFER_DAYS = 14
 
 
 def parquet_available() -> bool:
@@ -336,12 +338,16 @@ def missing_symbols_for_date(daily: pd.DataFrame | None, universe: pd.DataFrame,
     return sorted(symbols - covered)
 
 
-def refresh_start_date(start: date, end: date) -> date:
+def refresh_window_start(end: date) -> date:
     try:
-        five_year_start = end.replace(year=end.year - 5)
+        five_year_start = end.replace(year=end.year - REFRESH_HISTORY_YEARS)
     except ValueError:
-        five_year_start = end.replace(year=end.year - 5, day=28)
-    return max(start, five_year_start)
+        five_year_start = end.replace(year=end.year - REFRESH_HISTORY_YEARS, day=28)
+    return five_year_start - timedelta(days=REFRESH_START_BUFFER_DAYS)
+
+
+def refresh_start_date(start: date, end: date) -> date:
+    return max(start, refresh_window_start(end))
 
 
 def fetch_daily_if_stale(
@@ -362,7 +368,10 @@ def fetch_daily_if_stale(
 
     effective_start = refresh_start_date(start, end)
     if log is not None and effective_start != start:
-        log(f"refresh start adjusted from {start} to {effective_start} for five-year qfq refresh window")
+        log(
+            f"refresh start adjusted from {start} to {effective_start} "
+            "for buffered five-year qfq refresh window"
+        )
     stale_universe = universe[universe["symbol"].astype(str).isin(stale_symbols)].copy()
     if log is not None:
         log(f"replace stale symbol histories for latest trade date {target_trade_date}: {stale_symbols}")

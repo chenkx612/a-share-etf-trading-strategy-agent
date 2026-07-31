@@ -981,7 +981,7 @@ def test_fetch_daily_if_stale_refreshes_full_capped_window_when_latest_trade_dat
 
     assert not incoming.empty
     assert target_trade_date == TEST_DAY
-    assert calls == [(date(2021, 6, 14), TEST_END_DAY)]
+    assert calls == [(date(2021, 5, 31), TEST_END_DAY)]
 
 
 def test_fetch_daily_if_stale_refreshes_only_symbols_missing_latest_trade_date(

@@ -26,6 +26,7 @@ from quant_core.data.market_data import (
     fetch_daily_if_stale,
     load_universe,
     read_daily,
+    refresh_window_start,
     replace_symbol_history,
     validate_daily,
     write_table,
@@ -44,7 +45,6 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 PRODUCTION_SCHEMA_VERSION = 1
 EXECUTION_SEMANTICS = "close-signal/next-open-trade/open-to-open-return/v1"
 REQUIRED_STRATEGY_FUNCTIONS = ("parameter_grid", "select_with_params")
-SHARED_MARKET_DATA_YEARS = 5
 
 
 class ParameterSearchError(RuntimeError):
@@ -499,13 +499,7 @@ def _refresh_data(
             ],
             ignore_index=True,
         )
-    try:
-        start = requested.replace(year=requested.year - SHARED_MARKET_DATA_YEARS)
-    except ValueError:
-        start = requested.replace(
-            year=requested.year - SHARED_MARKET_DATA_YEARS,
-            day=28,
-        )
+    start = refresh_window_start(requested)
     client = AkshareMarketDataClient()
     incoming, _ = fetch_daily_if_stale(
         refresh_universe,

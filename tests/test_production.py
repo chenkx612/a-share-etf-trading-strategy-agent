@@ -15,7 +15,6 @@ from quant_core.cli import build_parser
 from quant_core.production import (
     ProductionContext,
     SearchResult,
-    SHARED_MARKET_DATA_YEARS,
     StrategyDataRequirements,
     _refresh_data,
     _validate_refresh_preserves_available_history,
@@ -478,8 +477,7 @@ def test_production_refresh_requests_shared_five_year_history(
 
     _refresh_data(ctx, date(2026, 7, 24), skip_refresh=False)
 
-    assert SHARED_MARKET_DATA_YEARS == 5
-    assert captured["start"] == date(2021, 7, 24)
+    assert captured["start"] == date(2021, 7, 10)
 
 
 def test_refresh_history_guard_allows_recently_listed_etf() -> None:
