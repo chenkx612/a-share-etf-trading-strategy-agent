@@ -44,6 +44,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 PRODUCTION_SCHEMA_VERSION = 1
 EXECUTION_SEMANTICS = "close-signal/next-open-trade/open-to-open-return/v1"
 REQUIRED_STRATEGY_FUNCTIONS = ("parameter_grid", "select_with_params")
+SHARED_MARKET_DATA_YEARS = 5
 
 
 class ParameterSearchError(RuntimeError):
@@ -488,8 +489,6 @@ def _refresh_data(
 
     production = context.task.production
     assert production is not None
-    parameter_selection = context.task.parameter_selection
-    assert parameter_selection is not None
     benchmark = _normalize_symbol(production["benchmark"])
     refresh_universe = context.universe.copy()
     if benchmark not in set(refresh_universe["symbol"]):
@@ -500,17 +499,13 @@ def _refresh_data(
             ],
             ignore_index=True,
         )
-    history_years = math.ceil(
-        (
-            int(parameter_selection["train_months"])
-            + int(production["curve_months"])
-        )
-        / 12
-    ) + 1
     try:
-        start = requested.replace(year=requested.year - history_years)
+        start = requested.replace(year=requested.year - SHARED_MARKET_DATA_YEARS)
     except ValueError:
-        start = requested.replace(year=requested.year - history_years, day=28)
+        start = requested.replace(
+            year=requested.year - SHARED_MARKET_DATA_YEARS,
+            day=28,
+        )
     client = AkshareMarketDataClient()
     incoming, _ = fetch_daily_if_stale(
         refresh_universe,
@@ -522,12 +517,43 @@ def _refresh_data(
     )
     if incoming.empty:
         return existing
+    _validate_refresh_preserves_available_history(existing, incoming, start)
     merged = replace_symbol_history(existing if not existing.empty else None, incoming)
     problems = validate_daily(merged)
     if problems:
         raise RuntimeError(f"refreshed market data is invalid: {problems}")
     write_table(merged, paths.data_daily)
     return merged
+
+
+def _validate_refresh_preserves_available_history(
+    existing: pd.DataFrame,
+    incoming: pd.DataFrame,
+    retention_start: date,
+) -> None:
+    """Reject a refresh that drops history already available in the five-year window."""
+    if existing.empty or incoming.empty:
+        return
+    old = existing.copy()
+    new = incoming.copy()
+    old["date"] = pd.to_datetime(old["date"]).dt.normalize()
+    new["date"] = pd.to_datetime(new["date"]).dt.normalize()
+    old["symbol"] = old["symbol"].map(_normalize_symbol)
+    new["symbol"] = new["symbol"].map(_normalize_symbol)
+    window_start = pd.Timestamp(retention_start)
+
+    for symbol in sorted(set(new["symbol"])):
+        available = old[(old["symbol"] == symbol) & (old["date"] >= window_start)]
+        if available.empty:
+            continue
+        refreshed = new[new["symbol"] == symbol]
+        missing_dates = sorted(set(available["date"]) - set(refreshed["date"]))
+        if missing_dates:
+            preview = ", ".join(value.date().isoformat() for value in missing_dates[:3])
+            raise RuntimeError(
+                "refreshed market data would drop available history for "
+                f"{symbol}: missing_dates={len(missing_dates)} ({preview})"
+            )
 
 
 def closed_market_data_end(

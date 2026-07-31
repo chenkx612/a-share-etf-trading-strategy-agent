@@ -15,7 +15,10 @@ from quant_core.cli import build_parser
 from quant_core.production import (
     ProductionContext,
     SearchResult,
+    SHARED_MARKET_DATA_YEARS,
     StrategyDataRequirements,
+    _refresh_data,
+    _validate_refresh_preserves_available_history,
     _historical_boundaries,
     _load_requirements,
     closed_market_data_end,
@@ -453,6 +456,96 @@ def test_market_data_refresh_uses_previous_date_before_current_session_closes() 
         pd.Timestamp("2026-07-29").date(),
         now=early_morning,
     ) == pd.Timestamp("2026-07-29").date()
+
+
+def test_production_refresh_requests_shared_five_year_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = context(tmp_path)
+    captured: dict[str, date] = {}
+
+    def fake_fetch(
+        universe: pd.DataFrame,
+        start: date,
+        end: date,
+        **kwargs: object,
+    ) -> tuple[pd.DataFrame, date]:
+        captured["start"] = start
+        return pd.DataFrame(), end
+
+    monkeypatch.setattr("quant_core.production.fetch_daily_if_stale", fake_fetch)
+
+    _refresh_data(ctx, date(2026, 7, 24), skip_refresh=False)
+
+    assert SHARED_MARKET_DATA_YEARS == 5
+    assert captured["start"] == date(2021, 7, 24)
+
+
+def test_refresh_history_guard_allows_recently_listed_etf() -> None:
+    existing = pd.DataFrame(
+        [
+            {"date": "2024-06-03", "symbol": "A"},
+            {"date": "2026-07-24", "symbol": "A"},
+        ]
+    )
+    incoming = pd.DataFrame(
+        [
+            {"date": "2024-06-03", "symbol": "A"},
+            {"date": "2026-07-24", "symbol": "A"},
+        ]
+    )
+
+    _validate_refresh_preserves_available_history(
+        existing,
+        incoming,
+        date(2021, 7, 24),
+    )
+
+
+def test_refresh_history_guard_rejects_truncating_available_history() -> None:
+    existing = pd.DataFrame(
+        [
+            {"date": "2022-01-04", "symbol": "A"},
+            {"date": "2026-07-24", "symbol": "A"},
+        ]
+    )
+    incoming = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "symbol": "A"},
+            {"date": "2026-07-24", "symbol": "A"},
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="would drop available history"):
+        _validate_refresh_preserves_available_history(
+            existing,
+            incoming,
+            date(2021, 7, 24),
+        )
+
+
+def test_refresh_history_guard_rejects_missing_intermediate_date() -> None:
+    existing = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "symbol": "A"},
+            {"date": "2024-01-03", "symbol": "A"},
+            {"date": "2026-07-24", "symbol": "A"},
+        ]
+    )
+    incoming = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "symbol": "A"},
+            {"date": "2026-07-24", "symbol": "A"},
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="2024-01-03"):
+        _validate_refresh_preserves_available_history(
+            existing,
+            incoming,
+            date(2021, 7, 24),
+        )
 
 
 def test_recommendation_applies_preclose_cutoff_before_refresh(
