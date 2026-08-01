@@ -23,9 +23,16 @@ class SharpeCorrThresholdParams:
     rebalance_every: int = 5
     # Slot-equal weight: each selected name gets max_gross/top_n (unused slots = cash).
     max_gross: float = 0.75
-    # Soft diversification: score = z(Sharpe) - corr_lambda * mean corr to already selected.
+    # Soft diversification: score = z(rank_factor) - corr_lambda * mean corr to already selected.
     # When corr_lambda == 0, fall back to hard corr_threshold blocking.
     corr_lambda: float = 0.0
+    # Vol-scaled ranking: rank_factor = rolling Sharpe / rolling_vol(vol_window)^vol_power.
+    # vol_window <= 0 disables scaling (rank by raw Sharpe). Equal slot weights unchanged.
+    # vol_power > 1 demotes high-vol names more strongly than linear Sharpe/vol.
+    vol_window: int = 0
+    vol_power: float = 1.0
+    # After a stop_loss exit, block re-entry for cooloff_days signal days. 0 disables.
+    cooloff_days: int = 0
 
     def __post_init__(self) -> None:
         if isinstance(self.top_n, bool) or not isinstance(self.top_n, int) or self.top_n <= 0:
@@ -54,6 +61,16 @@ class SharpeCorrThresholdParams:
             raise ValueError("max_gross must be in (0, 1]")
         if not math.isfinite(self.corr_lambda) or self.corr_lambda < 0.0:
             raise ValueError("corr_lambda must be a finite number >= 0")
+        if isinstance(self.vol_window, bool) or not isinstance(self.vol_window, int) or self.vol_window < 0:
+            raise ValueError("vol_window must be an integer >= 0")
+        if not math.isfinite(self.vol_power) or self.vol_power <= 0.0:
+            raise ValueError("vol_power must be a finite number > 0")
+        if (
+            isinstance(self.cooloff_days, bool)
+            or not isinstance(self.cooloff_days, int)
+            or self.cooloff_days < 0
+        ):
+            raise ValueError("cooloff_days must be an integer >= 0")
 
     @property
     def factor_name(self) -> str:
@@ -84,18 +101,20 @@ def parameter_grid() -> list[dict[str, object]]:
         {
             "top_n": top_n,
             "sharpe_window": 25,
-            "factor_lower_bound": 0.0,
+            "factor_lower_bound": 0.25,
             "corr_window": 100,
             "corr_threshold": 1.0,
             "stop_loss_pct": 0.10,
             "rebalance_every": rebalance_every,
-            "max_gross": max_gross,
-            "corr_lambda": corr_lambda,
+            "max_gross": 0.75,
+            "corr_lambda": 4.0,
+            "vol_window": 15,
+            "vol_power": 1.5,
+            "cooloff_days": cooloff_days,
         }
         for top_n in (3, 4)
         for rebalance_every in (5, 10)
-        for max_gross in (0.75,)
-        for corr_lambda in (4.0, 6.0)
+        for cooloff_days in (5, 10)
     ]
 
 
@@ -144,23 +163,41 @@ def select_sharpe_corr_threshold(
     names = df.drop_duplicates("symbol").set_index("symbol")["name"].to_dict()
     available_symbols = sorted(df["symbol"].unique().tolist())
 
-    score_frame = df.pivot(index="date", columns="symbol", values=score_col).sort_index()
+    primary_frame = df.pivot(index="date", columns="symbol", values=score_col).sort_index()
+    if int(params.vol_window) > 0:
+        rolling_vol = daily_rets.rolling(params.vol_window, min_periods=params.vol_window).std()
+        # Causal rank: Sharpe / vol^vol_power (vol_power=1 is linear Sharpe/vol).
+        vol_base = rolling_vol.replace(0.0, float("nan"))
+        power = float(params.vol_power)
+        if power == 1.0:
+            rank_frame = primary_frame / vol_base
+        else:
+            rank_frame = primary_frame / (vol_base ** power)
+    else:
+        rank_frame = primary_frame
+
     held: list[str] = []
+    # signal-day index after stop when cooloff ends (exclusive of re-entry until date_idx >= end).
+    cooloff_until: dict[str, int] = {}
+    signal_idx = -1
     days_since_rebalance = params.rebalance_every  # force first-day rebalance
     slot_weight = float(params.max_gross) / float(params.top_n)
     use_soft = float(params.corr_lambda) > 0.0
+    cooloff_n = int(params.cooloff_days)
 
-    for date in score_frame.index:
+    for date in primary_frame.index:
         if start is not None and date < start:
             continue
         if end is not None and date > end:
             continue
         signal_dates.append(date)
+        signal_idx += 1
 
-        day_scores = score_frame.loc[date].dropna()
+        day_primary = primary_frame.loc[date].dropna()
+        day_rank = rank_frame.loc[date] if date in rank_frame.index else pd.Series(dtype=float)
         day_ret = daily_rets.loc[date] if date in daily_rets.index else pd.Series(dtype=float)
 
-        # Intraday stop on held names: drop and free the slot until next rebalance.
+        # Single-day stop on held names: drop, free slot, start cooloff.
         if held:
             remaining: list[str] = []
             for asset in held:
@@ -174,8 +211,10 @@ def select_sharpe_corr_threshold(
                         "condition": "daily_return < -stop_loss_pct",
                         "daily_return": float(ret_val),
                         "stop_loss_pct": float(params.stop_loss_pct),
-                        "score": float(day_scores.loc[asset]) if asset in day_scores.index else float("nan"),
+                        "score": float(day_primary.loc[asset]) if asset in day_primary.index else float("nan"),
                     })
+                    if cooloff_n > 0:
+                        cooloff_until[str(asset)] = signal_idx + cooloff_n
                 else:
                     remaining.append(asset)
             held = remaining
@@ -184,10 +223,11 @@ def select_sharpe_corr_threshold(
         need_rebalance = days_since_rebalance >= params.rebalance_every or not held
 
         if need_rebalance:
-            candidates = day_scores[day_scores > params.factor_lower_bound]
+            # Eligibility stays on primary rolling Sharpe > bound (not vol-scaled).
+            eligible = day_primary[day_primary > params.factor_lower_bound]
             stopped_assets = {
                 asset
-                for asset in candidates.index
+                for asset in eligible.index
                 if asset in day_ret.index
                 and pd.notna(day_ret[asset])
                 and float(day_ret[asset]) < -params.stop_loss_pct
@@ -201,9 +241,54 @@ def select_sharpe_corr_threshold(
                     "condition": "daily_return < -stop_loss_pct",
                     "daily_return": float(day_ret[asset]),
                     "stop_loss_pct": float(params.stop_loss_pct),
-                    "score": float(candidates.loc[asset]),
+                    "score": float(eligible.loc[asset]),
                 })
-            candidates = candidates.drop(stopped_assets, errors="ignore")
+                if cooloff_n > 0:
+                    cooloff_until[str(asset)] = signal_idx + cooloff_n
+            eligible = eligible.drop(stopped_assets, errors="ignore")
+
+            if cooloff_n > 0:
+                blocked = {
+                    asset
+                    for asset in eligible.index
+                    if signal_idx < int(cooloff_until.get(str(asset), -1))
+                }
+                for asset in sorted(blocked, key=str):
+                    filter_events.append({
+                        "date": date.date().isoformat(),
+                        "symbol": str(asset),
+                        "name": names.get(str(asset), str(asset)),
+                        "filter": "cooloff",
+                        "condition": "within cooloff_days after stop_loss",
+                        "cooloff_days": cooloff_n,
+                        "score": float(eligible.loc[asset]),
+                    })
+                eligible = eligible.drop(list(blocked), errors="ignore")
+
+            # Rank among eligible by vol-scaled score when enabled; drop missing ranks.
+            if int(params.vol_window) > 0:
+                rank_vals = []
+                for asset in eligible.index.tolist():
+                    rv = day_rank[asset] if asset in day_rank.index else float("nan")
+                    if pd.notna(rv) and math.isfinite(float(rv)):
+                        rank_vals.append((asset, float(rv)))
+                    else:
+                        filter_events.append({
+                            "date": date.date().isoformat(),
+                            "symbol": str(asset),
+                            "name": names.get(str(asset), str(asset)),
+                            "filter": "vol_scale_missing",
+                            "condition": "missing rolling vol for sharpe/vol rank",
+                            "vol_window": int(params.vol_window),
+                            "score": float(eligible.loc[asset]),
+                        })
+                candidates = (
+                    pd.Series({a: v for a, v in rank_vals}, dtype=float)
+                    if rank_vals
+                    else pd.Series(dtype=float)
+                )
+            else:
+                candidates = eligible
 
             try:
                 curr_corr = rolling_corr.loc[date]
@@ -237,8 +322,8 @@ def select_sharpe_corr_threshold(
 
         for asset in held:
             score_val = (
-                float(day_scores.loc[asset])
-                if asset in day_scores.index and pd.notna(day_scores.loc[asset])
+                float(day_primary.loc[asset])
+                if asset in day_primary.index and pd.notna(day_primary.loc[asset])
                 else float("nan")
             )
             rows.append({
@@ -323,7 +408,6 @@ def _select_soft_corr(
                 best_pen = pen
         if best_asset is None:
             break
-        # Record high-Sharpe names skipped when a lower-Sharpe diversifier wins the slot.
         for asset in remaining:
             if asset == best_asset:
                 continue
