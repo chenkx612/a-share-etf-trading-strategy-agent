@@ -6,16 +6,50 @@ sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后�
 Gate 指标或研究记忆。后续 Run 必须以 Harness 管理并同步到工作区的本任务当前 Champion
 作为 Parent，不得重置为任务创建前的工作区基线。
 
-当前 Parent 是滚动 Sharpe、sticky 再平衡、max_gross 槽位等权、止损和 soft-correlation
-贪心选择的组合结构。该结构来自多项同时变化的已接受候选，只能作为待继续改进的整体，
-不得把历史表现归因于其中任一单独机制。后续每轮只改变一个可证伪的主要机制，保持其余
-Parent 逻辑不变，并用最小补丁和小型、确定的参数网格建立清晰对照。
+当前 Parent 是 Run 004 / Round 008 同步的 Champion 组合体：滚动 Sharpe 负责准入，
+Sharpe / rolling_vol^vol_power 负责排序，sticky 再平衡期间只响应止损退出，max_gross
+按 top_n 槽位等权且空槽持有现金，soft-correlation 贪心选择负责分散，止损后的 ETF 在
+cooloff_days 内禁止重新进入。当前 parameter_grid 固定 sharpe_window=25、
+factor_lower_bound=0.25、corr_window=100、corr_lambda=4、vol_window=15、vol_power=1.5、
+max_gross=0.75、stop_loss_pct=0.10，并搜索 top_n={3,4}、rebalance_every={5,10}、
+cooloff_days={5,10}。这些结构来自多项同时变化的已接受候选，只能作为待继续改进的整体，
+不得把历史表现归因于 sticky、soft correlation、波动率缩放、参数重配或 cooloff 中的任一
+单独机制。后续每轮只改变一个可证伪的主要机制，保持其余 Parent 逻辑不变，并用最小补丁
+和小型、确定的参数网格建立清晰对照；候选网格应保留至少一个精确 Parent 锚点，避免把
+移除当前可行配置误当作新机制的效果。
 
-下一阶段优先改善 Development walk-forward 的跨折稳健性和训练窗参数可行性，避免结果依赖
-少数可行折、单个参数点或全区间回测。减少 no_feasible_parameter_folds 是诊断目标，不是
-绕过晋级条件的替代指标；候选仍须先满足硬约束，并在 Development 中显示相对 Parent 的
-可解释改善，才值得提交 Gate。Harness 会提供不含精确 Gate 指标的既往研究历史；不得原样
-重复已拒绝的实现，除非新假设、作用路径和参数化方式均有实质区别。
+下一阶段优先改善 Development walk-forward 的跨折稳健性和训练窗参数可行性。当前 Champion
+仍约有 9 个 Development 训练折找不到满足硬约束的参数；先定位这些折究竟被年化收益、回撤
+还是换手约束淘汰，再提出作用路径与该失败模式直接对应的候选。减少
+no_feasible_parameter_folds 是诊断目标，不是绕过晋级条件的替代指标；候选仍须先满足硬约束，
+并在 Development 中显示相对 Parent 的可解释改善，才值得提交 Gate。除聚合指标外，提交前还要
+检查改善是否分布在多个验证折、参数是否集中于单个边界点、相邻参数是否方向一致，以及新增机制
+实际改变了多少持仓日和触发事件；不得只凭全区间回测、最佳参数点或少数可行折送 Gate。
+
+优先研究以下互斥 idea，每轮最多选择一个，不要求按顺序全部实现：
+
+1. 观测感知的相关性估计。当前 Parent 在计算 rolling correlation 前把缺失收益填为 0，可能把
+   上市初期或缺行情误表示为零收益并扭曲 soft-correlation 惩罚。可仅替换为基于成对真实观测、
+   显式 min_pair_observations 的因果滚动相关；缺少足够成对样本时必须给出确定且可解释的处理，
+   不得填补价格或使用未来样本。先量化它对新上市 ETF、相关惩罚和最终持仓的实际影响。
+2. 排序分母的稳健化。当前 Sharpe / 15 日波动率^1.5 会放大短窗波动率估计误差。可仅研究一个
+   因果 shrinkage 风险尺度，例如把短窗方差向较长窗历史方差收缩，或对截面波动率分母做预先
+   声明的稳健下限；保持准入、soft correlation、槽位等权和退出逻辑不变。它必须不同于已拒绝的
+   逆波动率持仓权重、单纯延长 vol_window 或 downside-vol 排序。
+3. 波动率标准化的止损触发。当前所有 ETF 共用单日 -10% 阈值，可仅把退出条件改为由截至 t 日的
+   自身历史波动率决定、且有明确上下界的异常跌幅阈值，继续在 t+1 由固定回测器执行；保持 cooloff
+   状态机和其他选股逻辑不变。它必须不同于已拒绝的固定更紧止损、trailing drawdown、最长持有期
+   和 take-profit。
+4. 若前三类没有 Development 证据，再考虑对 soft-correlation 分数本身做稳健化，例如仅改变相关
+   惩罚的截面标准化或对极端相关估计收缩；不得同时改变 corr_window、corr_lambda、rank factor 与
+   持仓惯性，也不得复刻已失败的 hard max-pair prune。
+
+既往已拒绝或未形成有效证据的路径包括：逆波动率持仓权重、max_new_names 换手帽、downside z
+惩罚、名称级 trailing drawdown、max_hold_days、rank persistence、较短 corr_window、较低
+corr_lambda、较长 rebalance_every、post-stop gross redeploy、单纯较长 vol_window、incumbent
+hold_boost，以及二元趋势/波动 risk-off。不得只改名称或轻微改阈值后重复这些实现；若重新研究，
+必须说明新的失败诊断、不同作用路径和可证伪预期。Harness 会提供不含精确 Gate 指标的既往研究
+历史；不得尝试推断、读取或利用历史精确 Gate 表现来选择候选。
 
 active_etf_rotation.csv 只决定允许参与的 symbol 集合。fund_size 是当前时点的审计字段，
 不得进入历史打分、权重、阈值或参数选择。该 CSV 是当前成分快照，因此仍存在幸存者偏差；
