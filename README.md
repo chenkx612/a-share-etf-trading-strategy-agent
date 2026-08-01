@@ -129,8 +129,10 @@ quant-agent loop active_etf_rerank_topk -d
   `objective`、`constraints`、`max_parameter_sets` 和 `schedule`。Research、逐日推荐
   与生产因果曲线共用该政策；`[production]` 只声明曲线窗口、基准和可选数据要求。
   策略调用内的迟滞等路径状态在调参边界重置，并在同一周期内连续回放。
-- 硬约束运算符为 `>=`、`<=` 和 `abs<=`；可选 Test 区间必须位于 Gate 之后，使用
-  `research test --task path/to/task.toml` 对当前 Champion 单独评测，结果不参与晋级。
+- 硬约束运算符为 `>=`、`<=` 和 `abs<=`；可选 Test 区间必须位于 Gate 之后。配置
+  `[evaluation.test]` 后，Harness 会在每个 Run 停止并完成终局报告后自动评测该 Run 的最终
+  Champion，结果只供人工观察，不参与晋级、停止条件、后续候选 Prompt 或研究记忆。兼容命令
+  `research test --task path/to/task.toml` 仍可按需对当前任务级 Champion 另行评测。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
 - `budget.round_minutes` 是每轮候选研发的硬时限；未配置时兼容使用
@@ -251,16 +253,24 @@ conda run --no-capture-output -n quant python -m quant_core.cli research clean \
 
 任务级 Champion 保存在 `.research/<task-id>/champion.py` 和 `champion.json`；每轮的
 `result.json`、`decision.json` 和可从冻结 Parent 重放的 `candidate.patch` 保存在
-`runs/<run>/rounds/<round>/`。`baseline.mode = "none"` 的首次 0→1 晋级还会保留完整
+`runs/<run>/artifacts/rounds/<round>/`。`baseline.mode = "none"` 的首次 0→1 晋级还会保留完整
 `candidate.py`，其内容哈希与 Round submission 一致。终局复盘
-保存在 `runs/<run>/report.md`；冻结的叙述与指标输入保存在 `report-input.json`，由最终 Champion
+保存在 `runs/<run>/report.md`；冻结的叙述与指标输入保存在 `artifacts/report/input.json`，由最终 Champion
 反向重放 Accepted Patch、再正向核验所有 Candidate 得到的版本事实链保存在
-`report-facts.json`。报告只能基于事实链解释机制演进，组合变更不得自动归因为单一机制。报告认证失败
+`artifacts/report/facts.json`。新 Run 的恢复状态与冻结输入契约位于 `artifacts/state.json` 和
+`artifacts/contracts/`；已存在的旧 Run 保持原布局且可继续读取或恢复。若任务配置了 Test，终局自动
+评测结果保存在 `runs/<run>/artifacts/test/result.json`；成功时删除冗余 `test.log`，失败时保留日志。
+Run state 记录 `test_status`、`test_path` 和 `test_error`；Harness 会在 Test 后向报告追加确定性的
+“Test 区间观察”，且 Test 指标不会进入报告 Agent 输入。Test 或报告失败均不会改变已完成的 Loop 结论；
+终局开始前会冻结该 Run 的最终 Champion，自动 Test 受 `budget.round_minutes`（未配置时为
+`opencode.timeout_minutes`）限制，因此并发启动后续 Run 或 Test 超时不会破坏 Run 审计边界；
+报告 Agent 失败时仍会生成最小 `report.md` 人类入口。报告只能基于事实链解释机制演进，
+组合变更不得自动归因为单一机制。报告认证失败
 不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop
 的阶段事件会同时输出到终端和
 `.research/<task-id>/.tmp/runs/<run>/events.jsonl`，正常结束后清理临时事件与 worktree。
 使用 `--retain-diagnostics` 时，Harness 还会将不含精确 Gate 指标的事件时间线、阶段日志尾部和
-确定性 `diagnostic-summary.json` 保存到 `.research/<task-id>/.cache/diagnostics/<run>/`。该开关对
+确定性 `diagnostic-summary.json` 保存到新 Run 的 `artifacts/diagnostics/`（旧 Run 仍沿用历史缓存路径）。该开关对
 同一活动 Run 的恢复保持有效，适合在 Loop 停止后让 Codex 只检查摘要和异常 Round；这些缓存可由
 `research clean` 删除，不参与晋级或后续候选 Prompt。
 
@@ -271,7 +281,9 @@ Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止
 Run，没有完整决策的当前 Round 会作为失败证据
 落盘；已经正常停止的 Run 不会恢复，而是分配下一个编号。
 
-`research clean` 会删除可选诊断缓存，但不会删除结构化 Round 结果、Decision、候选 checkpoint、patch、首次 0→1
+`research clean` 会删除可选诊断缓存。schema 5 的成功 Round 会删除可由结构化结果与认证 Patch
+替代的 checkpoint、成功 bind-probe、评测日志和 Agent 事件；失败或中断 Round 保留诊断证据。
+清理不会改写或删除已完成历史 Run，也不会删除结构化 Round 结果、Decision、patch、首次 0→1
 候选源码、Champion、冻结的 Evaluation 数据或终局报告，也不会清理仍在运行的 Loop。
 
 ## Quant framework

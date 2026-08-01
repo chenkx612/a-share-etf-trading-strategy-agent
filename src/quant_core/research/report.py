@@ -37,6 +37,8 @@ _REPORT_INPUT_CONTAINER_PATH = "/workspace/report-input.json"
 _REPORT_FACTS_CONTAINER_PATH = "/workspace/report-facts.json"
 _REPORT_INSTRUCTION_MAX_BYTES = 64 * 1024
 _REPORT_TITLE = "# Research Loop 总结"
+_TEST_SECTION_START = "<!-- harness:test-observation:start -->"
+_TEST_SECTION_END = "<!-- harness:test-observation:end -->"
 _FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_PREAMBLE_BLOCK = re.compile(
     r"^ {0,3}(?:"
@@ -71,6 +73,87 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def _write_loop_state(path: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_json_atomic(path, state)
+
+
+def append_test_observation(
+    report_path: Path,
+    task: ResearchTask,
+    manager: ResearchWorkspace,
+    loop_state: Mapping[str, Any],
+) -> Path:
+    """Append the Harness-owned Test summary without exposing it to the Agent."""
+    try:
+        body = report_path.read_text(encoding="utf-8")
+    except OSError:
+        body = "# Research Loop 总结\n"
+    pattern = re.compile(
+        rf"\n*{re.escape(_TEST_SECTION_START)}.*?{re.escape(_TEST_SECTION_END)}\s*",
+        re.DOTALL,
+    )
+    body = pattern.sub("\n", body).rstrip()
+    test = task.test_period
+    status = str(loop_state.get("test_status") or "unknown")
+    result = _read_json(manager.run_test_result_path) or {}
+    champion_sha256 = result.get("strategy_sha256")
+    if not isinstance(champion_sha256, str):
+        champion_sha256 = loop_state.get("final_champion_sha256")
+    if not isinstance(champion_sha256, str):
+        try:
+            champion_sha256 = manager.load_state(task.strategy_path).get(
+                "champion_sha256"
+            )
+        except Exception:
+            champion_sha256 = None
+    lines = [
+        _TEST_SECTION_START,
+        "## Test 区间观察",
+        "",
+        f"- 区间：{test['start']} 至 {test['end']}" if isinstance(test, Mapping) else "- 区间：未配置",
+        f"- 状态：{status}",
+        f"- Champion SHA-256：{champion_sha256 or '不可用'}",
+    ]
+    metrics = result.get("metrics")
+    scalar_metrics = (
+        sorted(
+            (str(key), value)
+            for key, value in metrics.items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        )
+        if isinstance(metrics, Mapping)
+        else []
+    )
+    if scalar_metrics:
+        lines.extend(["", "### 核心聚合指标", "", "| 指标 | 值 |", "|---|---:|"])
+        for key, value in scalar_metrics:
+            rendered = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+            lines.append(f"| {key} | {rendered} |")
+    lines.extend([_TEST_SECTION_END, ""])
+    temporary = report_path.with_suffix(".md.tmp")
+    temporary.write_text(body + "\n\n" + "\n".join(lines), encoding="utf-8")
+    temporary.replace(report_path)
+    return report_path
+
+
+def write_minimal_loop_report(
+    task: ResearchTask,
+    manager: ResearchWorkspace,
+    loop_state: Mapping[str, Any],
+) -> Path:
+    """Guarantee a stable human entry point when report generation fails."""
+    reason = str(loop_state.get("report_error") or "未知报告错误")
+    report = (
+        "# Research Loop 总结\n\n"
+        "报告 Agent 未能生成完整复盘；以下为 Harness 保留的最小终局摘要。\n\n"
+        f"- Run 状态：{loop_state.get('status')}\n"
+        f"- 停止原因：{loop_state.get('stop_reason')}\n"
+        f"- 报告失败原因：{reason}\n"
+        f"- Test 状态：{loop_state.get('test_status')}\n"
+    )
+    manager.report_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = manager.report_path.with_suffix(".md.tmp")
+    temporary.write_text(report, encoding="utf-8")
+    temporary.replace(manager.report_path)
+    return append_test_observation(manager.report_path, task, manager, loop_state)
 
 
 def _loop_round_ids(
@@ -174,11 +257,12 @@ def _loop_integrity_warnings(
 def _strategy_source(
     manager: ResearchWorkspace,
     champion_sha256: object,
+    frozen_path: Path | None = None,
 ) -> str | None:
     if not isinstance(champion_sha256, str):
         return None
     try:
-        return manager.champion_path.read_text(encoding="utf-8")
+        return (frozen_path or manager.champion_path).read_text(encoding="utf-8")
     except OSError:
         return None
 
@@ -319,11 +403,22 @@ def generate_loop_report(
             )
         task = bind_persisted_periods(task, persisted)
     task_state = manager.load_state(task.strategy_path)
-    manager.refresh_champion_metrics_status(
-        task_state,
-        _metrics_key(task),
-        task.evaluator_contract_paths,
-    )
+    if "final_champion_sha256" in loop_state:
+        task_state = {
+            **task_state,
+            "champion_sha256": loop_state.get("final_champion_sha256"),
+            "champion_round_id": loop_state.get("final_champion_round_id"),
+            "champion_number": loop_state.get("final_champion_number"),
+            "champion_metrics_record": loop_state.get(
+                "final_champion_metrics_record"
+            ),
+        }
+    else:
+        manager.refresh_champion_metrics_status(
+            task_state,
+            _metrics_key(task),
+            task.evaluator_contract_paths,
+        )
     round_ids = _loop_round_ids(manager.rounds, loop_state)
     experiments = _experiment_records(manager.rounds, round_ids)
     integrity_warnings = _loop_integrity_warnings(manager.rounds, loop_state, round_ids)
@@ -395,12 +490,19 @@ def generate_loop_report(
             "strategy_source": _strategy_source(
                 manager,
                 task_state.get("champion_sha256"),
+                (
+                    manager.terminal_champion_path
+                    if loop_state.get("final_champion_sha256")
+                    == task_state.get("champion_sha256")
+                    else None
+                ),
             ),
         },
     }
     current_champion = payload["champion"]
     champion_applicability: dict[str, Any] = {}
-    report_input_path = manager.run_root / "report-input.json"
+    report_input_path = manager.report_input_path
+    report_input_path.parent.mkdir(parents=True, exist_ok=True)
     frozen_payload = _read_json(report_input_path)
     if report_input_path.exists() and frozen_payload is None:
         raise RuntimeError("Frozen report input is missing or invalid")
@@ -461,12 +563,18 @@ def generate_loop_report(
             "Report instructions exceed the safe process argument budget",
             "invocation_argument_too_long",
         )
-    if len(_REPORT_INPUT_CONTAINER_PATH.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
+    report_input_container_path = (
+        "/workspace/" + report_input_path.relative_to(manager.run_root).as_posix()
+    )
+    report_facts_container_path = (
+        "/workspace/" + report_facts_path.relative_to(manager.run_root).as_posix()
+    )
+    if len(report_input_container_path.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
         raise ReportInfrastructureError(
             "Report attachment path exceeds the safe process argument budget",
             "invocation_argument_too_long",
         )
-    if len(_REPORT_FACTS_CONTAINER_PATH.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
+    if len(report_facts_container_path.encode("utf-8")) > _REPORT_INSTRUCTION_MAX_BYTES:
         raise ReportInfrastructureError(
             "Report facts attachment path exceeds the safe process argument budget",
             "invocation_argument_too_long",
@@ -474,8 +582,8 @@ def generate_loop_report(
     opencode = task.raw["opencode"]
     command = [
         "opencode", "run", "--auto", "--format", "json",
-        "--file", _REPORT_INPUT_CONTAINER_PATH,
-        "--file", _REPORT_FACTS_CONTAINER_PATH,
+        "--file", report_input_container_path,
+        "--file", report_facts_container_path,
         "--model", str(opencode["model"]), "--dir", str(manager.run_root),
     ]
     if variant := opencode.get("variant"):
@@ -496,7 +604,8 @@ def generate_loop_report(
         timeout,
     )
     if exit_code != 0:
-        failed_events = manager.run_root / "report-events.jsonl"
+        failed_events = manager.report_events_path
+        failed_events.parent.mkdir(parents=True, exist_ok=True)
         if events_path.exists():
             events_path.replace(failed_events)
         failure = _infrastructure_failure(failed_events)
@@ -509,7 +618,8 @@ def generate_loop_report(
     event_text = _last_text_event(events_path)
     report = _extract_markdown_report(event_text) if event_text is not None else None
     if report is None:
-        failed_events = manager.run_root / "report-events.jsonl"
+        failed_events = manager.report_events_path
+        failed_events.parent.mkdir(parents=True, exist_ok=True)
         if events_path.exists():
             events_path.replace(failed_events)
         raise RuntimeError("OpenCode report session produced no valid Markdown report")
@@ -605,9 +715,12 @@ def regenerate_loop_report(
         loop_state["report_error"] = str(exc)
         loop_state["report_failure_kind"] = getattr(exc, "failure_kind", None)
         loop_state["report_failure_code"] = getattr(exc, "failure_code", None)
+        loop_state["report_path"] = "report.md"
+        write_minimal_loop_report(task, manager, loop_state)
         _write_loop_state(loop_state_path, loop_state)
         restore_runtime_layout()
         raise
+    append_test_observation(report_path, task, manager, loop_state)
     loop_state["report_status"] = "completed"
     loop_state["report_path"] = report_path.relative_to(manager.run_root).as_posix()
     _write_loop_state(loop_state_path, loop_state)

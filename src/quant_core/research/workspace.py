@@ -554,8 +554,34 @@ class ResearchWorkspace:
         return self.runs / self.run_id
 
     @property
+    def uses_legacy_run_layout(self) -> bool:
+        """Return whether an allocated Run uses the pre-schema-5 layout."""
+        return not (self.run_root / "artifacts").exists() and (
+            (self.run_root / "state.json").exists()
+            or (self.run_root / "rounds").exists()
+        )
+
+    @property
+    def run_artifacts_root(self) -> Path:
+        if self.uses_legacy_run_layout:
+            return self.run_root
+        return self.run_root / "artifacts"
+
+    @property
+    def run_contracts_root(self) -> Path:
+        if self.uses_legacy_run_layout:
+            return self.run_root
+        return self.run_artifacts_root / "contracts"
+
+    @property
+    def run_report_root(self) -> Path:
+        if self.uses_legacy_run_layout:
+            return self.run_root
+        return self.run_artifacts_root / "report"
+
+    @property
     def loop_state_path(self) -> Path:
-        return self.run_root / "state.json"
+        return self.run_artifacts_root / "state.json"
 
     @property
     def report_path(self) -> Path:
@@ -563,11 +589,37 @@ class ResearchWorkspace:
 
     @property
     def report_facts_path(self) -> Path:
-        return self.run_root / "report-facts.json"
+        if self.uses_legacy_run_layout:
+            return self.run_root / "report-facts.json"
+        return self.run_report_root / "facts.json"
+
+    @property
+    def report_input_path(self) -> Path:
+        if self.uses_legacy_run_layout:
+            return self.run_root / "report-input.json"
+        return self.run_report_root / "input.json"
+
+    @property
+    def report_events_path(self) -> Path:
+        if self.uses_legacy_run_layout:
+            return self.run_root / "report-events.jsonl"
+        return self.run_report_root / "events.jsonl"
+
+    @property
+    def run_test_root(self) -> Path:
+        return self.run_artifacts_root / "test"
+
+    @property
+    def run_test_result_path(self) -> Path:
+        return self.run_test_root / "result.json"
 
     @property
     def run_temp(self) -> Path:
         return self.root / ".tmp" / "runs" / self.run_id
+
+    @property
+    def terminal_champion_path(self) -> Path:
+        return self.run_temp / "final-champion.py"
 
     @property
     def event_path(self) -> Path:
@@ -577,7 +629,9 @@ class ResearchWorkspace:
     def diagnostics_root(self) -> Path:
         if self.run_number is None:
             raise RuntimeError("research workspace is not bound to a run")
-        return self.root / ".cache" / "diagnostics" / self.run_id
+        if self.uses_legacy_run_layout:
+            return self.root / ".cache" / "diagnostics" / self.run_id
+        return self.run_artifacts_root / "diagnostics"
 
     @property
     def diagnostics_event_path(self) -> Path:
@@ -597,7 +651,7 @@ class ResearchWorkspace:
 
     @property
     def rounds(self) -> Path:
-        return self.run_root / "rounds"
+        return self.run_artifacts_root / "rounds"
 
     @property
     def legacy_experiments(self) -> Path:
@@ -628,15 +682,23 @@ class ResearchWorkspace:
 
     @property
     def development_inputs_path(self) -> Path:
-        return self.run_root / "development-inputs.json"
+        return self.run_contracts_root / "development-inputs.json"
 
     @property
     def evaluation_inputs_path(self) -> Path:
-        return self.run_root / "evaluation-inputs.json"
+        return self.run_contracts_root / "evaluation-inputs.json"
 
     @property
     def resolved_periods_path(self) -> Path:
-        return self.run_root / "resolved-periods.json"
+        return self.run_contracts_root / "resolved-periods.json"
+
+    @property
+    def preflight_failures_root(self) -> Path:
+        return self.run_artifacts_root / "preflight-failures"
+
+    @property
+    def run_diagnostics_root(self) -> Path:
+        return self.run_artifacts_root / "diagnostics"
 
     @property
     def evaluation_runtime(self) -> Path:
@@ -668,7 +730,7 @@ class ResearchWorkspace:
     ) -> None:
         if self.run_number is None:
             raise RuntimeError("cannot freeze Evaluation inputs without a Run")
-        self.run_root.mkdir(parents=True, exist_ok=True)
+        self.run_contracts_root.mkdir(parents=True, exist_ok=True)
         if self.evaluation_inputs_path.exists():
             existing = json.loads(
                 self.evaluation_inputs_path.read_text(encoding="utf-8")
@@ -742,7 +804,8 @@ class ResearchWorkspace:
 
         run_number = self.next_run_number()
         bound = self.for_run(run_number)
-        bound.rounds.mkdir(parents=True, exist_ok=False)
+        # A migrated pre-Run Loop remains on its historical schema/layout.
+        (bound.run_root / "rounds").mkdir(parents=True, exist_ok=False)
         mapping: dict[str, str] = {}
         for index, legacy_id in enumerate(selected, start=1):
             round_id = f"{index:03d}"
@@ -1251,14 +1314,27 @@ class ResearchWorkspace:
             path.unlink()
             removed_files += 1
 
-        experiment_roots = (
-            [self.rounds]
+        def remove_tree(path: Path) -> None:
+            nonlocal removed_files, removed_bytes
+            if not path.is_dir():
+                return
+            files = [item for item in path.rglob("*") if item.is_file()]
+            removed_files += len(files)
+            removed_bytes += sum(item.stat().st_size for item in files)
+            shutil.rmtree(path)
+
+        scoped_runs = (
+            [self]
             if self.run_number is not None
-            else [
-                self.legacy_experiments,
-                *(self.for_run(number).rounds for number in self.run_numbers()),
-            ]
+            else [self.for_run(number) for number in self.run_numbers()]
         )
+        # Historical Run directories are immutable audit records. Only schema-5
+        # artifacts and the pre-Run legacy experiment area are compacted.
+        experiment_roots = [
+            run.rounds for run in scoped_runs if not run.uses_legacy_run_layout
+        ]
+        if self.run_number is None:
+            experiment_roots.insert(0, self.legacy_experiments)
         for experiment_root in experiment_roots:
             if not experiment_root.exists():
                 continue
@@ -1285,7 +1361,8 @@ class ResearchWorkspace:
                             changed = True
                     if changed:
                         write_json_atomic(result_path, result)
-                remove(agent_output_path)
+                if result.get("status") == "completed":
+                    remove(agent_output_path)
 
                 if result.get("status") == "completed":
                     for name in (
@@ -1302,6 +1379,11 @@ class ResearchWorkspace:
                         "opencode-events.attempt-*.jsonl"
                     ):
                         remove(attempt_log)
+                    for attempt_log in experiment.glob("development-attempt-*.log"):
+                        remove(attempt_log)
+                    remove_tree(experiment / "bind-probe")
+                    if (experiment / "candidate.patch").is_file():
+                        remove_tree(experiment / "checkpoints")
 
         report_roots = (
             [self]
@@ -1309,18 +1391,24 @@ class ResearchWorkspace:
             else [self.for_run(number) for number in self.run_numbers()]
         )
         for run in report_roots:
+            if run.uses_legacy_run_layout:
+                continue
             try:
                 report_state = json.loads(run.loop_state_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 report_state = {}
             if report_state.get("report_status") == "completed" and run.report_path.is_file():
-                remove(run.run_root / "report-events.jsonl")
+                remove(run.report_events_path)
 
         return {"removed_files": removed_files, "removed_bytes": removed_bytes}
 
     def clear_diagnostics(self) -> None:
         """Remove opt-in, disposable diagnostics for this task."""
         shutil.rmtree(self.root / ".cache" / "diagnostics", ignore_errors=True)
+        for run_number in self.run_numbers():
+            run = self.for_run(run_number)
+            if not run.uses_legacy_run_layout:
+                shutil.rmtree(run.run_diagnostics_root, ignore_errors=True)
 
     def finalize_diagnostics(self, state: Mapping[str, Any]) -> Path | None:
         """Freeze a deterministic post-run diagnostic index."""
@@ -1436,7 +1524,9 @@ class ResearchWorkspace:
                 target.write_bytes(tail)
                 artifacts.append({
                     "path": target.relative_to(self.diagnostics_root).as_posix(),
-                    "source": source.relative_to(self.run_root).as_posix(),
+                    "source": source.relative_to(
+                        self.run_artifacts_root
+                    ).as_posix(),
                     "size_bytes": len(content),
                     "sha256": hashlib.sha256(content).hexdigest(),
                     "truncated": len(tail) != len(content),
@@ -1451,6 +1541,7 @@ class ResearchWorkspace:
             "stop_reason": state.get("stop_reason"),
             "status": state.get("status"),
             "report_status": state.get("report_status"),
+            "test_status": state.get("test_status"),
             "event_count": len(events),
             "rounds": round_records,
             "findings": findings,
@@ -1571,7 +1662,7 @@ class ResearchWorkspace:
             if frozen != manifest:
                 raise DevelopmentInputsError("Run Development inputs do not match the current view")
         else:
-            self.run_root.mkdir(parents=True, exist_ok=True)
+            self.run_contracts_root.mkdir(parents=True, exist_ok=True)
             write_json_atomic(self.development_inputs_path, manifest)
         return manifest
 
@@ -1734,7 +1825,13 @@ class ResearchWorkspace:
         self._add_worktree(evaluator, base_commit)
         return evaluator
 
-    def create_champion_test_evaluator(self, test_id: str, state: Mapping[str, Any]) -> Path:
+    def create_champion_test_evaluator(
+        self,
+        test_id: str,
+        state: Mapping[str, Any],
+        *,
+        champion_path: Path | None = None,
+    ) -> Path:
         """Create a task-level evaluator for an immutable Champion test."""
         if not isinstance(state.get("champion_sha256"), str):
             raise RuntimeError("research task does not have a champion yet")
@@ -1744,7 +1841,7 @@ class ResearchWorkspace:
         base_commit = self._snapshot_commit(
             state.get("baseline_exclude", []),
             strategy_path=str(state["strategy_path"]),
-            champion_path=self.champion_path,
+            champion_path=champion_path or self.champion_path,
         )
         self._add_worktree(evaluator, base_commit)
         return evaluator

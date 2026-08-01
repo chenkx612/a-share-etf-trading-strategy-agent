@@ -21,7 +21,12 @@ from quant_core.research.environment import (
     capture_evaluation_environment,
     persist_evaluation_environment,
 )
-from quant_core.research.report import generate_loop_report
+from quant_core.research.champion_test import evaluate_run_champion_test
+from quant_core.research.report import (
+    append_test_observation,
+    generate_loop_report,
+    write_minimal_loop_report,
+)
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     CandidateBindPreflightError,
@@ -43,6 +48,9 @@ from quant_core.research.workspace import (
 
 ManagedRunner = Callable[..., Path]
 LoopReporter = Callable[[Path, ResearchWorkspace, dict[str, Any]], Path]
+ChampionTester = Callable[
+    [Path, ResearchTask, ResearchWorkspace, dict[str, Any]], Path
+]
 ContainerPreflight = Callable[..., None]
 ProviderPreflight = Callable[[ResearchTask, Path], None]
 EnvironmentProbe = Callable[[], EvaluationEnvironment]
@@ -71,7 +79,7 @@ def _new_state(
 ) -> dict[str, Any]:
     now = _timestamp()
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "task_id": task.task_id,
         "run_number": run_number,
         "task_fingerprint": fingerprint,
@@ -94,6 +102,9 @@ def _new_state(
         "report_error": None,
         "report_failure_kind": None,
         "report_failure_code": None,
+        "test_status": None,
+        "test_path": None,
+        "test_error": None,
         "diagnostics_enabled": diagnostics_enabled,
         "development_view_sha256": development_view_sha256,
         "development_end": development_end,
@@ -109,8 +120,11 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
         state["current_round"] = state.pop("current_experiment_id", None)
     if "last_round" not in state:
         state["last_round"] = state.pop("last_experiment_id", None)
-    if state.get("schema_version") not in {2, 3, 4}:
+    if state.get("schema_version") not in {2, 3, 4, 5}:
         raise ValueError("research loop uses an incompatible state schema")
+    state.setdefault("test_status", None)
+    state.setdefault("test_path", None)
+    state.setdefault("test_error", None)
     return state
 
 
@@ -154,6 +168,28 @@ def _next_round_id(experiments: Path, reserved: Sequence[object] = ()) -> str:
         if isinstance(value, str) and _ROUND_ID.fullmatch(value):
             highest = max(highest, int(value))
     return f"{highest + 1:03d}"
+
+
+def _adopt_legacy_runner_round(
+    manager: ResearchWorkspace,
+    round_id: str,
+) -> Path | None:
+    """Move output from a pre-schema-5 injected runner into artifacts/."""
+    legacy_round = manager.run_root / "rounds" / round_id
+    canonical_round = manager.rounds / round_id
+    if legacy_round.is_dir():
+        canonical_round.parent.mkdir(parents=True, exist_ok=True)
+        if canonical_round.exists():
+            for child in legacy_round.iterdir():
+                shutil.move(str(child), str(canonical_round / child.name))
+            legacy_round.rmdir()
+        else:
+            shutil.move(str(legacy_round), str(canonical_round))
+    try:
+        legacy_round.parent.rmdir()
+    except OSError:
+        pass
+    return canonical_round if canonical_round.is_dir() else None
 
 
 def _record_decision(state: dict[str, Any], round_id: str, decision: str) -> None:
@@ -204,14 +240,43 @@ def _save(path: Path, state: dict[str, Any]) -> None:
     write_json_atomic(path, state)
 
 
+def _freeze_terminal_champion(
+    task: ResearchTask,
+    manager: ResearchWorkspace,
+    state: dict[str, Any],
+) -> None:
+    """Freeze the Run's final Champion before the Run becomes resumable history."""
+    champion_state = manager.load_state(task.strategy_path)
+    champion_sha256 = champion_state.get("champion_sha256")
+    state["final_champion_sha256"] = champion_sha256
+    state["final_champion_round_id"] = champion_state.get("champion_round_id")
+    state["final_champion_number"] = champion_state.get("champion_number")
+    state["final_champion_metrics_record"] = champion_state.get(
+        "champion_metrics_record"
+    )
+    if not isinstance(champion_sha256, str):
+        manager.terminal_champion_path.unlink(missing_ok=True)
+        return
+    source = manager.champion_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != champion_sha256:
+        raise RuntimeError("Champion changed while the Run terminal snapshot was captured")
+    manager.terminal_champion_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = manager.terminal_champion_path.with_suffix(".py.tmp")
+    temporary.write_bytes(source)
+    temporary.replace(manager.terminal_champion_path)
+
+
 def _finish_with_report(
     task_file: Path,
+    task: ResearchTask,
     manager: ResearchWorkspace,
     loop_state_path: Path,
     state: dict[str, Any],
     reason: str,
     reporter: LoopReporter,
+    champion_tester: ChampionTester,
 ) -> Path:
+    _freeze_terminal_champion(task, manager, state)
     state["status"] = "stopped"
     state["stop_reason"] = reason
     state["report_status"] = "running"
@@ -244,6 +309,60 @@ def _finish_with_report(
         except ValueError:
             state["report_path"] = str(report_path)
         manager.emit_event("report_completed", message="report completed")
+
+    if task.test_period is None:
+        state["test_status"] = "not_configured"
+        state["test_path"] = None
+        state["test_error"] = None
+        manager.emit_event("test_skipped", message="Test period is not configured")
+    else:
+        champion_sha256 = state.get("final_champion_sha256")
+        if not isinstance(champion_sha256, str):
+            state["test_status"] = "unavailable"
+            state["test_path"] = None
+            state["test_error"] = "research Run does not have a Champion to test"
+            manager.emit_event(
+                "test_unavailable", message="Champion is unavailable"
+            )
+        else:
+            state["test_status"] = "running"
+            state["test_path"] = None
+            state["test_error"] = None
+            _save(loop_state_path, state)
+            manager.emit_event("test_started", message="Champion Test started")
+            try:
+                test_path = champion_tester(task_file, task, manager, state)
+            except KeyboardInterrupt:
+                state["test_status"] = "interrupted"
+                state["test_error"] = "Champion Test evaluation was interrupted"
+                manager.emit_event(
+                    "test_interrupted", message="Champion Test interrupted"
+                )
+                manager.finalize_diagnostics(state)
+                manager.cleanup_transient(remove_development_cache=True)
+                _save(loop_state_path, state)
+                raise
+            except Exception as exc:
+                state["test_status"] = "failed"
+                state["test_error"] = str(exc)
+                manager.emit_event("test_failed", message="Champion Test failed")
+            else:
+                state["test_status"] = "completed"
+                try:
+                    state["test_path"] = test_path.relative_to(
+                        manager.run_artifacts_root
+                    ).as_posix()
+                except ValueError:
+                    state["test_path"] = str(test_path)
+                manager.emit_event(
+                    "test_completed", message="Champion Test completed"
+                )
+                (manager.run_test_root / "test.log").unlink(missing_ok=True)
+    if state.get("report_status") == "failed":
+        state["report_path"] = "report.md"
+        write_minimal_loop_report(task, manager, state)
+    else:
+        append_test_observation(manager.report_path, task, manager, state)
     manager.emit_event("run_completed", message=f"stopped: {reason}")
     manager.finalize_diagnostics(state)
     manager.compact_artifacts()
@@ -259,6 +378,7 @@ def run_loop(
     research_root: str | Path = ".research",
     managed_runner: ManagedRunner = run_managed_once,
     reporter: LoopReporter = generate_loop_report,
+    champion_tester: ChampionTester = evaluate_run_champion_test,
     monotonic: Callable[[], float] = time.monotonic,
     container_preflight: ContainerPreflight | None = None,
     provider_preflight: ProviderPreflight | None = None,
@@ -371,7 +491,7 @@ def run_loop(
         state["diagnostics_enabled"] = diagnostics_enabled
         manager.diagnostics_enabled = diagnostics_enabled
         incompatible_development_inputs = (
-            state.get("schema_version") != 4
+            state.get("schema_version") not in {4, 5}
             or state.get("development_view_sha256") != development_view_sha256
             or state.get("development_end") != development_end
             or not manager.development_inputs_path.is_file()
@@ -382,7 +502,6 @@ def run_loop(
             except DevelopmentInputsError:
                 incompatible_development_inputs = True
         if incompatible_development_inputs:
-            state["schema_version"] = 4
             state["status"] = "stopped"
             state["stop_reason"] = "infrastructure_failure"
             state["failure_kind"] = "infrastructure"
@@ -394,11 +513,13 @@ def run_loop(
             _save(manager.loop_state_path, state)
             return _finish_with_report(
                 task_file,
+                task,
                 manager,
                 manager.loop_state_path,
                 state,
                 "infrastructure_failure",
                 reporter,
+                champion_tester,
             )
     else:
         run_number = base_manager.next_run_number()
@@ -439,20 +560,18 @@ def run_loop(
                 })
                 applied = "failed"
             _record_decision(state, current, applied)
-        state["schema_version"] = 4
         state["resume_environment_sha256"] = environment.sha256
         _save(manager.loop_state_path, state)
         return _finish_with_report(
             task_file,
+            task,
             manager,
             manager.loop_state_path,
             state,
             "infrastructure_failure",
             reporter,
+            champion_tester,
         )
-    if active_runs:
-        state["schema_version"] = 4
-
     # Injected managed runners own their execution environment. The production
     # runner must prove its Docker boundary before a Run is allocated or resumed.
     preflight = container_preflight
@@ -533,6 +652,7 @@ def run_loop(
         lifecycle_event = ("run_resumed", "resumed")
     else:
         manager.run_root.mkdir(parents=True, exist_ok=False)
+        manager.run_artifacts_root.mkdir(parents=True, exist_ok=False)
         if evaluation_manifest is not None and resolved_payload is not None:
             manager.freeze_run_evaluation_inputs(
                 evaluation_manifest, resolved_payload
@@ -604,18 +724,20 @@ def run_loop(
         if reason is not None:
             return _finish_with_report(
                 task_file,
+                task,
                 manager,
                 loop_state_path,
                 state,
                 reason,
                 reporter,
+                champion_tester,
             )
 
         if parent_checked_before_lifecycle:
             parent_checked_before_lifecycle = False
         else:
             try:
-                check_parent_fixed_tests(manager.run_root / "preflight-failures")
+                check_parent_fixed_tests(manager.preflight_failures_root)
             except Exception as exc:
                 if getattr(exc, "failure_kind", None) != "infrastructure":
                     raise
@@ -635,7 +757,7 @@ def run_loop(
                 }
                 if isinstance(evidence_path, Path):
                     relative_evidence = (
-                        evidence_path.relative_to(manager.run_root).as_posix()
+                        evidence_path.relative_to(manager.run_artifacts_root).as_posix()
                     )
                     state["failure_evidence"] = relative_evidence
                     preflight_failure["evidence_path"] = relative_evidence
@@ -643,11 +765,13 @@ def run_loop(
                 _save(loop_state_path, state)
                 return _finish_with_report(
                     task_file,
+                    task,
                     manager,
                     loop_state_path,
                     state,
                     "infrastructure_failure",
                     reporter,
+                    champion_tester,
                 )
 
         if authentication_preflight is not None and (
@@ -658,11 +782,13 @@ def run_loop(
             except AgentContainerInfrastructureError:
                 return _finish_with_report(
                     task_file,
+                    task,
                     manager,
                     loop_state_path,
                     state,
                     "infrastructure_failure",
                     reporter,
+                    champion_tester,
                 )
 
         round_ids = state.get("round_ids")
@@ -694,7 +820,7 @@ def run_loop(
             except CandidateBindPreflightError as exc:
                 if candidate is not None and candidate.exists():
                     manager.discard_prepared_candidate(candidate)
-                diagnostic = manager.run_root / "diagnostics" / f"bind-probe-{round_id}"
+                diagnostic = manager.run_diagnostics_root / f"bind-probe-{round_id}"
                 diagnostic.parent.mkdir(parents=True, exist_ok=True)
                 source = exc.evidence_path.parent
                 if source.exists():
@@ -703,16 +829,20 @@ def run_loop(
                     "failure_kind": "infrastructure",
                     "failure_code": exc.code,
                     "message": str(exc),
-                    "evidence_path": diagnostic.relative_to(manager.run_root).as_posix(),
+                    "evidence_path": diagnostic.relative_to(
+                        manager.run_artifacts_root
+                    ).as_posix(),
                 }
                 _save(loop_state_path, state)
                 return _finish_with_report(
                     task_file,
+                    task,
                     manager,
                     loop_state_path,
                     state,
                     "infrastructure_failure",
                     reporter,
+                    champion_tester,
                 )
             except KeyboardInterrupt:
                 if candidate is not None and candidate.exists():
@@ -745,8 +875,14 @@ def run_loop(
             if managed_runner is run_managed_once:
                 runner_options["evaluation_environment"] = environment
                 runner_options["prepared_candidate"] = prepared_candidate
+            else:
+                # Older injected runners derive the former Round parent from
+                # research_root. It is removed immediately after their output
+                # is adopted into the schema-5 artifacts tree.
+                (manager.run_root / "rounds").mkdir(exist_ok=True)
             result_path = managed_runner(task_file, round_id, **runner_options)
         except KeyboardInterrupt:
+            _adopt_legacy_runner_round(manager, round_id)
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"
             state["stop_reason"] = "interrupted"
@@ -756,6 +892,7 @@ def run_loop(
             _save(loop_state_path, state)
             return loop_state_path
         except Exception:
+            _adopt_legacy_runner_round(manager, round_id)
             state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
             state["status"] = "interrupted"
             state["stop_reason"] = "runner_error"
@@ -764,6 +901,15 @@ def run_loop(
             manager.cleanup_transient(preserve_worktree_parents=True)
             _save(loop_state_path, state)
             raise
+
+        # Keep injected/legacy runner adapters usable while schema-5 storage is
+        # authoritative. Production runners already return the canonical path.
+        canonical_round = manager.rounds / round_id
+        if result_path.parent != canonical_round:
+            legacy_round = manager.run_root / "rounds" / round_id
+            if result_path.parent == legacy_round and legacy_round.is_dir():
+                _adopt_legacy_runner_round(manager, round_id)
+                result_path = canonical_round / result_path.name
 
         state["elapsed_seconds"] = float(state["elapsed_seconds"]) + max(0.0, monotonic() - started)
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -780,9 +926,11 @@ def run_loop(
         if result.get("failure_kind") == "infrastructure":
             return _finish_with_report(
                 task_file,
+                task,
                 manager,
                 loop_state_path,
                 state,
                 "infrastructure_failure",
                 reporter,
+                champion_tester,
             )

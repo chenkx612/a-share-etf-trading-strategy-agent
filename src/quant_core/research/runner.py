@@ -1546,16 +1546,23 @@ def _run_opencode_report_read_only(
     log_path: Path,
     timeout: int,
 ) -> int:
+    frozen_inputs = tuple(
+        path
+        for path in (
+            cwd / "report-input.json",
+            cwd / "report-facts.json",
+            cwd / "artifacts" / "report" / "input.json",
+            cwd / "artifacts" / "report" / "facts.json",
+        )
+        if path.is_file()
+    )
     return _run_opencode_container(
         command,
         prompt,
         cwd,
         log_path,
         timeout,
-        read_only_paths=(
-            cwd / "report-input.json",
-            cwd / "report-facts.json",
-        ),
+        read_only_paths=frozen_inputs,
         permissions=_NO_TOOL_PERMISSIONS,
     )
 

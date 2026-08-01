@@ -530,10 +530,24 @@ def command_research_loop(args: argparse.Namespace) -> None:
         f"rounds: {state['rounds_completed']} "
         f"(accepted={state['accepted']}, rejected={state['rejected']}, failed={state['failed']})"
     )
+    run_root = (
+        state_path.parent.parent
+        if state.get("schema_version") == 5 and state_path.parent.name == "artifacts"
+        else state_path.parent
+    )
     if state.get("report_status") == "completed":
-        print(f"report: {state_path.parent / str(state['report_path'])}")
+        print(f"report: {run_root / str(state['report_path'])}")
+    elif state.get("report_status") == "failed" and state.get("report_path"):
+        print(f"report fallback: {run_root / str(state['report_path'])}")
+        print(f"report failed: {state.get('report_error')}")
     elif state.get("report_status") == "failed":
         print(f"report failed: {state.get('report_error')}")
+    if state.get("test_status") == "completed":
+        print(f"test: {state_path.parent / str(state['test_path'])}")
+    elif state.get("test_status") == "failed":
+        print(f"test failed: {state.get('test_error')}")
+    elif state.get("test_status") == "unavailable":
+        print(f"test unavailable: {state.get('test_error')}")
     if state["stop_reason"] == "interrupted":
         raise SystemExit(130)
 

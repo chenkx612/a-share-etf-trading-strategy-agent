@@ -154,6 +154,10 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
         },
         "reasons": [],
     })
+    manager.run_test_root.mkdir(parents=True)
+    write_json_atomic(manager.run_test_result_path, {
+        "metrics": {"test_only_metric": 987654321},
+    })
     captured: dict[str, object] = {}
 
     def fake_agent(
@@ -194,10 +198,12 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
 
     prompt = str(captured["prompt"])
     command = list(captured["command"])
-    report_input = manager.run_root / "report-input.json"
-    report_facts = manager.run_root / "report-facts.json"
+    report_input = manager.report_input_path
+    report_facts = manager.report_facts_path
     attached = report_input.read_text(encoding="utf-8")
     facts = report_facts.read_text(encoding="utf-8")
+    assert "test_only_metric" not in attached
+    assert "987654321" not in attached
     assert "Use a faster risk filter" in attached
     assert "Historical hypothesis from an earlier loop" not in attached
     assert '"decision": "accepted"' in attached
@@ -213,16 +219,16 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert "accepted Round lacks replayable Candidate evidence" in facts
     assert "Use a faster risk filter" not in prompt
     assert "第一条非空行必须精确为 `# Research Loop 总结`" in prompt
-    assert command[command.index("--file") + 1] == "/workspace/report-input.json"
+    assert command[command.index("--file") + 1] == "/workspace/artifacts/report/input.json"
     second_file = command.index("--file", command.index("--file") + 1)
-    assert command[second_file + 1] == "/workspace/report-facts.json"
+    assert command[second_file + 1] == "/workspace/artifacts/report/facts.json"
     assert command[command.index("--model") + 1] == "xai/grok-4.5"
     assert command[command.index("--variant") + 1] == "high"
     assert captured["cwd"] == manager.run_root
     assert captured["timeout"] == 600
     assert report_path.read_text(encoding="utf-8").startswith("# Research Loop 总结")
     assert "已掌握足够信息" not in report_path.read_text(encoding="utf-8")
-    assert not (manager.run_root / "report-events.jsonl").exists()
+    assert not (manager.report_events_path).exists()
     frozen_input = report_input.read_bytes()
     frozen_facts = report_facts.read_bytes()
 
@@ -592,9 +598,9 @@ def test_generate_loop_report_rejects_incomplete_agent_text(tmp_path: Path) -> N
             {"rounds_completed": 0, "round_ids": []},
             agent_runner=fake_agent,
         )
-    assert (manager.run_root / "report-input.json").is_file()
+    assert (manager.report_input_path).is_file()
     assert manager.report_facts_path.is_file()
-    assert (manager.run_root / "report-events.jsonl").is_file()
+    assert (manager.report_events_path).is_file()
 
 
 @pytest.mark.parametrize(
@@ -711,7 +717,7 @@ def test_report_parse_failure_retry_preserves_decision_and_champion(
             agent_runner=ambiguous,
             evaluation_environment=environment,
         )
-    frozen_input = (manager.run_root / "report-input.json").read_bytes()
+    frozen_input = (manager.report_input_path).read_bytes()
     frozen_facts = manager.report_facts_path.read_bytes()
 
     def succeed(
@@ -740,7 +746,7 @@ def test_report_parse_failure_retry_preserves_decision_and_champion(
     assert champion_after["champion_sha256"] == champion_before["champion_sha256"]
     assert base.champion_path.read_bytes() == champion_source_before
     assert (experiment / "decision.json").read_bytes() == decision_before
-    assert (manager.run_root / "report-input.json").read_bytes() == frozen_input
+    assert (manager.report_input_path).read_bytes() == frozen_input
     assert manager.report_facts_path.read_bytes() == frozen_facts
     final_loop_state = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
     assert final_loop_state["stop_reason"] == "max_rounds"
@@ -803,7 +809,7 @@ def test_report_authentication_failure_is_retryable_with_frozen_input(
         )
 
     failed_state = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
-    report_input = manager.run_root / "report-input.json"
+    report_input = manager.report_input_path
     frozen_input = report_input.read_bytes()
     assert failed_state["report_status"] == "failed"
     assert failed_state["report_failure_kind"] == "infrastructure"
@@ -918,7 +924,7 @@ def test_generate_loop_report_exposes_state_integrity_warnings(tmp_path: Path) -
     )
 
     prompt = captured["prompt"]
-    attached = (manager.run_root / "report-input.json").read_text(encoding="utf-8")
+    attached = (manager.report_input_path).read_text(encoding="utf-8")
     assert "integrity_warnings" in attached
     assert "rounds_completed=1 but round_ids contains 0 entries" in attached
     assert "不得为缺失的轮次或工件虚构研究内容" in prompt
@@ -981,7 +987,7 @@ def test_legacy_loop_state_scopes_report_to_latest_rounds(tmp_path: Path) -> Non
         agent_runner=fake_agent,
     )
 
-    attached = (manager.run_root / "report-input.json").read_text(encoding="utf-8")
+    attached = (manager.report_input_path).read_text(encoding="utf-8")
     assert "Current loop" in attached
     assert "Earlier loop" not in attached
     assert '"integrity_warnings": []' in attached
@@ -1047,7 +1053,7 @@ def test_large_report_input_is_attached_without_entering_argv(
         agent_runner=fake_agent,
     )
 
-    frozen = (manager.run_root / "report-input.json").read_bytes()
+    frozen = (manager.report_input_path).read_bytes()
     command = captured["command"]
     assert isinstance(command, list)
     assert len(frozen) > os.sysconf("SC_ARG_MAX")
@@ -1071,3 +1077,36 @@ def test_large_report_input_is_attached_without_entering_argv(
             agent_runner=fake_agent,
         )
     assert failure.value.failure_code == "invocation_argument_too_long"
+
+
+def test_harness_test_observation_replaces_existing_section(tmp_path: Path) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(
+        TASK
+        + "\n[evaluation.test]\nstart = \"2025-01-01\"\nend = \"2025-12-31\"\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
+    manager = base.for_run(1)
+    manager.run_artifacts_root.mkdir(parents=True)
+    manager.report_path.write_text("# Research Loop 总结\n\n正文。\n", encoding="utf-8")
+    manager.run_test_root.mkdir(parents=True)
+    write_json_atomic(manager.run_test_result_path, {
+        "strategy_sha256": "a" * 64,
+        "metrics": {"sortino": 1.5},
+    })
+    task = ResearchTask.load(task_path)
+    state = {"test_status": "completed"}
+
+    research_report.append_test_observation(manager.report_path, task, manager, state)
+    research_report.append_test_observation(manager.report_path, task, manager, state)
+
+    report = manager.report_path.read_text(encoding="utf-8")
+    assert report.count("<!-- harness:test-observation:start -->") == 1
+    assert report.count("## Test 区间观察") == 1
+    assert "| sortino | 1.5 |" in report

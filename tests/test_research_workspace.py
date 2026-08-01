@@ -1719,6 +1719,10 @@ def test_compact_artifacts_removes_success_diagnostics_but_keeps_failure_logs(
         json.dumps({"experiment_id": "001/001", "status": "completed"}),
         encoding="utf-8",
     )
+    (completed / "decision.json").write_text(
+        json.dumps({"experiment_id": "001/001", "decision": "rejected"}),
+        encoding="utf-8",
+    )
     for name in (
         "agent-output.json",
         "opencode-events.jsonl",
@@ -1727,6 +1731,19 @@ def test_compact_artifacts_removes_success_diagnostics_but_keeps_failure_logs(
         "gate.log",
     ):
         (completed / name).write_text("diagnostic\n", encoding="utf-8")
+    (completed / "candidate.patch").write_text("patch\n", encoding="utf-8")
+    bind_probe = completed / "bind-probe"
+    bind_probe.mkdir()
+    (bind_probe / "summary.json").write_text("{}", encoding="utf-8")
+    checkpoint = completed / "checkpoints" / "request" / "001"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "checkpoint.json").write_text("{}", encoding="utf-8")
+    (completed / "development-attempt-001.log").write_text(
+        "successful evaluation\n", encoding="utf-8"
+    )
+    structured_attempt = completed / "development-attempts" / "001"
+    structured_attempt.mkdir(parents=True)
+    (structured_attempt / "attempt.json").write_text("{}", encoding="utf-8")
 
     failed = manager.rounds / "002"
     failed.mkdir()
@@ -1747,9 +1764,14 @@ def test_compact_artifacts_removes_success_diagnostics_but_keeps_failure_logs(
 
     summary = manager.compact_artifacts()
 
-    assert summary["removed_files"] == 6
-    assert sorted(path.name for path in completed.iterdir()) == ["result.json"]
-    assert not (failed / "agent-output.json").exists()
+    assert summary["removed_files"] == 8
+    assert sorted(path.name for path in completed.iterdir()) == [
+        "candidate.patch",
+        "decision.json",
+        "development-attempts",
+        "result.json",
+    ]
+    assert (failed / "agent-output.json").exists()
     assert (failed / "opencode-events.jsonl").exists()
     assert (failed / "opencode-events.attempt-001.jsonl").exists()
     assert (failed / "tests.log").exists()
