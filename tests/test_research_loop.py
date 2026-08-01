@@ -38,11 +38,14 @@ goal = "Improve the strategy"
 max_rounds = {max_rounds}
 max_hours = {max_hours}
 max_consecutive_failures = {max_failures}
+round_minutes = 60
 
 [opencode]
 model = "xai/grok-4.5"
 variant = "high"
-timeout_minutes = 60
+
+[execution]
+command_timeout_minutes = 60
 
 [data]
 universe = "universe.csv"
@@ -470,8 +473,8 @@ def test_automatic_test_timeout_is_bounded_and_keeps_log(
     task = _task(tmp_path, max_rounds=1, include_test=True)
     task.write_text(
         task.read_text(encoding="utf-8").replace(
-            "max_hours = 4",
-            "max_hours = 4\nround_minutes = 1",
+            "round_minutes = 60",
+            "round_minutes = 1",
         ),
         encoding="utf-8",
     )

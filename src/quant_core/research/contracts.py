@@ -148,9 +148,38 @@ class ResearchTask:
         variant = opencode.get("variant")
         if variant is not None and (not isinstance(variant, str) or not variant.strip()):
             raise ValueError("task.opencode.variant must be a non-empty string when provided")
-        timeout_minutes = opencode.get("timeout_minutes")
-        if not isinstance(timeout_minutes, int) or isinstance(timeout_minutes, bool) or timeout_minutes < 1:
-            raise ValueError("task.opencode.timeout_minutes must be a positive integer")
+        legacy_timeout_minutes = opencode.get("timeout_minutes")
+        execution = data.get("execution")
+        if execution is None:
+            if (
+                not isinstance(legacy_timeout_minutes, int)
+                or isinstance(legacy_timeout_minutes, bool)
+                or legacy_timeout_minutes < 1
+            ):
+                raise ValueError(
+                    "task.execution.command_timeout_minutes must be a positive integer"
+                )
+        else:
+            if not isinstance(execution, dict):
+                raise ValueError("task.execution must be a table")
+            command_timeout_minutes = execution.get("command_timeout_minutes")
+            if (
+                not isinstance(command_timeout_minutes, int)
+                or isinstance(command_timeout_minutes, bool)
+                or command_timeout_minutes < 1
+            ):
+                raise ValueError(
+                    "task.execution.command_timeout_minutes must be a positive integer"
+                )
+            if legacy_timeout_minutes is not None:
+                raise ValueError(
+                    "task.opencode.timeout_minutes is legacy and cannot be combined with "
+                    "task.execution.command_timeout_minutes"
+                )
+            if round_minutes is None:
+                raise ValueError(
+                    "task.budget.round_minutes is required with task.execution"
+                )
 
         source = _required(data, "data", dict, "task")
         _required(source, "universe", str, "task.data")
@@ -507,6 +536,20 @@ class ResearchTask:
     @property
     def task_id(self) -> str:
         return str(self.raw["id"])
+
+    @property
+    def command_timeout_minutes(self) -> int:
+        execution = self.raw.get("execution")
+        if isinstance(execution, Mapping):
+            return int(execution["command_timeout_minutes"])
+        return int(self.raw["opencode"]["timeout_minutes"])
+
+    @property
+    def round_timeout_minutes(self) -> int:
+        round_minutes = self.raw["budget"].get("round_minutes")
+        if round_minutes is not None:
+            return int(round_minutes)
+        return int(self.raw["opencode"]["timeout_minutes"])
 
     @property
     def evaluation_mode(self) -> str:

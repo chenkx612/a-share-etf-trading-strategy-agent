@@ -1791,7 +1791,7 @@ def run_parent_fixed_tests(
     transient_log.parent.mkdir(parents=True, exist_ok=True)
     evaluator_path = manager.test_evaluators / attempt_id
     command = [sys.executable, "-m", "pytest", "-q", *task.test_paths]
-    timeout = int(task.raw["opencode"]["timeout_minutes"]) * 60
+    timeout = task.command_timeout_minutes * 60
     exit_code = 127
     try:
         values = _values(
@@ -2439,8 +2439,8 @@ def _run_once_impl(
         development_values,
     )
     opencode = raw["opencode"]
-    command_timeout = int(opencode["timeout_minutes"]) * 60
-    round_timeout = int(raw["budget"].get("round_minutes", opencode["timeout_minutes"])) * 60
+    command_timeout = task.command_timeout_minutes * 60
+    round_timeout = task.round_timeout_minutes * 60
     finalization_reserve = _development_finalization_reserve(round_timeout)
     development_config: Path | None = None
     agent_development_config: Path | None = None
@@ -2903,7 +2903,7 @@ def _evaluate_existing(
     stale_reasons: Sequence[str] = (),
 ) -> dict[str, Any]:
     raw = task.raw
-    timeout = int(raw["opencode"]["timeout_minutes"]) * 60
+    timeout = task.command_timeout_minutes * 60
     metrics: dict[str, Any] = {}
     copy_runtime_inputs(runtime_source, workspace)
     details: dict[str, Any] = {"round": round_id} if round_id is not None else {}

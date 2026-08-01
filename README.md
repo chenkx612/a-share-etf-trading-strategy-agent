@@ -135,8 +135,11 @@ quant-agent loop active_etf_rerank_topk -d
   `research test --task path/to/task.toml` 仍可按需对当前任务级 Champion 另行评测。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
-- `budget.round_minutes` 是每轮候选研发的硬时限；未配置时兼容使用
-  `opencode.timeout_minutes`。Harness 会向 Agent 提供绝对截止时间，并在候选工作区刷新
+- `budget.round_minutes` 是每轮候选研发的硬时限；
+  `execution.command_timeout_minutes` 是固定测试、Development、Gate 和 Champion 重评等
+  单条 Harness 命令的超时，两者相互独立。旧任务契约仍可从
+  `opencode.timeout_minutes` 兼容读取这两个值，但新任务必须显式配置前两项。Harness 会向
+  Agent 提供绝对截止时间，并在候选工作区刷新
   `.quant-research-round.json`，其中包含剩余秒数和 `research`、`converge`、`finalize`、
   `submit_now` 阶段。候选容器的 OpenCode Bash 默认超时由 Harness 显式设为同一 Round
   时限，实际仍受实时剩余 Round 时间约束，不会再隐含使用较短的工具默认值。每次
@@ -262,8 +265,8 @@ conda run --no-capture-output -n quant python -m quant_core.cli research clean \
 评测结果保存在 `runs/<run>/artifacts/test/result.json`；成功时删除冗余 `test.log`，失败时保留日志。
 Run state 记录 `test_status`、`test_path` 和 `test_error`；Harness 会在 Test 后向报告追加确定性的
 “Test 区间观察”，且 Test 指标不会进入报告 Agent 输入。Test 或报告失败均不会改变已完成的 Loop 结论；
-终局开始前会冻结该 Run 的最终 Champion，自动 Test 受 `budget.round_minutes`（未配置时为
-`opencode.timeout_minutes`）限制，因此并发启动后续 Run 或 Test 超时不会破坏 Run 审计边界；
+终局开始前会冻结该 Run 的最终 Champion，自动 Test 受 `budget.round_minutes` 限制，因此并发
+启动后续 Run 或 Test 超时不会破坏 Run 审计边界；
 报告 Agent 失败时仍会生成最小 `report.md` 人类入口。报告只能基于事实链解释机制演进，
 组合变更不得自动归因为单一机制。报告认证失败
 不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop

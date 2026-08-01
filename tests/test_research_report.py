@@ -31,11 +31,14 @@ goal = "Improve a strategy"
 max_rounds = 2
 max_hours = 1
 max_consecutive_failures = 2
+round_minutes = 30
 
 [opencode]
 model = "xai/grok-4.5"
 variant = "high"
-timeout_minutes = 30
+
+[execution]
+command_timeout_minutes = 30
 
 [strategy]
 name = "example"

@@ -108,12 +108,7 @@ def evaluate_run_champion_test(
                 for part in task.raw["commands"]["backtest"]
             ]
 
-        timeout_seconds = int(
-            task.raw["budget"].get(
-                "round_minutes",
-                task.raw["opencode"]["timeout_minutes"],
-            )
-        ) * 60
+        timeout_seconds = task.round_timeout_minutes * 60
         try:
             completed = subprocess.run(
                 command,

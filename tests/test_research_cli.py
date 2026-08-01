@@ -20,10 +20,13 @@ goal = "Evaluate the champion"
 max_rounds = 1
 max_hours = 1
 max_consecutive_failures = 1
+round_minutes = 1
 
 [opencode]
 model = "test/model"
-timeout_minutes = 1
+
+[execution]
+command_timeout_minutes = 1
 
 [data]
 universe = "universe.csv"

@@ -104,8 +104,14 @@ def fixed_task() -> dict:
     return {
         "id": "etf-momentum",
         "goal": "Develop an ETF momentum strategy",
-        "budget": {"max_rounds": 3, "max_hours": 4, "max_consecutive_failures": 2},
-        "opencode": {"model": "xai/grok-4.5", "variant": "high", "timeout_minutes": 60},
+        "budget": {
+            "max_rounds": 3,
+            "max_hours": 4,
+            "max_consecutive_failures": 2,
+            "round_minutes": 60,
+        },
+        "opencode": {"model": "xai/grok-4.5", "variant": "high"},
+        "execution": {"command_timeout_minutes": 60},
         "data": {"universe": "universe.csv"},
         "scope": {
             "editable": ["src/quant_core/strategy/etf_momentum.py"],
@@ -618,11 +624,11 @@ def test_task_requires_opencode_provider_model_format() -> None:
         ResearchTask.from_mapping(payload)
 
 
-def test_task_requires_positive_opencode_timeout() -> None:
+def test_task_requires_positive_command_timeout() -> None:
     payload = fixed_task()
-    payload["opencode"]["timeout_minutes"] = 0
+    payload["execution"]["command_timeout_minutes"] = 0
 
-    with pytest.raises(ValueError, match="opencode.timeout_minutes"):
+    with pytest.raises(ValueError, match="execution.command_timeout_minutes"):
         ResearchTask.from_mapping(payload)
 
 
@@ -636,9 +642,44 @@ def test_task_requires_non_empty_opencode_variant_when_provided() -> None:
 
 def test_task_allows_model_without_variant() -> None:
     payload = fixed_task()
-    payload["opencode"] = {"model": "opencode/hy3-free", "timeout_minutes": 60}
+    payload["opencode"] = {"model": "opencode/hy3-free"}
 
     ResearchTask.from_mapping(payload)
+
+
+def test_task_supports_legacy_opencode_timeout() -> None:
+    payload = fixed_task()
+    payload.pop("execution")
+    payload["budget"].pop("round_minutes")
+    payload["opencode"]["timeout_minutes"] = 60
+
+    task = ResearchTask.from_mapping(payload)
+
+    assert task.command_timeout_minutes == 60
+    assert task.round_timeout_minutes == 60
+
+
+def test_task_rejects_legacy_and_command_timeouts_together() -> None:
+    payload = fixed_task()
+    payload["opencode"]["timeout_minutes"] = 60
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_new_execution_contract_requires_explicit_round_timeout() -> None:
+    payload = fixed_task()
+    payload["budget"].pop("round_minutes")
+
+    with pytest.raises(ValueError, match="budget.round_minutes is required"):
+        ResearchTask.from_mapping(payload)
+
+
+def test_active_etf_sharpe_has_distinct_round_and_command_timeouts() -> None:
+    task = ResearchTask.load(REPOSITORY_ROOT / "tasks/active_etf_sharpe.toml")
+
+    assert task.round_timeout_minutes == 30
+    assert task.command_timeout_minutes == 10
 
 
 def test_task_supports_explicit_strategy_metadata() -> None:

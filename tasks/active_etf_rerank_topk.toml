@@ -38,7 +38,9 @@ round_minutes = 30
 [opencode]
 model = "xai/grok-4.5"
 variant = "high"
-timeout_minutes = 30
+
+[execution]
+command_timeout_minutes = 30
 
 [strategy]
 name = "active-etf-rerank-topk"

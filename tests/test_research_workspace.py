@@ -45,11 +45,14 @@ goal = "Improve the strategy"
 max_rounds = 3
 max_hours = 4
 max_consecutive_failures = 2
+round_minutes = 60
 
 [opencode]
 model = "xai/grok-4.5"
 variant = "high"
-timeout_minutes = 60
+
+[execution]
+command_timeout_minutes = 60
 
 [data]
 universe = "universe.csv"
@@ -1449,7 +1452,7 @@ def test_managed_run_can_promote_checkpoint_restored_after_timeout(tmp_path: Pat
     task = _task(tmp_path)
     task.write_text(
         task.read_text(encoding="utf-8").replace(
-            "max_hours = 4", "max_hours = 4\nround_minutes = 7",
+            "round_minutes = 60", "round_minutes = 7",
         ),
         encoding="utf-8",
     )

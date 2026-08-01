@@ -50,11 +50,14 @@ goal = "Develop one strategy candidate"
 max_rounds = 3
 max_hours = 4
 max_consecutive_failures = 2
+round_minutes = 60
 
 [opencode]
 model = "xai/grok-4.5"
 variant = "high"
-timeout_minutes = 60
+
+[execution]
+command_timeout_minutes = 60
 
 [strategy]
 name = "runner-strategy"
@@ -2216,7 +2219,7 @@ def test_run_once_keeps_agent_events_after_post_agent_failure(
 def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(
-        TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
+        TASK_TOML.replace("round_minutes = 60", "round_minutes = 7"),
         encoding="utf-8",
     )
     events: list[tuple[str, dict[str, object]]] = []
@@ -2263,7 +2266,7 @@ def test_run_once_enforces_round_deadline_and_records_timing(tmp_path: Path) -> 
 def test_run_once_rejects_late_success_before_tests_or_gate(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(
-        TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
+        TASK_TOML.replace("round_minutes = 60", "round_minutes = 7"),
         encoding="utf-8",
     )
     current_time = [0.0]
@@ -2319,7 +2322,7 @@ def _checkpoint_metadata(label: str) -> dict[str, str]:
 def test_run_once_restores_latest_checkpoint_after_deadline(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(
-        TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
+        TASK_TOML.replace("round_minutes = 60", "round_minutes = 7"),
         encoding="utf-8",
     )
     (tmp_path / "strategy.py").write_text("VALUE = 0\n", encoding="utf-8")
@@ -2436,7 +2439,7 @@ def test_run_once_prefers_final_submission_over_checkpoint(tmp_path: Path) -> No
 def test_timeout_checkpoint_test_failure_does_not_fall_back(tmp_path: Path) -> None:
     task_path = tmp_path / "task.toml"
     task_path.write_text(
-        TASK_TOML.replace("max_hours = 4", "max_hours = 4\nround_minutes = 7"),
+        TASK_TOML.replace("round_minutes = 60", "round_minutes = 7"),
         encoding="utf-8",
     )
     (tmp_path / "strategy.py").write_text("VALUE = 0\n", encoding="utf-8")

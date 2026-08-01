@@ -588,7 +588,7 @@ def generate_loop_report(
     ]
     if variant := opencode.get("variant"):
         command.extend(["--variant", str(variant)])
-    timeout = min(int(opencode["timeout_minutes"]) * 60, 600)
+    timeout = min(task.command_timeout_minutes * 60, 600)
     events_path = manager.run_temp / "report-events.jsonl"
     events_path.parent.mkdir(parents=True, exist_ok=True)
     if agent_runner is _run_opencode_report_read_only:
