@@ -135,6 +135,12 @@ quant-agent loop active_etf_rerank_topk -d
   `research test --task path/to/task.toml` 仍可按需对当前任务级 Champion 另行评测。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
+- 配置 `[production]` 的任务在 Run 报告和可选 Test 完成后，会将该 Run 冻结的最终 Champion
+  原子同步到 `scope.editable` 声明的生产策略文件。同步只在 Run 内产生新 Champion 时发生，
+  不执行 `git add`、commit 或 push。若策略文件在 Run 启动时已与 Champion 不一致，Harness 会在
+  分配 Run 后立即停止、不会启动 Round；若在 Run 期间被人工修改，同样不会覆盖。两种情况都会在
+  `artifacts/production-sync.json` 留下哈希证据并以非零状态退出。若冲突发生在已有新 Champion 的
+  终局同步阶段，处理后重新运行同一 Loop 命令会先恢复该同步，不会分配新 Run。
 - `budget.round_minutes` 是每轮候选研发的硬时限；
   `execution.command_timeout_minutes` 是固定测试、Development、Gate 和 Champion 重评等
   单条 Harness 命令的超时，两者相互独立。旧任务契约仍可从
@@ -284,7 +290,7 @@ Loop 在达到轮数、总时长、连续技术失败或可选目标值时停止
 Run，没有完整决策的当前 Round 会作为失败证据
 落盘；已经正常停止的 Run 不会恢复，而是分配下一个编号。
 
-`research clean` 会删除可选诊断缓存。schema 5 的成功 Round 会删除可由结构化结果与认证 Patch
+`research clean` 会删除可选诊断缓存。schema 6 的成功 Round 会删除可由结构化结果与认证 Patch
 替代的 checkpoint、成功 bind-probe、评测日志和 Agent 事件；失败或中断 Round 保留诊断证据。
 清理不会改写或删除已完成历史 Run，也不会删除结构化 Round 结果、Decision、patch、首次 0→1
 候选源码、Champion、冻结的 Evaluation 数据或终局报告，也不会清理仍在运行的 Loop。

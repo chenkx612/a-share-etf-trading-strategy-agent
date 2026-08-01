@@ -614,6 +614,14 @@ class ResearchWorkspace:
         return self.run_test_root / "result.json"
 
     @property
+    def production_sync_path(self) -> Path:
+        return self.run_artifacts_root / "production-sync.json"
+
+    @property
+    def production_sync_champion_path(self) -> Path:
+        return self.run_artifacts_root / "production-sync-champion.py"
+
+    @property
     def run_temp(self) -> Path:
         return self.root / ".tmp" / "runs" / self.run_id
 

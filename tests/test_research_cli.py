@@ -88,6 +88,39 @@ def test_loop_shortcut_resolves_task_stem_and_enables_diagnostics(
     assert received[0].research_root == ".research"
 
 
+def test_research_loop_exits_nonzero_when_production_sync_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "runs/001/artifacts/state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "schema_version": 6,
+        "stop_reason": "max_rounds",
+        "rounds_completed": 1,
+        "accepted": 1,
+        "rejected": 0,
+        "failed": 0,
+        "report_status": "completed",
+        "report_path": "report.md",
+        "test_status": "not_configured",
+        "production_sync_status": "conflict",
+        "production_sync_error": "production strategy changed outside the Run",
+    }), encoding="utf-8")
+    monkeypatch.setattr(cli, "run_loop", lambda *args, **kwargs: state_path)
+    args = argparse.Namespace(
+        task="task.toml",
+        root=str(tmp_path),
+        research_root=".research",
+        retain_diagnostics=False,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.command_research_loop(args)
+
+    assert exc_info.value.code == 1
+
+
 def test_loop_shortcut_accepts_task_id_and_explicit_path(
     tmp_path: Path,
     monkeypatch,

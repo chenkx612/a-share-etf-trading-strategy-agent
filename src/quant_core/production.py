@@ -195,7 +195,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
     if not strategy_path.is_file() or not champion_path.is_file() or not metadata_path.is_file():
         raise RuntimeError(
             "Production requires a synchronized Champion; run the managed Loop and "
-            "synchronize the promoted strategy first"
+            "resolve any reported production synchronization conflict first"
         )
     champion = json.loads(metadata_path.read_text(encoding="utf-8"))
     strategy_hash = _sha256_file(strategy_path)
@@ -208,7 +208,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
     ):
         raise RuntimeError(
             "Production strategy, Champion code, and Champion metadata hashes do not match; "
-            "synchronize Champion before recommending"
+            "resolve the managed Loop production synchronization conflict before recommending"
         )
 
     importlib.invalidate_caches()

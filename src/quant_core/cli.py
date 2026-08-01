@@ -532,7 +532,7 @@ def command_research_loop(args: argparse.Namespace) -> None:
     )
     run_root = (
         state_path.parent.parent
-        if state.get("schema_version") == 5 and state_path.parent.name == "artifacts"
+        if state_path.parent.name == "artifacts"
         else state_path.parent
     )
     if state.get("report_status") == "completed":
@@ -548,8 +548,15 @@ def command_research_loop(args: argparse.Namespace) -> None:
         print(f"test failed: {state.get('test_error')}")
     elif state.get("test_status") == "unavailable":
         print(f"test unavailable: {state.get('test_error')}")
+    sync_status = state.get("production_sync_status")
+    if sync_status is not None:
+        print(f"production sync: {sync_status}")
+    if state.get("production_sync_error"):
+        print(f"production sync error: {state['production_sync_error']}")
     if state["stop_reason"] == "interrupted":
         raise SystemExit(130)
+    if sync_status in {"pending", "conflict", "failed", "legacy_unavailable"}:
+        raise SystemExit(1)
 
 
 def resolve_research_task_reference(reference: str, workspace: str | Path = ".") -> Path:

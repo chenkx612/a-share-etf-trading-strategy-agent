@@ -5,6 +5,7 @@ import json
 import subprocess
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -147,6 +148,213 @@ def _runner(decisions: list[str]):
     return run
 
 
+def _production_sync_fixture(
+    tmp_path: Path,
+) -> tuple[
+    SimpleNamespace,
+    ResearchWorkspace,
+    ResearchWorkspace,
+    dict[str, object],
+]:
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "loop-test")
+    champion = base.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    manager = base.for_run(1)
+    manager.run_artifacts_root.mkdir(parents=True)
+    manager.terminal_champion_path.parent.mkdir(parents=True)
+    manager.terminal_champion_path.write_text("2.0\n", encoding="utf-8")
+    initial_sha256 = str(champion["champion_sha256"])
+    final_sha256 = hashlib.sha256(b"2.0\n").hexdigest()
+    base.champion_path.write_text("2.0\n", encoding="utf-8")
+    champion_state = json.loads(base.state_path.read_text(encoding="utf-8"))
+    champion_state["champion_sha256"] = final_sha256
+    champion_state["champion_number"] = 1
+    champion_state["champion_round_id"] = "001/001"
+    base.state_path.write_text(json.dumps(champion_state), encoding="utf-8")
+    state: dict[str, object] = {
+        "schema_version": 6,
+        "task_id": "loop-test",
+        "run_number": 1,
+        "status": "stopped",
+        "stop_reason": "max_rounds",
+        "production_sync_baseline_available": True,
+        "initial_champion_sha256": initial_sha256,
+        "initial_champion_number": 0,
+        "initial_champion_round_id": None,
+        "initial_production_strategy_sha256": initial_sha256,
+        "final_champion_sha256": final_sha256,
+        "final_champion_number": 1,
+        "final_champion_round_id": "001/001",
+        "production_sync_status": None,
+        "production_sync_path": None,
+        "production_sync_error": None,
+    }
+    research_loop._save(manager.loop_state_path, state)
+    task = SimpleNamespace(
+        production={"curve_months": 12, "benchmark": "510300"},
+        task_id="loop-test",
+        strategy_path="strategy.py",
+    )
+    return task, base, manager, state
+
+
+def test_terminal_champion_is_atomically_synchronized_to_production(
+    tmp_path: Path,
+) -> None:
+    task, _base, manager, state = _production_sync_fixture(tmp_path)
+
+    research_loop._synchronize_production_strategy(task, manager, state)
+
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "2.0\n"
+    persisted = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
+    audit = json.loads(manager.production_sync_path.read_text(encoding="utf-8"))
+    assert persisted["production_sync_status"] == "completed"
+    assert audit["status"] == "completed"
+    assert audit["production_strategy_sha256"] == state["final_champion_sha256"]
+    assert not manager.production_sync_champion_path.exists()
+
+
+def test_production_sync_conflict_preserves_user_change_and_audit_source(
+    tmp_path: Path,
+) -> None:
+    task, _base, manager, state = _production_sync_fixture(tmp_path)
+    (tmp_path / "strategy.py").write_text("user change\n", encoding="utf-8")
+
+    research_loop._synchronize_production_strategy(task, manager, state)
+
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "user change\n"
+    audit = json.loads(manager.production_sync_path.read_text(encoding="utf-8"))
+    assert audit["status"] == "conflict"
+    assert "changed outside" in audit["error"]
+    assert manager.production_sync_champion_path.read_text(encoding="utf-8") == "2.0\n"
+
+
+def test_unresolved_production_sync_recovers_before_allocating_another_run(
+    tmp_path: Path,
+) -> None:
+    task, base, manager, state = _production_sync_fixture(tmp_path)
+    (tmp_path / "strategy.py").write_text("user change\n", encoding="utf-8")
+    research_loop._synchronize_production_strategy(task, manager, state)
+    (tmp_path / "strategy.py").write_text("1.0\n", encoding="utf-8")
+
+    recovered = research_loop._recover_unresolved_production_sync(task, base)
+
+    assert recovered == manager.loop_state_path
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "2.0\n"
+    persisted = json.loads(manager.loop_state_path.read_text(encoding="utf-8"))
+    audit = json.loads(manager.production_sync_path.read_text(encoding="utf-8"))
+    assert persisted["production_sync_status"] == "completed"
+    assert audit["recovered"] is True
+    assert base.run_numbers() == [1]
+
+
+def test_production_sync_is_not_needed_without_a_new_champion(tmp_path: Path) -> None:
+    task, _base, manager, state = _production_sync_fixture(tmp_path)
+    state["final_champion_sha256"] = state["initial_champion_sha256"]
+    state["final_champion_number"] = state["initial_champion_number"]
+    state["final_champion_round_id"] = state["initial_champion_round_id"]
+
+    research_loop._synchronize_production_strategy(task, manager, state)
+
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "1.0\n"
+    assert state["production_sync_status"] == "not_needed"
+
+
+def test_production_change_is_reported_even_when_champion_did_not_change(
+    tmp_path: Path,
+) -> None:
+    task, _base, manager, state = _production_sync_fixture(tmp_path)
+    state["final_champion_sha256"] = state["initial_champion_sha256"]
+    (tmp_path / "strategy.py").write_text("user change\n", encoding="utf-8")
+
+    research_loop._synchronize_production_strategy(task, manager, state)
+
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "user change\n"
+    assert state["production_sync_status"] == "conflict"
+
+
+def test_loop_synchronizes_its_frozen_final_champion_after_reporting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_path = _task(tmp_path, max_rounds=1)
+    task = ResearchTask.load(task_path)
+    task.raw["production"] = {"curve_months": 12, "benchmark": "510300"}
+    monkeypatch.setattr(ResearchTask, "load", lambda _path: task)
+
+    def promoting_runner(
+        task_file: Path,
+        round_id: str,
+        *,
+        workspace: Path,
+        research_root: Path,
+        run_number: int,
+        event_sink,
+    ) -> Path:
+        del task_file, workspace, event_sink
+        base = ResearchWorkspace(tmp_path, research_root, task.task_id)
+        promoted = b"2.0\n"
+        base.champion_path.write_bytes(promoted)
+        champion_state = json.loads(base.state_path.read_text(encoding="utf-8"))
+        champion_state["champion_sha256"] = hashlib.sha256(promoted).hexdigest()
+        champion_state["champion_number"] = 1
+        champion_state["champion_round_id"] = f"{run_number:03d}/{round_id}"
+        champion_state["last_round_id"] = f"{run_number:03d}/{round_id}"
+        base.state_path.write_text(json.dumps(champion_state), encoding="utf-8")
+        experiment = base.for_run(run_number).rounds / round_id
+        experiment.mkdir()
+        result_path = experiment / "result.json"
+        result_path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+        (experiment / "decision.json").write_text(json.dumps({
+            "experiment_id": round_id,
+            "decision": "accepted",
+        }), encoding="utf-8")
+        return result_path
+
+    state_path = run_loop(
+        task_path,
+        workspace=tmp_path,
+        managed_runner=promoting_runner,
+        reporter=_reporter,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    audit = json.loads((state_path.parent / "production-sync.json").read_text(encoding="utf-8"))
+    assert state["schema_version"] == 6
+    assert state["production_sync_status"] == "completed"
+    assert audit["final_champion_round_id"] == "001/001"
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "2.0\n"
+
+
+def test_loop_stops_before_first_round_when_production_is_initially_unsynchronized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_path = _task(tmp_path)
+    task = ResearchTask.load(task_path)
+    task.raw["production"] = {"curve_months": 12, "benchmark": "510300"}
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", task.task_id)
+    base.initialize(date(2021, 12, 31), strategy_path="strategy.py")
+    (tmp_path / "strategy.py").write_text("manual change\n", encoding="utf-8")
+    monkeypatch.setattr(ResearchTask, "load", lambda _path: task)
+
+    state_path = run_loop(
+        task_path,
+        workspace=tmp_path,
+        managed_runner=lambda *args, **kwargs: pytest.fail("must not start a Round"),
+        reporter=lambda *args: pytest.fail("must not generate a terminal report"),
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    audit = json.loads((state_path.parent / "production-sync.json").read_text(encoding="utf-8"))
+    assert state["stop_reason"] == "production_sync_conflict"
+    assert state["rounds_completed"] == 0
+    assert state["production_sync_status"] == "conflict"
+    assert audit["status"] == "conflict"
+    assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "manual change\n"
+
+
 def test_legacy_interrupted_loop_is_migrated_before_active_run_scan(
     tmp_path: Path,
 ) -> None:
@@ -252,7 +460,7 @@ def test_loop_stops_after_consecutive_failed_rounds(
     )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["schema_version"] == 5
+    assert state["schema_version"] == 6
     assert state["stop_reason"] == "max_consecutive_failures"
     assert state["rounds_completed"] == 3
     assert state["rejected"] == 1
