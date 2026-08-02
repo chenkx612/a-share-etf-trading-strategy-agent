@@ -133,7 +133,8 @@ quant-agent loop active_etf_rerank_topk -d
 - 硬约束运算符为 `>=`、`<=` 和 `abs<=`。可选 `[evaluation.guard]` 与 Guard 区间必须成对配置，
   且严格位于 Gate 之后；每轮候选先通过 Primary Gate，才会执行 Guard。Harness 以冻结 Universe
   的无费、日度再平衡 open-to-open 等权基准计算 Gate 与 Guard 年化超额收益；当其下滑超过
-  `max_excess_annual_return_degradation`（现有任务为 10 个百分点）即拒绝，Guard 通过后才晋级 Champion。
+  `max_excess_annual_return_degradation`（由任务配置，现有任务为 5 或 10 个百分点）即拒绝，Guard
+  通过后才晋级 Champion。
   Guard 完整证据保存在该轮 `guard.json`，后续候选 Prompt 与研究记忆只会收到统一的拒绝原因，不会收到
   Guard 精确指标。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
