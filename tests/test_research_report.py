@@ -388,6 +388,11 @@ def efficiency_score(value):
     assert second["changes"]["attribution"] == "combined_change"
     assert "parameters" in second["changes"]["changed_categories"]
     assert "definitions" in second["changes"]["changed_categories"]
+    for record in (first, second):
+        warning = record["changes"]["attribution_warning"]
+        assert warning.startswith("Candidate contains")
+        assert "Accepted candidate" not in warning
+    assert first["integrity_warnings"] == []
     assert any(
         "round 002" in warning and "single-mechanism attribution is prohibited" in warning
         for warning in facts["integrity_warnings"]

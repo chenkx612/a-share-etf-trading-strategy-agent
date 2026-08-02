@@ -33,52 +33,31 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P2 | 结构归因警告出现过晚，无法在 Gate 前提示拆分候选 |
-| P2 | 中断或基础设施失败仍会消耗研发轮次 |
-| P2 | 每轮结构归因警告错误地把拒绝候选称为已接受候选 |
+| P1 | 终局报告将绝对 objective 改善门槛误写为百分比 |
 | P2 | Agent 执行阶段缺少心跳事件，长时间停滞无法及时诊断 |
-| P2 | 终局报告将绝对 objective 改善门槛误写为百分比 |
 
 ## 一、待解决问题
 
+### P1：推荐解决
+
+#### 终局报告将绝对 objective 改善门槛误写为百分比
+
+- **问题**：`active-etf-sharpe` Run 005 的固定 Decision 正确按
+  `candidate_sortino >= champion_sortino + 0.03` 执行绝对 objective 点数改善，但终局
+  `report.md` 将 `minimum_improvement=0.03` 写成“相对改善阈值 3%”。Round 001 的 Sortino
+  从 `7.757116` 升至 `7.958143`，绝对改善 `0.201027` 因而正确晋级，百分比改善却只约
+  `2.59%`；报告因此出现“+ 约 2.6%”与“已过 3% 门槛”的内部矛盾。Promotion、Champion
+  和冻结指标未受影响，但报告误述了晋级契约，会误导人工复盘和下游摘要。
+- **方案**：报告输入与模板显式将 `minimum_improvement` 标注为“objective 绝对点数”，并为每轮
+  预计算 `required_candidate_objective = champion + minimum_improvement` 与绝对差值；禁止报告模型
+  仅根据小数形式自行推断百分比语义。如未来需要真正的比例改善，应在版本化契约中增加独立 mode，
+  不得复用现有字段并改变历史语义。
+- **验证**：覆盖高基数 objective（如 `7.757 -> 7.958`）、低基数、负值和无 Champion 的报告事实；
+  生成报告必须与 `runner.py` 的绝对加法判定一致，且不出现未由契约明确定义的 `%` 表述。
+- **风险**：修复终局文案不应回写或重判历史 Decision；历史 Run 005 报告应保持不可变，需在
+  新报告或外部复盘中明确更正。
+
 ### P2：有时间时优化
-
-#### 结构归因警告出现过晚，无法在 Gate 前提示拆分候选
-
-- **问题**：`active-etf-rerank-topk` Run 002 的 Round 002 在同一候选中移除 Parent 已晋级机制并
-  新增另一机制，仍通过固定评测并晋级；Harness 直到终局生成 `report-facts.json` 时才将其标记为
-  `combined_change`。评测、Promotion 和 Gate 隔离本身仍有效，但研究者已失去在 Gate 前主动拆分
-  候选或补充 Development 消融的机会。
-- **方案**：在 Candidate 提交后、Gate 前复用保守的 Parent—Patch 结构归因，向 Agent 发出
-  非阻断提示，并允许其在本轮剩余时间内拆分或重新提交。Promotion 仍只由固定测试、硬约束和目标改善
-  决定；结构归因不定义“机制”、不作为拒绝条件，选择继续的候选在终局明确标记为不可单独归因。
-- **验证**：覆盖疑似组合或不透明修改会在 Gate 前产生提示、Agent 可重新提交、选择继续时 Gate 和
-  Promotion 语义不变、单纯接线修改即使被保守提示也不会自动拒绝；提示不得包含或间接泄露 Gate
-  信息。
-- **风险**：AST 归因只能描述结构变化，不能可靠划分单机制与多机制；提示可能误报或漏报，因此只能
-  帮助研究纪律，不能成为候选有效性或因果归因的证明。
-
-#### 中断或基础设施失败仍会消耗研发轮次
-
-- **问题**：未提交候选的中断或基础设施失败会被记录为 failed 并计入 `max_rounds`，减少真实候选
-  预算；系统又无法自动证明中断候选完整或安全恢复模型会话。
-- **方案**：增加显式 `research loop reset-current` 或“诊断轮不计预算”模式。命令必须验证候选
-  未提交、Champion 未变化，并保留独立审计记录。
-- **验证**：只有满足安全前置条件的诊断失败可以释放研究预算；所有历史事件和失败原因仍可追溯。
-- **风险**：修复前必须保留失败记录并继续使用同一任务根；直接删除 Round 目录或编辑状态文件会破坏
-  恢复语义。
-
-#### 每轮结构归因警告错误地把拒绝候选称为已接受候选
-
-- **问题**：Run 003 的 `report-facts.json` 对 Round 001、003、004、005、007、008、010 等拒绝候选
-  均写入 `Accepted candidate contains multiple or opaque structural changes`。只有 Round 002
-  实际接受；任务级 `integrity_warnings` 正确地只汇总了接受轮，因此未改变 Promotion 或最终
-  Champion，但逐轮事实的措辞与 Decision 冲突，容易在自动报告或人工复盘时把拒绝候选误读为晋级。
-- **方案**：结构分类器使用中性的 `Candidate contains ...`，或在报告组装层按 Decision 生成措辞；
-  接受轮是否进入任务级 integrity warning 仍由独立逻辑决定，不能靠文案字符串推断。
-- **验证**：同一 `combined_change` 分类分别覆盖 accepted、rejected 和其他合法 Decision；逐轮警告
-  与 Decision 一致，只有接受候选的归因风险进入任务级汇总，历史报告重建保持确定。
-- **风险**：这是报告准确性问题，不影响已冻结指标、Gate、Promotion、patch 重放或 Champion。
 
 #### Agent 执行阶段缺少心跳事件，长时间停滞无法及时诊断
 
@@ -102,23 +81,6 @@
 - **风险**：仅有进程心跳不能证明模型或 Provider 正在取得进展，过密事件还会制造噪声；因此应采用
   低频、可配置的保守信号，并继续由硬 deadline 负责停止条件。
 
-#### 终局报告将绝对 objective 改善门槛误写为百分比
-
-- **问题**：`active-etf-sharpe` Run 005 的固定 Decision 正确按
-  `candidate_sortino >= champion_sortino + 0.03` 执行绝对 objective 点数改善，但终局
-  `report.md` 将 `minimum_improvement=0.03` 写成“相对改善阈值 3%”。Round 001 的 Sortino
-  从 `7.757116` 升至 `7.958143`，绝对改善 `0.201027` 因而正确晋级，百分比改善却只约
-  `2.59%`；报告因此出现“+ 约 2.6%”与“已过 3% 门槛”的内部矛盾。Promotion、Champion
-  和冻结指标未受影响，但报告误述了晋级契约，会误导人工复盘和下游摘要。
-- **方案**：报告输入与模板显式将 `minimum_improvement` 标注为“objective 绝对点数”，并为每轮
-  预计算 `required_candidate_objective = champion + minimum_improvement` 与绝对差值；禁止报告模型
-  仅根据小数形式自行推断百分比语义。如未来需要真正的比例改善，应在版本化契约中增加独立 mode，
-  不得复用现有字段并改变历史语义。
-- **验证**：覆盖高基数 objective（如 `7.757 -> 7.958`）、低基数、负值和无 Champion 的报告事实；
-  生成报告必须与 `runner.py` 的绝对加法判定一致，且不出现未由契约明确定义的 `%` 表述。
-- **风险**：修复终局文案不应回写或重判历史 Decision；历史 Run 005 报告应保持不可变，需在
-  新报告或外部复盘中明确更正。
-
 ## 二、已解决问题
 
 本节只保留会影响信任边界、评测语义、恢复一致性或长时间运行可靠性的经验。一次性的字段遗漏、
@@ -136,22 +98,8 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   `preflight-failures/` 并在 Run 分配前熔断；活动 Run 在下一 Round 分配前失败则以
   `infrastructure_failure` 停止且不改已有计数。Candidate 测试失败时固定执行一次同环境 Parent A/B
   对照：Parent 通过仍归为候选回归，Parent 同样失败、超时或不可执行则改判基础设施故障并保留两份日志。
-- **验证**：覆盖失败、超时、不可执行、成功缓存及适用性失效，schema 7→8 迁移、Promotion 清缓存、
-  下一 Round 前熔断，以及 Candidate/Parent 分歧与共同失败归因。
 - **风险**：首次预检和适用性变化会增加一次固定测试成本；失败路径的 A/B 对照也会额外执行一次测试，
   这是避免静态依赖闭包误判的确定性成本。
-
-### P2：诊断可观测性
-
-#### Champion 初评与重评缺少阶段事件
-
-- **问题**：Champion 初评或因 evaluator/data/environment 变化而重评时，外部观察者会在候选 Gate
-  后看到数分钟无事件，难以区分正常重评与卡死。
-- **解决**：`_evaluate_existing()` 现在发出 Champion 重评及 Development/Gate 子阶段的 started、completed、
-  failed 事件，携带 stale 原因但不携带精确 Gate 指标。`research loop --retain-diagnostics` 可将该时间线和
-  确定性摘要保留到可清理缓存，供终局离线复盘。
-- **验证**：Loop 与 runner 测试覆盖诊断时间线和终局摘要；事件仍经原有候选隔离边界写入，不进入后续候选 Prompt。
-- **风险**：事件仅描述阶段状态；精确 Gate 指标仍只存在于冻结 Round 评测产物中。
 
 ### P1：曾影响终局复盘完整性
 
@@ -165,9 +113,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   失败均保留现有机制脱敏后的主事件和重试事件；checkpoint 超时恢复后最终成功仍清理冗余事件。
   `compact_artifacts()` 继续删除旧 `agent-output.json` 并向失败结果补充可用摘要，但只按最终
   `result.status == completed` 删除 Agent 事件。
-- **验证**：Runner 回归覆盖 blocked、正常输出后的测试/Development 失败、checkpoint 恢复后的成功与
-  失败；压缩回归覆盖带旧 `agent-output.json` 的 failed Round 保留主事件、重试事件及失败日志，
-  completed Round 继续清理成功诊断。
 - **风险**：失败会话可能较大并含 Provider 输出，因此继续沿用认证信息脱敏和失败工件保留策略。已经
   丢失的历史 Run 003 Round 002 事件无法可靠回填，本修复不伪造或重建该日志。
 
@@ -178,7 +123,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：Harness 生成写一次的 `report-facts.json`，从最终 Champion 和每轮 Patch 重建
   Parent/Candidate，核对源码与哈希，并用 AST 保守描述结构变化。事实链优先于叙述；组合或不透明修改
   不作单机制归因，代码变化也不作为指标改善的因果证明。
-- **验证**：覆盖接受、拒绝、首次晋级、Patch 缺失或损坏、哈希不符、组合变化及冻结附件重试。
 - **风险**：结构化差异刻意保守，可能把相关修改归为组合变化，但不会把未经证据支持的因果解释写成
   事实。该机制不改变评测、Gate、Promotion 或停止条件。
 
@@ -188,7 +132,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：允许同轮调整研究方向。Agent 先冻结 checkpoint，再通过 Harness-owned Attempt
   接口运行 Development；Harness 按候选哈希去重并冻结假设、指标和时间，以最终提交哈希标记
   `submitted`/`abandoned`。`learning` 只承担解释，不替代 Harness-owned 事实。
-- **验证**：覆盖重复评估、放弃后提交、learning 缺失、超时 checkpoint 恢复及旧历史兼容。
 - **风险**：Agent 仍可给出错误因果解释，因此 learning 仅作为研究叙述；Harness-owned 指标和
   Candidate 哈希才是审计事实。底层参数组合与 folds 不作为独立 Attempt，避免低质量信息膨胀。
 
@@ -204,9 +147,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   生产推荐仍可用交易所日历构造未来候选日期，但运行时日历不再参与历史月/周边界判断。任务已显式将
   `src/quant_core/schedule.py` 纳入 evaluator 契约，因此本次源码变化会使旧 Champion 指标自动 stale；
   历史 Run 保持不可变。
-- **验证**：固定行情下模拟 Provider 可用、异常及返回不同日历，fold 数、参数日期与边界保持一致；
-  另覆盖自然周期首日、月初缺行情、长假、周期中段评测起点、重复日期和多 symbol 缺行。预算投影仍为
-  2 折及 `750s`。
 - **风险**：所有 ETF 同时缺失的日期按回测实际可交易语义视为不可交易日。该定义可能不同于交易所
   官方开市日，但可由已冻结的评测输入完整重放，不允许再用实时 Provider 隐式补齐。
 
@@ -219,11 +159,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   文件大小与哈希，视图复用前重新验证，损坏缓存以临时目录原子重建。Champion applicability、Run 根
   `development-inputs.json`、Run state、Attempt 和 `result.json` 共同冻结视图哈希与终点；旧完成
   Run 保持可读，缺少该契约的旧活动 Run 以基础设施不兼容终止。
-- **验证**：单元测试覆盖 CSV/Parquet 截断、前置历史、空表、确定性复用、缓存篡改重建，以及未知格式、
-  损坏表、无日期列、无效日期和文件/目录符号链接的 fail-closed。生产预检在 Run 分配前核对真实视图，
-  并在 Agent 镜像内通过 Bash、pandas、pyarrow 和 evaluator 导入验证只读文件集合、哈希、日期上界，
-  同时确认 Evaluation/Gate runtime、宿主绝对路径及镜像同名缓存不可见。固定 fixture 的宿主输入与
-  Development 视图评测逐项比较折定义、可行性、参数选择和汇总指标。
 - **风险**：`data/` 与 `outputs/factors/` 现在是纯时间表契约；合法非时间辅助文件必须迁移到
   `universes/`、任务配置或其他显式目录。视图是可重建缓存，由既有清理流程回收。
 
@@ -233,8 +168,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   `git diff` 不会记录它，导致候选虽能晋级，耐久 Patch 却无法重放。
 - **解决**：使用隔离临时 index 生成包含新增文件的 binary patch；Decision 和晋级前，在冻结 Parent
   上重放并逐字节核对候选及 submission 哈希。首次晋级另存内容寻址的 `candidate.py` 冗余证据。
-- **验证**：覆盖新增、修改、删除、空文件、二进制、真实空改动、哈希不符及重放失败，且不修改候选
-  真实 index。
 - **风险**：历史 Run 003 Round 001 的空 patch 无法追溯修补；当前任务级 Champion 仍存在时应另行
   冻结核对。新 Round 已具备可重放 patch 和首次晋级冗余源码。
 
@@ -243,29 +176,8 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **问题**：若 applicability 不含 Python、ABI、平台和依赖，不同宿主环境产生的指标可能被直接比较。
 - **解决**：入口在状态变更前校验固定环境，并生成内容寻址、稳定且脱敏的环境 manifest；所有评测
   与报告引用其哈希。环境变化使旧指标 stale 并触发重评，活动 Run 禁止跨环境恢复。
-- **验证**：覆盖错误环境前置失败、manifest 稳定性、环境变化、旧 schema 迁移、同环境缓存及跨环境
-  恢复熔断。
 - **风险**：`quant` 内包升级会主动使指标 stale 并触发重评；当前未增加跨平台 Conda lockfile，
   但每次实际评测环境均有不可歧义的耐久清单，不能静默复用异环境指标。
-
-#### Provider 刷新令牌失效必须持久化并按基础设施错误熔断
-
-- **问题**：隔离会话中的 refresh token 轮换若未回写，后续会继续使用已撤销凭据；若再被当作普通
-  候选失败，会无意义地消耗轮次。
-- **解决**：认证文件上的会话串行执行；Run/Round 分配前由受限宿主探针预检。会话结束后仅提取合法
-  Provider 变化，经宿主复核后原子合并；认证失效、损坏或冲突统一归类为基础设施故障并熔断。
-- **验证**：覆盖轮换、原子回写、成功/失败/超时/中断恢复、非法状态、并发冲突、脱敏和预检不分配
-  研究轮次。
-- **风险**：同一认证文件上的 Harness 会话会串行，锁等待计入会话硬时限；外部 OpenCode 进程不遵守
-  Harness 锁时无法完全消除提交竞态，Harness 会检测已知同 Provider 冲突并拒绝覆盖。完整 refresh
-  token 会进入一次性容器；这符合当前协作型 Agent 威胁模型，但不防御主动读取或替换凭据的恶意候选。
-
-#### 容器运行时故障必须在 Run 前预检并按基础设施错误熔断
-
-- **问题**：挂载、模型缓存或 CLI 契约故障若到 Agent 启动后才暴露，会连续消耗研究轮次。
-- **解决**：使用权限受限的一次性 runtime home，并在创建耐久 Run 前用真实镜像验证挂载、读写边界、
-  Research Root 遮蔽和模型可用性；运行时基础设施故障首次出现即熔断。
-- **验证**：真实容器会话和隔离边界测试必须通过，容器初始化失败不得按普通候选失败重试。
 
 #### 候选 Agent 曾可通过 Bash 访问 Research Root
 
@@ -273,7 +185,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   Gate 泄漏。
 - **解决**：候选只在一次性容器中运行，仅挂载候选 worktree 和只读 Development 输入；Research
   Root、Gate runtime 和主工作区不挂载。Docker 不可用时失败，不回退宿主机。
-- **验证**：真实容器测试覆盖 Bash、Python、绝对路径和符号链接，确认候选只能写自身目录。
 - **风险**：不防御 Docker daemon、宿主内核或容器运行时本身被攻破；OpenCode 认证文件仍作为
   必要输入进入一次性 runtime home。
 
@@ -283,16 +194,8 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：以单调时钟强制单轮时间预算；截止后返回的成功不得进入评测。耐久证据只保留冻结输入、
   顶层 Attempt 最小事实、最终 diff、固定评测指标、Decision、Parent 和时长，内部参数与 fold 搜索
   轨迹保持 disposable。
-- **验证**：覆盖超时终止、截止竞态、最小 Attempt 事实、成功日志压缩和失败原因保留。
 - **风险**：不防御 Agent 主动通过 `setsid`、容器逃逸或其他系统权限规避进程组。若改为对抗型
   Agent，应升级系统沙箱，而不是恢复次数限制或宣称可核验全部内部探索。
-
-#### 候选 Worktree 导入主工作区代码
-
-- **问题**：editable install 可能让隔离评测导入主工作区代码，导致实际评测对象与声明候选不一致。
-- **解决**：所有 Agent、测试和回测子进程都将候选 worktree 的 `src/` 放在 `PYTHONPATH` 首位；
-  仅切换 `cwd` 不能覆盖 editable install 的导入映射。
-- **验证**：真实子进程断言策略模块 `__file__` 位于候选路径；单元测试覆盖搜索路径顺序。
 
 #### Gate 可行性优先于目标改善和 Development 表现
 
@@ -300,7 +203,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   Gate 证据则会接受隐藏区间违反约束的候选。
 - **解决**：候选必须先通过全部 Gate 硬约束。Champion 不可行时，首个目标有限且满足约束的
   候选直接替换；Champion 可行后才要求相对目标改善。精确 Gate 指标不得反馈给后续研发轮次。
-- **验证**：覆盖不可行/可行 Champion、Gate 约束失败和目标改善组合，拒绝候选不得污染 Champion。
 - **风险**：Gate 通过/失败仍形成弱反馈；最终结果需要独立验证区间或前向观察。
 
 ### P1：重要可靠性问题
@@ -316,23 +218,9 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   `__pycache__`。门面只转发 `evaluate_candidate()` 和 selection 校验，walk-forward 函数与 CLI
   固定抛出 `HarnessExecutionRequired`；权威实现不进入候选解释器。挂载源位于 worktree 外，
   容器继续丢弃全部 capabilities 并启用 `no-new-privileges`。官方 receiver 在宿主执行冻结评测。
-- **验证**：单元测试覆盖修改 marker、替换旧 guard、伪造 execution 仍不能从门面取得权威入口；
-  生产容器预检验证门面、标记和 bytecode 遮蔽均只读且不可删除，并在真实镜像内覆盖直接导入、
-  包装调用和 CLI。既有 receiver 回归继续覆盖 checkpoint、候选哈希、去重、learning、预算和
-  Attempt 汇总。
 - **风险**：边界只保护项目权威的顶层 walk-forward evaluator。候选仍可使用 pandas、自写轻量
   Development 诊断和 `evaluate_candidate()` 等低层纯函数；在冻结 Development 数据边界内，这是
   保留的协作研究能力，不构成 Harness-owned 顶层 Attempt。
-
-#### Evaluator 指纹不得写入主 Git 对象库
-
-- **问题**：临时 `GIT_INDEX_FILE` 只能隔离 index；`git add` 和 `git write-tree` 仍会把新 blob/tree
-  写入主 `.git/objects`，导致主 Git 元数据只读的受管环境在分配 Run 前失败。
-- **解决**：指纹计算同时使用临时 index 和临时 object database，通过 alternate object directory
-  只读复用仓库公共对象库。保留 Git 的工作树、文件模式、删除和路径语义，临时对象随计算结束清理。
-- **验证**：主对象库只读时，tracked 修改、未跟踪新增和删除仍可稳定计算；主 index 和对象库内容
-  均保持不变，工作树与冻结提交的指纹继续一致。
-- **风险**：本修复只覆盖 Evaluator 指纹；候选快照和 worktree 管理仍按设计需要可写 Git 元数据。
 
 #### Evaluator 契约必须显式声明固定评测输入
 
@@ -340,20 +228,8 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：任务必须通过 `evaluation.contract.paths` 显式声明固定测试、回测、配置及其导入或读取
   的仓库输入。Harness 用临时 index 生成 canonical manifest；路径校验拒绝 editable 策略、runtime、
   重复、重叠、越界、缺失和空输入，并用静态导入审计补强 Python 间接依赖检查。
-- **验证**：无关文件变化应保持哈希稳定，固定依赖的修改、删除和未跟踪新增应改变哈希；工作区与提交
-  哈希一致且不修改用户 index。
 - **风险**：任务使用非 Python 动态读取的新资源时，维护者仍须显式扩充清单；缺漏不会由静态导入
   审计发现，因此任务评测命令的资源变更必须同步评审 `evaluation.contract.paths`。
-
-#### Agent 单次 Shell 时限与 Round 评测预算不一致
-
-- **问题**：Shell 工具的隐式时限可能短于 Round 预算并截断合法评测；参数数量上限也不能代表实际
-  运行时间。
-- **解决**：显式令 Shell 时限与 Round 契约一致。Development 根据实测折耗时和剩余时间估算完整
-  网格成本，预留 finalization 时间；预计超预算则提前拒绝，不静默裁剪。进度和终止原因原子落盘。
-- **验证**：覆盖时限传递、checkpoint 真实性、短 Round 预留、超预算拒绝、耗时校准复用及超时事件。
-- **风险**：耗时估算基于两个折的保守采样，极端非均匀策略仍可能在外层 Round 截止处被终止；
-  `max_parameter_sets` 仍是结构上限，不能替代运行时估算。
 
 #### Champion 指标值与适用性必须独立于 disposable runtime
 
@@ -362,8 +238,6 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：`champion.json` 升级为 schema v5，用 `champion_metrics_record` 同时保存指标值、评测来源、
   valid/stale 状态及策略、数据、环境和 evaluator 指纹。清理只影响缓存；适用性变化保留历史值但标记
   stale。晋级与目标停止只读取匹配的 valid 指标，pending promotion 原子切换策略和指标记录。
-- **验证**：覆盖正常清理、预检失败、数据/evaluator 变化、旧 schema 迁移、重评、目标停止和晋级
-  中断恢复。
 - **风险**：旧 schema 缺少完整适用性证据，升级后的首次晋级比较必须重评 Champion；这是有意的保守
   行为，不能通过当前 runtime 反推旧指标有效。
 
@@ -373,22 +247,8 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：增加 Harness-owned checkpoint 协议。Agent 用显式命令提交策略和完整候选说明，Harness 在
   截止前校验并冻结到 Agent 不可写目录。正常完成以最终提交为准；超时才恢复最近有效 checkpoint 并
   执行完整固定评测。基础设施失败不恢复，正式测试失败也不回退更早版本。
-- **验证**：覆盖多 checkpoint、冻结副本损坏、无 checkpoint、最终提交优先、截止后提交拒绝及恢复后
-  测试失败/晋级。
 - **风险**：checkpoint 接收使用协作型 Agent 信任模型；冻结边界防止确认后的版本被回写，但不防御
   主动攻击 Harness 控制协议的恶意候选。正式评测仍不计入 Agent 研发时限，并受原有命令超时约束。
-
-#### Docker bind 可见性故障必须在 Round 分配前诊断
-
-- **问题**：删除并重建候选父目录后，Docker Desktop 可能暂时仍认为真实存在的 bind source 不存在；
-  单次重试既不足以覆盖恢复场景，也容易在 Agent 启动后才失败并覆盖首次证据。
-- **解决**：活动 Run 保持候选父目录 inode 稳定。候选先暂存，再用不启动 Agent 的只读 bind 探针
-  有界退避重试；仅在宿主路径存在且身份稳定、Docker 明确报告 source 不存在时重试。每次尝试保留独立
-  诊断，持续失败在分配 Round 前熔断。
-- **验证**：覆盖瞬态恢复、持续不可见、宿主路径消失或身份变化、失败不分配 Round、独立日志及中断
-  清理后的 inode 稳定。
-- **风险**：超过探针预算的 daemon 故障仍会停止 Run，但不会消耗研究轮次；有界重试避免无限阻塞，
-  且必须保证 Agent 尚未启动以免产生重复副作用。
 
 #### Run 边界及状态—工件一致性必须由 Harness 强制
 
@@ -396,6 +256,5 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
 - **解决**：Champion 保持任务级，Round、状态和报告按 Run 隔离；恢复未完成 Round 时补写失败工件，
   编号同时参考状态和物理目录。Decision 前校验计数与 ID，报告前确定性检查必需工件；异常只记录
   `integrity_warnings`，禁止模型补全事实。
-- **验证**：回归测试覆盖连续 Run 隔离、缺目录恢复、编号不复用、计数一致性和损坏状态告警。
 - **风险**：完整性检查只能暴露既有损坏，不能自动推断或修复缺失历史；失败是否占预算仍由
   “中断或基础设施失败仍会消耗研发轮次”跟踪。

@@ -211,7 +211,7 @@ def _structured_changes(
         else "combined_change"
     )
     warning = (
-        "Accepted candidate contains multiple or opaque structural changes; "
+        "Candidate contains multiple or opaque structural changes; "
         "single-mechanism attribution is prohibited"
         if attribution == "combined_change"
         else None
