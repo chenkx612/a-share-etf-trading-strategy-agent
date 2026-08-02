@@ -132,8 +132,12 @@ def fixed_task() -> dict:
             "fixed": {
                 "development": {"start": "2018-01-01", "end": "2021-12-31"},
                 "gate": {"start": "2022-01-01", "end": "2024-12-31"},
+                "guard": {"start": "2025-01-01", "end": "2025-12-31"},
             },
-            "test": {"start": "2025-01-01", "end": "2025-12-31"},
+            "guard": {
+                "benchmark": "universe_equal_weight",
+                "max_excess_annual_return_degradation": 0.10,
+            },
         },
     }
 
@@ -531,7 +535,7 @@ def test_repository_walk_forward_tasks_use_shared_parameter_selection(
         "anchor": "latest_complete_universe_date",
         "development_months": 30,
         "gate_months": 12,
-        "test_months": 6,
+        "guard_months": 6,
     }
     if task.production is not None:
         assert not {
@@ -775,19 +779,37 @@ def test_walk_forward_task_does_not_require_unused_backtest_template() -> None:
     assert task.evaluation_mode == "walk_forward"
 
 
-def test_test_period_must_follow_research_period() -> None:
+def test_guard_period_must_follow_gate_period() -> None:
     payload = fixed_task()
-    payload["evaluation"]["test"]["start"] = "2024-01-01"
+    payload["evaluation"]["fixed"]["guard"]["start"] = "2024-01-01"
 
-    with pytest.raises(ValueError, match="must start after"):
+    with pytest.raises(ValueError, match="must not overlap"):
         ResearchTask.from_mapping(payload)
 
 
-def test_task_allows_no_test_period() -> None:
+def test_task_allows_no_guard_period() -> None:
     payload = fixed_task()
-    del payload["evaluation"]["test"]
+    del payload["evaluation"]["guard"]
+    del payload["evaluation"]["fixed"]["guard"]
 
     ResearchTask.from_mapping(payload)
+
+
+def test_task_rejects_obsolete_test_contract_and_invalid_guard() -> None:
+    payload = fixed_task()
+    payload["evaluation"]["test"] = {"start": "2025-01-01", "end": "2025-12-31"}
+    with pytest.raises(ValueError, match="evaluation.test is obsolete"):
+        ResearchTask.from_mapping(payload)
+
+    payload = fixed_task()
+    payload["evaluation"]["guard"]["benchmark"] = "csi300"
+    with pytest.raises(ValueError, match="benchmark"):
+        ResearchTask.from_mapping(payload)
+
+    payload = fixed_task()
+    payload["evaluation"]["guard"]["max_excess_annual_return_degradation"] = -0.01
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        ResearchTask.from_mapping(payload)
 
 
 def test_task_requires_non_empty_constraints() -> None:

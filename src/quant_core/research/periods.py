@@ -69,9 +69,9 @@ def resolve_relative_periods(
 
     dates = pd.DatetimeIndex(scoped["date"].drop_duplicates()).sort_values()
     exclusive_end = anchor + pd.Timedelta(days=1)
-    test_months = int(config.get("test_months", 0))
-    test_start = exclusive_end - pd.DateOffset(months=test_months)
-    gate_start = test_start - pd.DateOffset(months=int(config["gate_months"]))
+    guard_months = int(config.get("guard_months", 0))
+    guard_start = exclusive_end - pd.DateOffset(months=guard_months)
+    gate_start = guard_start - pd.DateOffset(months=int(config["gate_months"]))
     development_start = gate_start - pd.DateOffset(
         months=int(config["development_months"])
     )
@@ -90,10 +90,10 @@ def resolve_relative_periods(
 
     periods: dict[str, dict[str, str]] = {
         "development": _period(dates, development_start, gate_start, "development"),
-        "gate": _period(dates, gate_start, test_start, "gate"),
+        "gate": _period(dates, gate_start, guard_start, "gate"),
     }
-    if test_months:
-        periods["test"] = _period(dates, test_start, exclusive_end, "test")
+    if guard_months:
+        periods["guard"] = _period(dates, guard_start, exclusive_end, "guard")
 
     schedule = task.parameter_selection["schedule"]
     development_first = pd.Timestamp(periods["development"]["start"])
@@ -126,7 +126,7 @@ def resolve_relative_periods(
         "configured_months": {
             "development": int(config["development_months"]),
             "gate": int(config["gate_months"]),
-            "test": test_months or None,
+            "guard": guard_months or None,
         },
     }
     return task.with_resolved_periods(periods, resolution)

@@ -6,7 +6,6 @@ import signal
 import subprocess
 import sys
 import tomllib
-import uuid
 from datetime import date, datetime
 from pathlib import Path
 from types import FrameType
@@ -41,15 +40,7 @@ from quant_core.research.environment import (
     capture_evaluation_environment,
     persist_evaluation_environment,
 )
-from quant_core.research.periods import resolve_relative_periods
-from quant_core.research.workspace import (
-    build_evaluation_view,
-    ResearchWorkspace,
-    copy_runtime_inputs,
-    runtime_inputs_manifest,
-    workspace_python_env,
-    write_json_atomic,
-)
+from quant_core.research.workspace import ResearchWorkspace
 from quant_core.strategy.sharpe_corr_threshold import (
     STRATEGY_NAME,
     SharpeCorrThresholdParams,
@@ -542,12 +533,6 @@ def command_research_loop(args: argparse.Namespace) -> None:
         print(f"report failed: {state.get('report_error')}")
     elif state.get("report_status") == "failed":
         print(f"report failed: {state.get('report_error')}")
-    if state.get("test_status") == "completed":
-        print(f"test: {state_path.parent / str(state['test_path'])}")
-    elif state.get("test_status") == "failed":
-        print(f"test failed: {state.get('test_error')}")
-    elif state.get("test_status") == "unavailable":
-        print(f"test unavailable: {state.get('test_error')}")
     sync_status = state.get("production_sync_status")
     if sync_status is not None:
         print(f"production sync: {sync_status}")
@@ -708,99 +693,6 @@ def command_research_clean(args: argparse.Namespace) -> None:
     )
 
 
-def command_research_test(args: argparse.Namespace) -> None:
-    """Evaluate the immutable Champion without feeding results into promotion."""
-    task_file = Path(args.task).resolve()
-    task = ResearchTask.load(task_file)
-    source = Path(args.root).resolve()
-    research_root = Path(args.research_root)
-    if not research_root.is_absolute():
-        research_root = source / research_root
-    environment = capture_evaluation_environment()
-    manager = ResearchWorkspace(
-        source,
-        research_root,
-        task.task_id,
-        evaluation_environment_sha256=environment.sha256,
-    )
-    evaluation_runtime = source
-    relative_manifest: dict[str, object] | None = None
-    if task.relative_period_config is not None:
-        evaluation_runtime, input_manifest = build_evaluation_view(
-            source, manager.evaluation_views
-        )
-        task = resolve_relative_periods(
-            task, source=source, runtime=evaluation_runtime
-        )
-        relative_manifest = {
-            "schema_version": 1,
-            "periods": dict(task.resolved_periods or {}),
-            "resolution": dict(task.period_resolution or {}),
-            "evaluation_inputs": input_manifest,
-        }
-    persist_evaluation_environment(manager.root, environment)
-    state = manager.initialize(
-        date.fromisoformat(task.evaluation_periods["development"]["end"]),
-        task.baseline_mode, task.baseline_exclude, task.strategy_path,
-        evaluation_runtime=evaluation_runtime,
-    )
-    if not isinstance(state.get("champion_sha256"), str):
-        raise RuntimeError("research task does not have a champion yet")
-    test = task.test_period
-    if not isinstance(test, dict):
-        raise ValueError("task.evaluation.test is required")
-    test_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
-    evaluator = manager.create_champion_test_evaluator(test_id, state)
-    output = manager.root / "tests" / test_id
-    output.mkdir(parents=True)
-    if relative_manifest is not None:
-        write_json_atomic(output / "resolved-periods.json", relative_manifest)
-    try:
-        copy_runtime_inputs(evaluation_runtime, evaluator)
-        runtime_inputs = runtime_inputs_manifest(evaluator)
-        run_id = f"test-{test_id}"
-        values = {"python": sys.executable, "universe": str(task.raw["data"]["universe"]),
-                  "workspace": str(evaluator), "start": str(test["start"]), "end": str(test["end"]), "run_id": run_id,
-                  "strategy_name": task.strategy_name or "", "strategy_module": task.strategy_module or ""}
-        metrics_relative = task.metrics_path_template.format_map(values)
-        if task.evaluation_mode == "walk_forward":
-            command = [sys.executable, "-m", "quant_core.research.evaluator", "--root", str(evaluator),
-                       "--universe", str(task.raw["data"]["universe"]), "--start", str(test["start"]),
-                       "--end", str(test["end"]), "--run-id", run_id, "--candidate-module", str(task.strategy_module),
-                       "--task", str(task_file), "--stage", "test", "--metrics-path", metrics_relative]
-            if relative_manifest is not None:
-                command.extend([
-                    "--resolved-periods",
-                    str(output / "resolved-periods.json"),
-                ])
-        else:
-            command = [part.format_map(values) for part in task.raw["commands"]["backtest"]]
-        completed = subprocess.run(command, cwd=evaluator, env=workspace_python_env(evaluator), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-        (output / "test.log").write_text(completed.stdout, encoding="utf-8")
-        metrics_path = Path(metrics_relative)
-        if not metrics_path.is_absolute():
-            metrics_path = evaluator / metrics_path
-        if completed.returncode != 0 or not metrics_path.exists():
-            raise RuntimeError("test evaluation failed")
-        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        write_json_atomic(output / "result.json", {
-            "test_id": test_id,
-            "strategy_sha256": state["champion_sha256"],
-            "evaluation_environment_sha256": environment.sha256,
-            "runtime_inputs": runtime_inputs,
-            "test_period": dict(test),
-            "period_resolution": (
-                dict(task.period_resolution)
-                if task.period_resolution is not None
-                else None
-            ),
-            "metrics": metrics,
-        })
-    finally:
-        manager.remove_evaluator(evaluator)
-    print(f"wrote test result to {output / 'result.json'}")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="quant-agent")
     parser.add_argument("--root", default=".")
@@ -928,10 +820,6 @@ def build_parser() -> argparse.ArgumentParser:
     research_clean_target.add_argument("--task-id")
     research_clean.add_argument("--research-root", default=".research")
     research_clean.set_defaults(func=command_research_clean)
-    research_test = research_sub.add_parser("test")
-    research_test.add_argument("--task", required=True)
-    research_test.add_argument("--research-root", default=".research")
-    research_test.set_defaults(func=command_research_test)
     return parser
 
 

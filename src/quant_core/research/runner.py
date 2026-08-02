@@ -26,6 +26,11 @@ from quant_core.research.environment import (
     capture_evaluation_environment,
 )
 from quant_core.research.periods import bind_persisted_periods
+from quant_core.research.guard import (
+    GUARD_REJECTION_REASON,
+    metric_annual_return,
+    universe_equal_weight_annual_return,
+)
 from quant_core.research.workspace import (
     ResearchWorkspace,
     copy_runtime_inputs,
@@ -2033,7 +2038,7 @@ def _prompt(
         comparison_guidance,
         f"Hard gate constraints: {json.dumps(_constraint_descriptions(task.constraints), ensure_ascii=False)}",
         f"Optional absolute target for stopping the loop: {target if target is not None else '(none)'}",
-        "Use only the development period. Do not inspect gate or test periods.",
+        "Use only the development period. Do not inspect gate or guard periods.",
         "If completed, your final response must be exactly one JSON object with string fields status, previous_feedback, hypothesis, attempts, development_effect, and candidate.",
         "If blocked, return exactly string fields status, previous_feedback, and error instead.",
         "In previous_feedback, distinguish the previous round's observed outcome from possible causes.",
@@ -3087,6 +3092,173 @@ def _decide(
     }
 
 
+class GuardEvaluationError(RuntimeError):
+    pass
+
+
+def _guard_input_fingerprints(
+    task: ResearchTask,
+    workspace: Path,
+    runtime: Path,
+) -> dict[str, str]:
+    universe_path = Path(str(task.raw["data"]["universe"]))
+    if not universe_path.is_absolute():
+        universe_path = workspace / universe_path
+    if not universe_path.is_file():
+        raise GuardEvaluationError("Guard universe input is unavailable")
+    return {
+        "evaluation_inputs_sha256": runtime_inputs_sha256(runtime),
+        "universe_sha256": hashlib.sha256(universe_path.read_bytes()).hexdigest(),
+    }
+
+
+def _evaluate_guard(
+    task: ResearchTask,
+    task_path: Path,
+    workspace: Path,
+    runtime: Path,
+    experiment: Path,
+    record_id: str,
+    gate_metrics: Mapping[str, Any],
+    strategy_sha256: str,
+    command_runner: CommandRunner,
+    event_sink: EventSink | None,
+    round_id: str,
+) -> tuple[bool, str]:
+    guard_period = task.guard_period
+    guard_config = task.guard_config
+    if guard_period is None or guard_config is None:
+        raise GuardEvaluationError("Guard is not configured")
+    guard_path = experiment / "guard.json"
+    log_path = experiment / "guard.log"
+    resolved_periods_path = _persist_resolved_periods(task, experiment)
+    fingerprints: dict[str, str] = {}
+    try:
+        fingerprints = _guard_input_fingerprints(task, workspace, runtime)
+        values = _values(task, dict(guard_period), f"{record_id.replace('/', '-')}-guard", workspace)
+        generated_dir = Path(
+            task.metrics_path_template.format_map(values)
+        ).parent.as_posix()
+        inputs_before = _snapshot(workspace, experiment)
+        command = _evaluation_command(
+            task,
+            task_path,
+            "guard",
+            values,
+            resolved_periods_path=resolved_periods_path,
+        )
+        _emit(event_sink, "guard_started", round=round_id, message="guard backtest started")
+        exit_code = _run_with_failure_log(
+            command_runner,
+            command,
+            workspace,
+            log_path,
+            task.command_timeout_minutes * 60,
+        )
+        inputs_after = _snapshot(workspace, experiment)
+        unexpected_changes = [
+            path
+            for path in _changed_files(inputs_before, inputs_after)
+            if not _is_within(path, [generated_dir])
+        ]
+        if unexpected_changes:
+            raise GuardEvaluationError(
+                "Guard modified immutable evaluator inputs: "
+                + ", ".join(unexpected_changes)
+            )
+        if exit_code != 0:
+            raise GuardEvaluationError("Guard backtest failed")
+        metrics_path = workspace / task.metrics_path_template.format_map(values)
+        try:
+            guard_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise GuardEvaluationError("Guard metrics are missing or invalid") from exc
+        if not isinstance(guard_metrics, Mapping):
+            raise GuardEvaluationError("Guard metrics are invalid")
+        gate_strategy = metric_annual_return(gate_metrics)
+        guard_strategy = metric_annual_return(guard_metrics)
+        universe_path = Path(str(task.raw["data"]["universe"]))
+        if not universe_path.is_absolute():
+            universe_path = workspace / universe_path
+        gate_benchmark = universe_equal_weight_annual_return(
+            runtime, universe_path, task.gate_period
+        )
+        guard_benchmark = universe_equal_weight_annual_return(
+            runtime, universe_path, guard_period
+        )
+        gate_excess = gate_strategy - gate_benchmark
+        guard_excess = guard_strategy - guard_benchmark
+        degradation = gate_excess - guard_excess
+        threshold = float(
+            guard_config["max_excess_annual_return_degradation"]
+        )
+        values_to_check = (
+            gate_strategy,
+            guard_strategy,
+            gate_benchmark,
+            guard_benchmark,
+            gate_excess,
+            guard_excess,
+            degradation,
+        )
+        if not all(math.isfinite(value) for value in values_to_check):
+            raise GuardEvaluationError("Guard produced non-finite metrics")
+        passed = degradation <= threshold
+        evidence = {
+            "schema_version": 1,
+            "status": "passed" if passed else "failed",
+            "benchmark": "universe_equal_weight",
+            "periods": {
+                "gate": dict(task.gate_period),
+                "guard": dict(guard_period),
+            },
+            "strategy_annual_return": {
+                "gate": gate_strategy,
+                "guard": guard_strategy,
+            },
+            "benchmark_annual_return": {
+                "gate": gate_benchmark,
+                "guard": guard_benchmark,
+            },
+            "excess_annual_return": {
+                "gate": gate_excess,
+                "guard": guard_excess,
+            },
+            "degradation": degradation,
+            "max_excess_annual_return_degradation": threshold,
+            "strategy_sha256": strategy_sha256,
+            "input_fingerprints": fingerprints,
+        }
+        write_json_atomic(guard_path, evidence)
+        evidence_sha256 = hashlib.sha256(guard_path.read_bytes()).hexdigest()
+        log_path.unlink(missing_ok=True)
+        _emit(
+            event_sink,
+            "guard_completed",
+            round=round_id,
+            passed=passed,
+            message="guard completed",
+        )
+        return passed, evidence_sha256
+    except Exception as exc:
+        if not isinstance(exc, GuardEvaluationError):
+            exc = GuardEvaluationError(str(exc))
+        write_json_atomic(guard_path, {
+            "schema_version": 1,
+            "status": "failed",
+            "error": "guard evaluation failed",
+            "benchmark": "universe_equal_weight",
+            "periods": {
+                "gate": dict(task.gate_period),
+                "guard": dict(guard_period),
+            },
+            "strategy_sha256": strategy_sha256,
+            "input_fingerprints": fingerprints,
+        })
+        _emit(event_sink, "guard_failed", round=round_id, message="guard evaluation failed")
+        raise exc
+
+
 def _metrics_key(task: ResearchTask) -> str:
     periods = dict(task.evaluation_periods)
     if task.evaluation_mode == "walk_forward":
@@ -3415,6 +3587,63 @@ def run_managed_once(
         "submission": dict(result["submission"]),
         "candidate_patch_sha256": candidate_patch_sha256,
     }
+    guard_evidence_sha256: str | None = None
+    if decision["decision"] == "accepted" and task.guard_config is not None:
+        guard_evaluator: Path | None = None
+        try:
+            guard_evaluator = manager.create_candidate_evaluator(
+                round_id,
+                state,
+                candidate,
+                str(result["submission"]["strategy_sha256"]),
+            )
+            copy_runtime_inputs(manager.evaluation_runtime, guard_evaluator)
+            guard_passed, guard_evidence_sha256 = _evaluate_guard(
+                task,
+                task_file,
+                guard_evaluator,
+                guard_evaluator,
+                experiment,
+                record_id,
+                result["metrics"]["gate"],
+                str(result["submission"]["strategy_sha256"]),
+                command_runner,
+                event_sink,
+                round_id,
+            )
+        except (GuardEvaluationError, OSError, RuntimeError, ValueError):
+            guard_path = experiment / "guard.json"
+            if not guard_path.is_file():
+                write_json_atomic(guard_path, {
+                    "schema_version": 1,
+                    "status": "failed",
+                    "error": "guard evaluation failed",
+                    "strategy_sha256": str(
+                        result["submission"]["strategy_sha256"]
+                    ),
+                })
+            decision["decision"] = "failed"
+            decision["reasons"] = ["guard evaluation failed"]
+            decision["guard"] = {"path": "guard.json", "status": "failed"}
+            write_json_atomic(decision_path, decision)
+            manager.reject(candidate, state, record_id)
+            return _write_failed(
+                experiment,
+                record_id,
+                "Guard evaluation failed",
+                result,
+                failure_code="guard_evaluation_failed",
+            )
+        finally:
+            if guard_evaluator is not None and guard_evaluator.exists():
+                manager.remove_evaluator(guard_evaluator)
+        decision["guard"] = {
+            "path": "guard.json",
+            "status": "passed" if guard_passed else "failed",
+        }
+        if not guard_passed:
+            decision["decision"] = "rejected"
+            decision["reasons"] = [GUARD_REJECTION_REASON]
     if decision["decision"] == "accepted" and not has_champion:
         try:
             manager.write_candidate_source(
@@ -3446,6 +3675,7 @@ def run_managed_once(
             metrics_key,
             task.evaluator_contract_paths,
             evaluator_contract_sha256,
+            guard_evidence_sha256=guard_evidence_sha256,
         )
     else:
         if evaluated_champion_record is not None:

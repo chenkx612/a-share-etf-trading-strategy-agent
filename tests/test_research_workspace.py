@@ -82,9 +82,6 @@ end = "2021-12-31"
 start = "2022-01-01"
 end = "2024-12-31"
 
-[evaluation.test]
-start = "2025-01-01"
-end = "2025-12-31"
 """
 
 
@@ -559,7 +556,7 @@ def test_schema_five_metrics_migrate_to_stale_without_losing_values(
 
     migrated = manager.load_state(strategy_path="strategy.py")
 
-    assert migrated["schema_version"] == 8
+    assert migrated["schema_version"] == 9
     assert migrated["champion_fixed_test_record"] is None
     assert migrated["champion_metrics_record"]["status"] == "stale"
     assert migrated["champion_metrics_record"]["stale_reasons"] == [
@@ -581,7 +578,7 @@ def test_schema_seven_migrates_with_empty_fixed_test_record(
 
     migrated = manager.load_state(strategy_path="strategy.py")
 
-    assert migrated["schema_version"] == 8
+    assert migrated["schema_version"] == 9
     assert migrated["champion_fixed_test_record"] is None
 
 
@@ -626,7 +623,7 @@ def test_legacy_task_and_loop_layout_migrates_to_numbered_run(tmp_path: Path) ->
     migrated_state = manager.initialize(strategy_path="strategy.py")
     run_number = manager.migrate_legacy_loop()
 
-    assert migrated_state["schema_version"] == 8
+    assert migrated_state["schema_version"] == 9
     assert migrated_state["champion_fixed_test_record"] is None
     assert manager.champion_path.read_text(encoding="utf-8") == "1.0\n"
     assert "champion_commit" not in migrated_state
@@ -653,7 +650,7 @@ def test_schema_four_metrics_are_preserved_as_stale_during_migration(
 
     migrated = manager.load_state(strategy_path="strategy.py")
 
-    assert migrated["schema_version"] == 8
+    assert migrated["schema_version"] == 9
     assert migrated["champion_fixed_test_record"] is None
     assert migrated["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 1.3
     assert migrated["champion_metrics_record"]["status"] == "stale"
@@ -1952,7 +1949,7 @@ def test_recovery_finalizes_state_when_champion_file_was_already_replaced(
 
     assert recovered["champion_sha256"] == sha256
     assert recovered["champion_round_id"] == "001/001"
-    assert recovered["schema_version"] == 8
+    assert recovered["schema_version"] == 9
     assert recovered["champion_fixed_test_record"] is None
     assert recovered["champion_metrics_record"]["status"] == "stale"
     assert recovered["champion_metrics_record"]["metrics"]["gate"]["sortino"] == 2.0

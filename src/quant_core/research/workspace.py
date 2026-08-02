@@ -606,14 +606,6 @@ class ResearchWorkspace:
         return self.run_report_root / "events.jsonl"
 
     @property
-    def run_test_root(self) -> Path:
-        return self.run_artifacts_root / "test"
-
-    @property
-    def run_test_result_path(self) -> Path:
-        return self.run_test_root / "result.json"
-
-    @property
     def production_sync_path(self) -> Path:
         return self.run_artifacts_root / "production-sync.json"
 
@@ -1173,14 +1165,22 @@ class ResearchWorkspace:
             return
         state = json.loads(source.read_text(encoding="utf-8"))
         schema_version = state.get("schema_version")
-        if schema_version in {7, 8} and source == self.state_path:
+        if schema_version in {7, 8, 9} and source == self.state_path:
             changed = False
             if "last_experiment_id" in state and "last_round_id" not in state:
                 state["last_round_id"] = state.pop("last_experiment_id")
                 changed = True
             if schema_version == 7:
-                state["schema_version"] = 8
+                state["schema_version"] = 9
                 state["champion_fixed_test_record"] = None
+                state["champion_guard_evidence_sha256"] = None
+                changed = True
+            if schema_version == 8:
+                state["schema_version"] = 9
+                state["champion_guard_evidence_sha256"] = None
+                changed = True
+            if "champion_guard_evidence_sha256" not in state:
+                state["champion_guard_evidence_sha256"] = None
                 changed = True
             if changed:
                 write_json_atomic(self.state_path, state)
@@ -1200,8 +1200,9 @@ class ResearchWorkspace:
                     stale_reasons.append("legacy_missing_development_view")
                 metrics_record["status"] = "stale"
                 metrics_record["stale_reasons"] = stale_reasons
-            state["schema_version"] = 8
+            state["schema_version"] = 9
             state["champion_fixed_test_record"] = None
+            state["champion_guard_evidence_sha256"] = None
             state["development_view_sha256"] = None
             state["development_end"] = None
             write_json_atomic(self.state_path, state)
@@ -1234,7 +1235,7 @@ class ResearchWorkspace:
         if champion_round_id is None:
             champion_round_id = self._latest_accepted_round()
         migrated = {
-            "schema_version": 8,
+            "schema_version": 9,
             "task_id": self.task_id,
             "baseline_mode": state.get("baseline_mode", "workspace"),
             "baseline_exclude": list(state.get("baseline_exclude", [])),
@@ -1245,6 +1246,7 @@ class ResearchWorkspace:
             "champion_round_id": champion_round_id,
             "champion_metrics_record": metrics_record,
             "champion_fixed_test_record": None,
+            "champion_guard_evidence_sha256": None,
             "last_round_id": state.get(
                 "last_round_id",
                 state.get("last_experiment_id"),
@@ -1519,7 +1521,7 @@ class ResearchWorkspace:
                 continue
             experiment = self.rounds / round_id
             for name in (
-                "tests.log", "development.log", "gate.log",
+                "tests.log", "development.log", "gate.log", "guard.log",
                 "champion-development.log", "champion-gate.log",
             ):
                 source = experiment / name
@@ -1549,7 +1551,7 @@ class ResearchWorkspace:
             "stop_reason": state.get("stop_reason"),
             "status": state.get("status"),
             "report_status": state.get("report_status"),
-            "test_status": state.get("test_status"),
+            "guard_query_count": state.get("guard_query_count"),
             "event_count": len(events),
             "rounds": round_records,
             "findings": findings,
@@ -1611,6 +1613,9 @@ class ResearchWorkspace:
             state["last_round_id"] = str(pending["round_id"])
             state["project_revision"] = str(pending["project_revision"])
             state["champion_fixed_test_record"] = None
+            state["champion_guard_evidence_sha256"] = pending.get(
+                "guard_evidence_sha256"
+            )
         self.champion_next_path.unlink(missing_ok=True)
         state["pending_promotion"] = None
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1708,7 +1713,7 @@ class ResearchWorkspace:
             os.replace(self.champion_next_path, self.champion_path)
             champion_sha256 = _file_sha256(self.champion_path)
         state: dict[str, Any] = {
-            "schema_version": 8,
+            "schema_version": 9,
             "task_id": self.task_id,
             "baseline_mode": baseline_mode,
             "baseline_exclude": list(baseline_exclude),
@@ -1719,6 +1724,7 @@ class ResearchWorkspace:
             "champion_round_id": None,
             "champion_metrics_record": None,
             "champion_fixed_test_record": None,
+            "champion_guard_evidence_sha256": None,
             "last_round_id": None,
             "pending_promotion": None,
             "development_view_sha256": None,
@@ -1733,7 +1739,7 @@ class ResearchWorkspace:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("task_id") != self.task_id:
             raise ValueError("research workspace task id does not match task.toml")
-        if state.get("schema_version") != 8:
+        if state.get("schema_version") != 9:
             raise ValueError("research workspace uses an incompatible Champion schema")
         self._strategy_path(state, strategy_path)
         if isinstance(state.get("pending_promotion"), dict):
@@ -1829,6 +1835,31 @@ class ResearchWorkspace:
             state.get("baseline_exclude", []),
             strategy_path=str(state["strategy_path"]),
             champion_path=self.champion_path,
+        )
+        self._add_worktree(evaluator, base_commit)
+        return evaluator
+
+    def create_candidate_evaluator(
+        self,
+        round_id: str,
+        state: Mapping[str, Any],
+        candidate: Path,
+        expected_strategy_sha256: str,
+    ) -> Path:
+        """Create a clean evaluator containing only the validated candidate strategy."""
+        strategy_path = str(state["strategy_path"])
+        candidate_strategy = candidate / strategy_path
+        if (
+            not candidate_strategy.is_file()
+            or _file_sha256(candidate_strategy) != expected_strategy_sha256
+        ):
+            raise RuntimeError("candidate strategy is unavailable or has an invalid hash")
+        self._cleanup_worktrees(self.evaluators)
+        evaluator = self.evaluators / round_id
+        base_commit = self._snapshot_commit(
+            state.get("baseline_exclude", []),
+            strategy_path=strategy_path,
+            champion_path=candidate_strategy,
         )
         self._add_worktree(evaluator, base_commit)
         return evaluator
@@ -2010,6 +2041,8 @@ class ResearchWorkspace:
         metrics_key: str,
         evaluator_contract_paths: Sequence[str],
         evaluator_contract_sha256: str,
+        *,
+        guard_evidence_sha256: str | None = None,
     ) -> str:
         strategy_path = str(state["strategy_path"])
         if list(editable) != [strategy_path]:
@@ -2035,6 +2068,7 @@ class ResearchWorkspace:
             "champion_number": number,
             "metrics_record": metrics_record,
             "project_revision": _git(self.source, "rev-parse", "HEAD"),
+            "guard_evidence_sha256": guard_evidence_sha256,
         }
         write_json_atomic(self.state_path, state)
         os.replace(self.champion_next_path, self.champion_path)
@@ -2042,6 +2076,7 @@ class ResearchWorkspace:
         state["champion_number"] = number
         state["champion_round_id"] = round_id
         state["champion_fixed_test_record"] = None
+        state["champion_guard_evidence_sha256"] = guard_evidence_sha256
         state["project_revision"] = state["pending_promotion"]["project_revision"]
         state["pending_promotion"] = None
         self.record_state(state, round_id, metrics_record)

@@ -77,12 +77,12 @@ def test_resolves_contiguous_relative_periods_and_freezes_anchor(
 
     assert resolved.period_resolution is not None
     assert resolved.period_resolution["anchor"] == "2026-07-30"
-    assert resolved.test_period == {"start": "2026-02-02", "end": "2026-07-30"}
+    assert resolved.guard_period == {"start": "2026-02-02", "end": "2026-07-30"}
     assert pd.Timestamp(resolved.development_period["end"]) < pd.Timestamp(
         resolved.gate_period["start"]
     )
     assert pd.Timestamp(resolved.gate_period["end"]) < pd.Timestamp(
-        resolved.test_period["start"]
+        resolved.guard_period["start"]
     )
 
 
@@ -129,7 +129,7 @@ def test_evaluation_views_are_content_addressed_and_run_frozen(
         "periods": {
             "development": {"start": "2022-01-01", "end": "2024-06-30"},
             "gate": {"start": "2024-07-01", "end": "2025-06-30"},
-            "test": {"start": "2025-07-01", "end": "2025-12-31"},
+            "guard": {"start": "2025-07-01", "end": "2025-12-31"},
         },
         "resolution": {"anchor": "2025-12-31"},
     }

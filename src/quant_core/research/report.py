@@ -37,8 +37,6 @@ _REPORT_INPUT_CONTAINER_PATH = "/workspace/report-input.json"
 _REPORT_FACTS_CONTAINER_PATH = "/workspace/report-facts.json"
 _REPORT_INSTRUCTION_MAX_BYTES = 64 * 1024
 _REPORT_TITLE = "# Research Loop 总结"
-_TEST_SECTION_START = "<!-- harness:test-observation:start -->"
-_TEST_SECTION_END = "<!-- harness:test-observation:end -->"
 _FENCE_START = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_PREAMBLE_BLOCK = re.compile(
     r"^ {0,3}(?:"
@@ -75,76 +73,6 @@ def _write_loop_state(path: Path, state: dict[str, Any]) -> None:
     write_json_atomic(path, state)
 
 
-def _test_observation_metrics(value: object) -> list[tuple[str, object]]:
-    if not isinstance(value, Mapping):
-        return []
-    aggregate = value.get("aggregate")
-    source = aggregate if isinstance(aggregate, Mapping) else value
-    metrics = {
-        str(key): item
-        for key, item in source.items()
-        if isinstance(item, (str, int, float, bool)) or item is None
-    }
-    if source is not value:
-        metrics.update({
-            str(key): item
-            for key, item in value.items()
-            if isinstance(item, (str, int, float, bool)) or item is None
-        })
-    return sorted(metrics.items())
-
-
-def append_test_observation(
-    report_path: Path,
-    task: ResearchTask,
-    manager: ResearchWorkspace,
-    loop_state: Mapping[str, Any],
-) -> Path:
-    """Append the Harness-owned Test summary without exposing it to the Agent."""
-    try:
-        body = report_path.read_text(encoding="utf-8")
-    except OSError:
-        body = "# Research Loop 总结\n"
-    pattern = re.compile(
-        rf"\n*{re.escape(_TEST_SECTION_START)}.*?{re.escape(_TEST_SECTION_END)}\s*",
-        re.DOTALL,
-    )
-    body = pattern.sub("\n", body).rstrip()
-    test = task.test_period
-    status = str(loop_state.get("test_status") or "unknown")
-    result = _read_json(manager.run_test_result_path) or {}
-    champion_sha256 = result.get("strategy_sha256")
-    if not isinstance(champion_sha256, str):
-        champion_sha256 = loop_state.get("final_champion_sha256")
-    if not isinstance(champion_sha256, str):
-        try:
-            champion_sha256 = manager.load_state(task.strategy_path).get(
-                "champion_sha256"
-            )
-        except Exception:
-            champion_sha256 = None
-    lines = [
-        _TEST_SECTION_START,
-        "## Test 区间观察",
-        "",
-        f"- 区间：{test['start']} 至 {test['end']}" if isinstance(test, Mapping) else "- 区间：未配置",
-        f"- 状态：{status}",
-        f"- Champion SHA-256：{champion_sha256 or '不可用'}",
-    ]
-    metrics = result.get("metrics")
-    scalar_metrics = _test_observation_metrics(metrics)
-    if scalar_metrics:
-        lines.extend(["", "### 核心聚合指标", "", "| 指标 | 值 |", "|---|---:|"])
-        for key, value in scalar_metrics:
-            rendered = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-            lines.append(f"| {key} | {rendered} |")
-    lines.extend([_TEST_SECTION_END, ""])
-    temporary = report_path.with_suffix(".md.tmp")
-    temporary.write_text(body + "\n\n" + "\n".join(lines), encoding="utf-8")
-    temporary.replace(report_path)
-    return report_path
-
-
 def write_minimal_loop_report(
     task: ResearchTask,
     manager: ResearchWorkspace,
@@ -158,13 +86,12 @@ def write_minimal_loop_report(
         f"- Run 状态：{loop_state.get('status')}\n"
         f"- 停止原因：{loop_state.get('stop_reason')}\n"
         f"- 报告失败原因：{reason}\n"
-        f"- Test 状态：{loop_state.get('test_status')}\n"
     )
     manager.report_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = manager.report_path.with_suffix(".md.tmp")
     temporary.write_text(report, encoding="utf-8")
     temporary.replace(manager.report_path)
-    return append_test_observation(manager.report_path, task, manager, loop_state)
+    return manager.report_path
 
 
 def _loop_round_ids(
@@ -475,7 +402,7 @@ def generate_loop_report(
             ),
             "development_period": task.development_period,
             "gate_period": task.gate_period,
-            "test_period": task.test_period,
+            "guard_period": task.guard_period,
             "period_resolution": task.period_resolution,
         },
         "loop": loop_payload,
@@ -731,7 +658,6 @@ def regenerate_loop_report(
         _write_loop_state(loop_state_path, loop_state)
         restore_runtime_layout()
         raise
-    append_test_observation(report_path, task, manager, loop_state)
     loop_state["report_status"] = "completed"
     loop_state["report_path"] = report_path.relative_to(manager.run_root).as_posix()
     _write_loop_state(loop_state_path, loop_state)

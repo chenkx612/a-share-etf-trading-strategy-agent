@@ -90,9 +90,6 @@ end = "2021-12-31"
 start = "2022-01-01"
 end = "2024-12-31"
 
-[evaluation.test]
-start = "2025-01-01"
-end = "2025-12-31"
 """
 
 
@@ -105,7 +102,7 @@ def test_relative_gate_command_receives_frozen_period_manifest(
         {
             "development": {"start": "2022-08-01", "end": "2025-01-31"},
             "gate": {"start": "2025-02-01", "end": "2026-01-31"},
-            "test": {"start": "2026-02-01", "end": "2026-07-31"},
+            "guard": {"start": "2026-02-01", "end": "2026-07-31"},
         },
         {"anchor": "2026-07-31"},
     )
@@ -237,7 +234,7 @@ def test_research_history_normalizes_fixed_and_walk_forward_development_metrics(
     assert "8.8" not in serialized
 
 
-def test_walk_forward_development_config_excludes_gate_and_test_periods(
+def test_walk_forward_development_config_excludes_gate_and_guard_periods(
     tmp_path: Path,
 ) -> None:
     task_path = tmp_path / "task.toml"

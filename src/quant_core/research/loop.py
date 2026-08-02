@@ -21,9 +21,7 @@ from quant_core.research.environment import (
     capture_evaluation_environment,
     persist_evaluation_environment,
 )
-from quant_core.research.champion_test import evaluate_run_champion_test
 from quant_core.research.report import (
-    append_test_observation,
     generate_loop_report,
     write_minimal_loop_report,
 )
@@ -49,9 +47,6 @@ from quant_core.research.workspace import (
 
 ManagedRunner = Callable[..., Path]
 LoopReporter = Callable[[Path, ResearchWorkspace, dict[str, Any]], Path]
-ChampionTester = Callable[
-    [Path, ResearchTask, ResearchWorkspace, dict[str, Any]], Path
-]
 ContainerPreflight = Callable[..., None]
 ProviderPreflight = Callable[[ResearchTask, Path], None]
 EnvironmentProbe = Callable[[], EvaluationEnvironment]
@@ -84,7 +79,7 @@ def _new_state(
 ) -> dict[str, Any]:
     now = _timestamp()
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "task_id": task.task_id,
         "run_number": run_number,
         "task_fingerprint": fingerprint,
@@ -107,9 +102,7 @@ def _new_state(
         "report_error": None,
         "report_failure_kind": None,
         "report_failure_code": None,
-        "test_status": None,
-        "test_path": None,
-        "test_error": None,
+        "guard_query_count": 0,
         "diagnostics_enabled": diagnostics_enabled,
         "development_view_sha256": development_view_sha256,
         "development_end": development_end,
@@ -134,12 +127,15 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     if "last_round" not in state:
         state["last_round"] = state.pop("last_experiment_id", None)
     schema_version = state.get("schema_version")
-    if schema_version not in {2, 3, 4, 5, 6}:
+    if schema_version not in {2, 3, 4, 5, 6, 7}:
         raise ValueError("research loop uses an incompatible state schema")
-    state.setdefault("test_status", None)
-    state.setdefault("test_path", None)
-    state.setdefault("test_error", None)
-    if schema_version != 6:
+    if schema_version != 7:
+        state["schema_version"] = 7
+        state.pop("test_status", None)
+        state.pop("test_path", None)
+        state.pop("test_error", None)
+    state.setdefault("guard_query_count", 0)
+    if schema_version not in {6, 7}:
         state.setdefault("production_sync_baseline_available", False)
     state.setdefault("production_sync_status", None)
     state.setdefault("production_sync_path", None)
@@ -405,7 +401,7 @@ def _recover_unresolved_production_sync(
             state = json.loads(run.loop_state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        if state.get("schema_version") != 6 or state.get("production_sync_status") not in {
+        if state.get("schema_version") not in {6, 7} or state.get("production_sync_status") not in {
             "pending",
             "conflict",
             "failed",
@@ -527,6 +523,19 @@ def _record_decision(state: dict[str, Any], round_id: str, decision: str) -> Non
         state["consecutive_failures"] = int(state["consecutive_failures"]) + 1
 
 
+def _sync_guard_query_count(
+    state: dict[str, Any], manager: ResearchWorkspace
+) -> None:
+    if not manager.rounds.is_dir():
+        state["guard_query_count"] = 0
+        return
+    state["guard_query_count"] = sum(
+        (round_path / "guard.json").is_file()
+        for round_path in manager.rounds.iterdir()
+        if round_path.is_dir()
+    )
+
+
 def _stop_reason(
     state: dict[str, Any],
     task: ResearchTask,
@@ -583,7 +592,6 @@ def _finish_with_report(
     state: dict[str, Any],
     reason: str,
     reporter: LoopReporter,
-    champion_tester: ChampionTester,
 ) -> Path:
     _freeze_terminal_champion(task, manager, state)
     state["status"] = "stopped"
@@ -619,59 +627,9 @@ def _finish_with_report(
             state["report_path"] = str(report_path)
         manager.emit_event("report_completed", message="report completed")
 
-    if task.test_period is None:
-        state["test_status"] = "not_configured"
-        state["test_path"] = None
-        state["test_error"] = None
-        manager.emit_event("test_skipped", message="Test period is not configured")
-    else:
-        champion_sha256 = state.get("final_champion_sha256")
-        if not isinstance(champion_sha256, str):
-            state["test_status"] = "unavailable"
-            state["test_path"] = None
-            state["test_error"] = "research Run does not have a Champion to test"
-            manager.emit_event(
-                "test_unavailable", message="Champion is unavailable"
-            )
-        else:
-            state["test_status"] = "running"
-            state["test_path"] = None
-            state["test_error"] = None
-            _save(loop_state_path, state)
-            manager.emit_event("test_started", message="Champion Test started")
-            try:
-                test_path = champion_tester(task_file, task, manager, state)
-            except KeyboardInterrupt:
-                state["test_status"] = "interrupted"
-                state["test_error"] = "Champion Test evaluation was interrupted"
-                manager.emit_event(
-                    "test_interrupted", message="Champion Test interrupted"
-                )
-                manager.finalize_diagnostics(state)
-                manager.cleanup_transient(remove_development_cache=True)
-                _save(loop_state_path, state)
-                raise
-            except Exception as exc:
-                state["test_status"] = "failed"
-                state["test_error"] = str(exc)
-                manager.emit_event("test_failed", message="Champion Test failed")
-            else:
-                state["test_status"] = "completed"
-                try:
-                    state["test_path"] = test_path.relative_to(
-                        manager.run_artifacts_root
-                    ).as_posix()
-                except ValueError:
-                    state["test_path"] = str(test_path)
-                manager.emit_event(
-                    "test_completed", message="Champion Test completed"
-                )
-                (manager.run_test_root / "test.log").unlink(missing_ok=True)
     if state.get("report_status") == "failed":
         state["report_path"] = "report.md"
         write_minimal_loop_report(task, manager, state)
-    else:
-        append_test_observation(manager.report_path, task, manager, state)
     try:
         _synchronize_production_strategy(task, manager, state)
     except Exception as exc:
@@ -694,7 +652,6 @@ def run_loop(
     research_root: str | Path = ".research",
     managed_runner: ManagedRunner = run_managed_once,
     reporter: LoopReporter = generate_loop_report,
-    champion_tester: ChampionTester = evaluate_run_champion_test,
     monotonic: Callable[[], float] = time.monotonic,
     container_preflight: ContainerPreflight | None = None,
     provider_preflight: ProviderPreflight | None = None,
@@ -810,7 +767,7 @@ def run_loop(
         state["diagnostics_enabled"] = diagnostics_enabled
         manager.diagnostics_enabled = diagnostics_enabled
         incompatible_development_inputs = (
-            state.get("schema_version") not in {4, 5, 6}
+            state.get("schema_version") not in {4, 5, 6, 7}
             or state.get("development_view_sha256") != development_view_sha256
             or state.get("development_end") != development_end
             or not manager.development_inputs_path.is_file()
@@ -838,7 +795,6 @@ def run_loop(
                 state,
                 "infrastructure_failure",
                 reporter,
-                champion_tester,
             )
     else:
         run_number = base_manager.next_run_number()
@@ -889,7 +845,6 @@ def run_loop(
             state,
             "infrastructure_failure",
             reporter,
-            champion_tester,
         )
     # Injected managed runners own their execution environment. The production
     # runner must prove its Docker boundary before a Run is allocated or resumed.
@@ -1070,6 +1025,7 @@ def run_loop(
                 "reasons": ["loop was interrupted before the round was finalized"],
             })
         _record_decision(state, current, str(decision))
+        _sync_guard_query_count(state, manager)
         _save(loop_state_path, state)
 
     while True:
@@ -1094,7 +1050,6 @@ def run_loop(
                 state,
                 reason,
                 reporter,
-                champion_tester,
             )
 
         if parent_checked_before_lifecycle:
@@ -1135,7 +1090,6 @@ def run_loop(
                     state,
                     "infrastructure_failure",
                     reporter,
-                    champion_tester,
                 )
 
         if authentication_preflight is not None and (
@@ -1152,7 +1106,6 @@ def run_loop(
                     state,
                     "infrastructure_failure",
                     reporter,
-                    champion_tester,
                 )
 
         round_ids = state.get("round_ids")
@@ -1206,7 +1159,6 @@ def run_loop(
                     state,
                     "infrastructure_failure",
                     reporter,
-                    champion_tester,
                 )
             except KeyboardInterrupt:
                 if candidate is not None and candidate.exists():
@@ -1280,6 +1232,7 @@ def run_loop(
         decision_path = result_path.parent / "decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8")).get("decision", "failed")
         _record_decision(state, round_id, str(decision))
+        _sync_guard_query_count(state, manager)
         manager.emit_event(
             "round_completed",
             round=round_id,
@@ -1296,5 +1249,4 @@ def run_loop(
                 state,
                 "infrastructure_failure",
                 reporter,
-                champion_tester,
             )

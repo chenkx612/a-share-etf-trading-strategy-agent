@@ -149,8 +149,12 @@ mode = "walk_forward"
 [evaluation.acceptance]
 minimum_improvement = 0.03
 
+[evaluation.guard]
+benchmark = "universe_equal_weight"
+max_excess_annual_return_degradation = 0.10
+
 [evaluation.walk_forward.relative]
 anchor = "latest_complete_universe_date"
 development_months = 30
 gate_months = 12
-test_months = 6
+guard_months = 6

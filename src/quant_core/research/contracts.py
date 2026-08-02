@@ -421,6 +421,35 @@ class ResearchTask:
                 raise ValueError(
                     "task.evaluation.acceptance.minimum_improvement must be finite and non-negative"
                 )
+        if "test" in evaluation:
+            raise ValueError("task.evaluation.test is obsolete; configure task.evaluation.guard")
+        guard_config = evaluation.get("guard")
+        if guard_config is not None:
+            if not isinstance(guard_config, dict) or set(guard_config) != {
+                "benchmark",
+                "max_excess_annual_return_degradation",
+            }:
+                raise ValueError(
+                    "task.evaluation.guard must contain exactly benchmark and "
+                    "max_excess_annual_return_degradation"
+                )
+            if guard_config.get("benchmark") != "universe_equal_weight":
+                raise ValueError(
+                    "task.evaluation.guard.benchmark must be universe_equal_weight"
+                )
+            degradation = guard_config.get(
+                "max_excess_annual_return_degradation"
+            )
+            if (
+                not isinstance(degradation, (int, float))
+                or isinstance(degradation, bool)
+                or not math.isfinite(float(degradation))
+                or not 0.0 <= float(degradation) <= 1.0
+            ):
+                raise ValueError(
+                    "task.evaluation.guard.max_excess_annual_return_degradation "
+                    "must be finite and between 0 and 1"
+                )
         target = evaluation.get("target")
         if target is not None:
             if not isinstance(target, dict):
@@ -446,7 +475,7 @@ class ResearchTask:
                     "anchor",
                     "development_months",
                     "gate_months",
-                    "test_months",
+                    "guard_months",
                 }
                 if not {"anchor", "development_months", "gate_months"} <= set(relative):
                     raise ValueError(
@@ -462,7 +491,12 @@ class ResearchTask:
                         "task.evaluation.walk_forward.relative.anchor must be "
                         "latest_complete_universe_date"
                     )
-                for key in ("development_months", "gate_months", "test_months"):
+                if "test_months" in relative:
+                    raise ValueError(
+                        "task.evaluation.walk_forward.relative.test_months is obsolete; "
+                        "use guard_months"
+                    )
+                for key in ("development_months", "gate_months", "guard_months"):
                     if key not in relative:
                         continue
                     value = relative[key]
@@ -475,17 +509,27 @@ class ResearchTask:
                             f"task.evaluation.walk_forward.relative.{key} "
                             "must be a positive integer"
                         )
-                if evaluation.get("test") is not None:
+                if ("guard_months" in relative) != (guard_config is not None):
                     raise ValueError(
-                        "relative walk-forward periods must declare test_months "
-                        "instead of task.evaluation.test"
+                        "relative walk-forward guard requires both guard_months and "
+                        "task.evaluation.guard"
                     )
                 return cls(raw=dict(data))
-            if set(periods) != absolute_keys:
+            expected_absolute = absolute_keys | ({"guard"} if guard_config is not None else set())
+            if set(periods) != expected_absolute:
                 raise ValueError(
-                    "task.evaluation.walk_forward must contain exactly development "
-                    "and gate, or exactly relative; parameter search policy belongs "
-                    "in task.parameter_selection"
+                    "task.evaluation.walk_forward must contain exactly development, "
+                    "gate, and configured guard, or exactly relative; parameter "
+                    "search policy belongs in task.parameter_selection"
+                )
+        elif mode == "fixed":
+            expected_fixed = {"development", "gate"} | (
+                {"guard"} if guard_config is not None else set()
+            )
+            if set(periods) != expected_fixed:
+                raise ValueError(
+                    "task.evaluation.fixed must contain exactly development, gate, "
+                    "and configured guard"
                 )
         development = _period(
             _required(periods, "development", dict, f"task.evaluation.{periods_key}"),
@@ -498,13 +542,11 @@ class ResearchTask:
         if development[1] >= gate[0]:
             raise ValueError("fixed development and gate periods must not overlap")
 
-        test = evaluation.get("test")
-        if test is not None:
-            if not isinstance(test, dict):
-                raise ValueError("task.evaluation.test must be a table")
-            test_period = _period(test, "task.evaluation.test")
-            if gate[1] >= test_period[0]:
-                raise ValueError("test period must start after the research period")
+        guard = periods.get("guard")
+        if guard_config is not None:
+            guard_period = _period(guard, f"task.evaluation.{periods_key}.guard")
+            if gate[1] >= guard_period[0]:
+                raise ValueError("gate and guard periods must not overlap")
 
         return cls(raw=dict(data))
 
@@ -593,7 +635,7 @@ class ResearchTask:
             return {
                 key: value
                 for key, value in self.resolved_periods.items()
-                if key in {"development", "gate"}
+                if key in {"development", "gate", "guard"}
             }
         evaluation = self.raw["evaluation"]
         return evaluation["fixed" if self.evaluation_mode == "fixed" else "walk_forward"]
@@ -613,8 +655,8 @@ class ResearchTask:
         if self.relative_period_config is None:
             raise ValueError("only relative tasks can bind resolved periods")
         expected = {"development", "gate"}
-        if "test_months" in self.relative_period_config:
-            expected.add("test")
+        if "guard_months" in self.relative_period_config:
+            expected.add("guard")
         if set(periods) != expected:
             raise ValueError(
                 f"resolved periods must contain exactly {sorted(expected)}"
@@ -629,13 +671,13 @@ class ResearchTask:
         )
         if development[1] >= gate[0]:
             raise ValueError("resolved development and gate periods must not overlap")
-        if "test" in expected:
-            test = _period(
-                _required(periods, "test", dict, "resolved periods"),
-                "resolved periods.test",
+        if "guard" in expected:
+            guard = _period(
+                _required(periods, "guard", dict, "resolved periods"),
+                "resolved periods.guard",
             )
-            if gate[1] >= test[0]:
-                raise ValueError("resolved gate and test periods must not overlap")
+            if gate[1] >= guard[0]:
+                raise ValueError("resolved gate and guard periods must not overlap")
         return ResearchTask(
             raw=self.raw,
             resolved_periods=dict(periods),
@@ -651,16 +693,15 @@ class ResearchTask:
         return self.evaluation_periods["gate"]
 
     @property
-    def test_period(self) -> Mapping[str, Any] | None:
-        if self.relative_period_config is not None:
-            if self.resolved_periods is None:
-                raise RuntimeError(
-                    "relative evaluation periods must be resolved against a frozen "
-                    "runtime input snapshot"
-                )
-            value = self.resolved_periods.get("test")
-            return value if isinstance(value, Mapping) else None
-        value = self.raw["evaluation"].get("test")
+    def guard_period(self) -> Mapping[str, Any] | None:
+        if self.raw["evaluation"].get("guard") is None:
+            return None
+        value = self.evaluation_periods.get("guard")
+        return value if isinstance(value, Mapping) else None
+
+    @property
+    def guard_config(self) -> Mapping[str, Any] | None:
+        value = self.raw["evaluation"].get("guard")
         return value if isinstance(value, Mapping) else None
 
     @property
@@ -953,6 +994,8 @@ class ExperimentResult:
                 raise ValueError("result.metrics must contain development and gate metrics")
             if "test" in metrics:
                 raise ValueError("result.metrics must not contain test metrics during the research loop")
+            if "guard" in metrics:
+                raise ValueError("result.metrics must not contain guard metrics during the research loop")
             if not all(isinstance(metrics[key], dict) for key in ("development", "gate")):
                 raise ValueError("result development and gate metrics must be objects")
         else:

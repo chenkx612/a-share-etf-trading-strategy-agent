@@ -484,7 +484,13 @@ def _select_soft_corr(
                 continue
             if float(raw.loc[asset]) <= float(raw.loc[best_asset]):
                 continue
-            if best_raw_pen <= 0.0 and best_pen <= 0.0:
+            asset_raw_pen = _mean_corr_to_selected(asset, selected, curr_corr)
+            asset_pen = (
+                (1.0 - mix) * asset_raw_pen + mix * median_pair
+                if mix > 0.0
+                else asset_raw_pen
+            )
+            if asset_raw_pen <= 0.0 and asset_pen <= 0.0:
                 continue
             filter_events.append({
                 "date": date.date().isoformat(),
@@ -493,8 +499,8 @@ def _select_soft_corr(
                 "filter": "soft_correlation",
                 "condition": "z_sharpe - corr_lambda * corr_pen < selected",
                 "corr_lambda": float(corr_lambda),
-                "mean_corr_to_selected": float(best_raw_pen),
-                "corr_pen_used": float(best_pen),
+                "mean_corr_to_selected": float(asset_raw_pen),
+                "corr_pen_used": float(asset_pen),
                 "corr_pen_median_mix": float(mix),
                 "median_pair_corr": float(median_pair),
                 "selected_symbol": str(best_asset),

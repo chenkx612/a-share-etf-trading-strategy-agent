@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 
 import quant_core.research.loop as research_loop
-import quant_core.research.champion_test as champion_test
 from quant_core.research import run_loop
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.environment import EvaluationEnvironment
@@ -75,13 +74,6 @@ end = "2024-12-31"
 
 """
 
-TEST_PERIOD = """
-[evaluation.test]
-start = "2025-01-01"
-end = "2025-12-31"
-"""
-
-
 def _init_repo(root: Path) -> None:
     if (root / ".git").exists():
         return
@@ -101,7 +93,6 @@ def _task(
     max_hours: int = 4,
     max_failures: int = 2,
     target: float | None = None,
-    include_test: bool = False,
 ) -> Path:
     path = root / "task.toml"
     content = TASK.format(
@@ -111,8 +102,6 @@ def _task(
     )
     if target is not None:
         content += f"\n[evaluation.target]\nobjective_at_least = {target}\n"
-    if include_test:
-        content += TEST_PERIOD
     path.write_text(content, encoding="utf-8")
     (root / "strategy.py").write_text("1.0\n", encoding="utf-8")
     _init_repo(root)
@@ -321,7 +310,7 @@ def test_loop_synchronizes_its_frozen_final_champion_after_reporting(
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     audit = json.loads((state_path.parent / "production-sync.json").read_text(encoding="utf-8"))
-    assert state["schema_version"] == 6
+    assert state["schema_version"] == 7
     assert state["production_sync_status"] == "completed"
     assert audit["final_champion_round_id"] == "001/001"
     assert (tmp_path / "strategy.py").read_text(encoding="utf-8") == "2.0\n"
@@ -460,7 +449,7 @@ def test_loop_stops_after_consecutive_failed_rounds(
     )
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["schema_version"] == 6
+    assert state["schema_version"] == 7
     assert state["stop_reason"] == "max_consecutive_failures"
     assert state["rounds_completed"] == 3
     assert state["rejected"] == 1
@@ -472,7 +461,7 @@ def test_loop_stops_after_consecutive_failed_rounds(
     ]
     assert state["report_status"] == "completed"
     assert state["report_path"] == "report.md"
-    assert state["test_status"] == "not_configured"
+    assert state["guard_query_count"] == 0
     assert state_path == tmp_path / ".research/loop-test/runs/001/artifacts/state.json"
     assert (state_path.parent.parent / "report.md").exists()
     assert not (tmp_path / ".research/loop-test/.tmp/runs/001/events.jsonl").exists()
@@ -480,235 +469,6 @@ def test_loop_stops_after_consecutive_failed_rounds(
     assert "[001] started" in output
     assert "[001/001] candidate started" in output
     assert "[001/003] completed: failed" in output
-
-
-def test_loop_automatically_tests_the_run_champion_after_report(
-    tmp_path: Path,
-) -> None:
-    task = _task(tmp_path, max_rounds=1, include_test=True)
-    stages: list[str] = []
-
-    def reporter(
-        task_path: Path,
-        manager: ResearchWorkspace,
-        state: dict[str, object],
-    ) -> Path:
-        stages.append("report")
-        return _reporter(task_path, manager, state)
-
-    def champion_tester(
-        task_path: Path,
-        research_task: ResearchTask,
-        manager: ResearchWorkspace,
-        state: dict[str, object],
-    ) -> Path:
-        stages.append("test")
-        assert research_task.test_period == {
-            "start": "2025-01-01",
-            "end": "2025-12-31",
-        }
-        manager.run_test_root.mkdir(parents=True)
-        manager.run_test_result_path.write_text(
-            json.dumps({"metrics": {"sortino": 1.25}}),
-            encoding="utf-8",
-        )
-        return manager.run_test_result_path
-
-    state_path = run_loop(
-        task,
-        workspace=tmp_path,
-        managed_runner=_runner(["rejected"]),
-        reporter=reporter,
-        champion_tester=champion_tester,
-    )
-
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert stages == ["report", "test"]
-    assert state["stop_reason"] == "max_rounds"
-    assert state["test_status"] == "completed"
-    assert state["test_path"] == "test/result.json"
-    assert json.loads(
-        (state_path.parent / state["test_path"]).read_text(encoding="utf-8")
-    )["metrics"]["sortino"] == 1.25
-    run_root = state_path.parent.parent
-    assert sorted(path.name for path in run_root.iterdir()) == [
-        "artifacts",
-        "report.md",
-    ]
-    report = (run_root / "report.md").read_text(encoding="utf-8")
-    assert report.count("<!-- harness:test-observation:start -->") == 1
-    assert "| sortino | 1.25 |" in report
-
-
-def test_automatic_champion_test_failure_does_not_change_loop_result(
-    tmp_path: Path,
-) -> None:
-    task = _task(tmp_path, max_rounds=1, include_test=True)
-
-    def failing_tester(task_path, research_task, manager, state):
-        manager.run_test_root.mkdir(parents=True)
-        (manager.run_test_root / "test.log").write_text(
-            "test evaluator detail", encoding="utf-8"
-        )
-        raise RuntimeError("test evaluator unavailable")
-
-    state_path = run_loop(
-        task,
-        workspace=tmp_path,
-        managed_runner=_runner(["rejected"]),
-        reporter=_reporter,
-        champion_tester=failing_tester,
-    )
-
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["status"] == "stopped"
-    assert state["stop_reason"] == "max_rounds"
-    assert state["report_status"] == "completed"
-    assert state["test_status"] == "failed"
-    assert state["test_path"] is None
-    assert state["test_error"] == "test evaluator unavailable"
-    assert (state_path.parent / "test/test.log").read_text(
-        encoding="utf-8"
-    ) == "test evaluator detail"
-
-
-def test_default_automatic_test_writes_run_scoped_auditable_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    task = _task(tmp_path, max_rounds=1, include_test=True)
-    (tmp_path / "data").mkdir()
-    market_data = b"date,value\n2025-12-31,7\n"
-    (tmp_path / "data/market.csv").write_bytes(market_data)
-    real_run = subprocess.run
-
-    def fake_run(command, **kwargs):
-        if command[0] != "backtest":
-            return real_run(command, **kwargs)
-        cwd = kwargs["cwd"]
-        assert command[0] == "backtest"
-        assert (cwd / "data/market.csv").read_bytes() == market_data
-        run_id = command[-1]
-        metrics_path = cwd / "outputs/backtests" / run_id / "metrics.json"
-        metrics_path.parent.mkdir(parents=True)
-        metrics_path.write_text(
-            json.dumps({"sortino": 1.75, "max_drawdown": -0.08}),
-            encoding="utf-8",
-        )
-        return subprocess.CompletedProcess(command, 0, stdout="test complete")
-
-    monkeypatch.setattr(champion_test.subprocess, "run", fake_run)
-
-    state_path = run_loop(
-        task,
-        workspace=tmp_path,
-        managed_runner=_runner(["rejected"]),
-        reporter=_reporter,
-    )
-
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    result = json.loads(
-        (state_path.parent / "test/result.json").read_text(encoding="utf-8")
-    )
-    assert state["test_status"] == "completed"
-    assert result["run"] == "001"
-    assert result["strategy_sha256"]
-    assert result["test_period"] == {
-        "start": "2025-01-01",
-        "end": "2025-12-31",
-    }
-    assert result["metrics"]["sortino"] == 1.75
-    assert result["runtime_inputs"] == {
-        "data/market.csv": hashlib.sha256(market_data).hexdigest(),
-    }
-    assert not (state_path.parent / "test/test.log").exists()
-
-
-def test_automatic_test_uses_champion_frozen_before_report(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    task = _task(tmp_path, max_rounds=1, include_test=True)
-    original_sha256 = hashlib.sha256(b"1.0\n").hexdigest()
-    real_run = subprocess.run
-
-    def mutate_task_champion(
-        task_path: Path,
-        manager: ResearchWorkspace,
-        state: dict[str, object],
-    ) -> Path:
-        changed = b"2.0\n"
-        manager.champion_path.write_bytes(changed)
-        champion_state = json.loads(manager.state_path.read_text(encoding="utf-8"))
-        champion_state["champion_sha256"] = hashlib.sha256(changed).hexdigest()
-        champion_state["champion_round_id"] = "002/001"
-        manager.state_path.write_text(json.dumps(champion_state), encoding="utf-8")
-        return _reporter(task_path, manager, state)
-
-    def fake_run(command, **kwargs):
-        if command[0] != "backtest":
-            return real_run(command, **kwargs)
-        evaluator = kwargs["cwd"]
-        assert (evaluator / "strategy.py").read_bytes() == b"1.0\n"
-        metrics_path = (
-            evaluator / "outputs/backtests/test-run-001/metrics.json"
-        )
-        metrics_path.parent.mkdir(parents=True)
-        metrics_path.write_text(json.dumps({"sortino": 1.0}), encoding="utf-8")
-        return subprocess.CompletedProcess(command, 0, stdout="tested frozen Champion")
-
-    monkeypatch.setattr(champion_test.subprocess, "run", fake_run)
-    state_path = run_loop(
-        task,
-        workspace=tmp_path,
-        managed_runner=_runner(["rejected"]),
-        reporter=mutate_task_champion,
-    )
-
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    result = json.loads(
-        (state_path.parent / "test/result.json").read_text(encoding="utf-8")
-    )
-    assert state["final_champion_sha256"] == original_sha256
-    assert result["strategy_sha256"] == original_sha256
-    assert result["champion_round_id"] is None
-
-
-def test_automatic_test_timeout_is_bounded_and_keeps_log(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    task = _task(tmp_path, max_rounds=1, include_test=True)
-    task.write_text(
-        task.read_text(encoding="utf-8").replace(
-            "round_minutes = 60",
-            "round_minutes = 1",
-        ),
-        encoding="utf-8",
-    )
-    real_run = subprocess.run
-
-    def fake_run(command, **kwargs):
-        if command[0] != "backtest":
-            return real_run(command, **kwargs)
-        assert kwargs["timeout"] == 60
-        raise subprocess.TimeoutExpired(command, 60, output="partial test output")
-
-    monkeypatch.setattr(champion_test.subprocess, "run", fake_run)
-    state_path = run_loop(
-        task,
-        workspace=tmp_path,
-        managed_runner=_runner(["rejected"]),
-        reporter=_reporter,
-    )
-
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["stop_reason"] == "max_rounds"
-    assert state["test_status"] == "failed"
-    assert state["test_error"] == "Champion Test evaluation timed out after 60 seconds"
-    log = (state_path.parent / "test/test.log").read_text(encoding="utf-8")
-    assert "partial test output" in log
-    assert "timed out after 60 seconds" in log
 
 
 def test_parent_preflight_failure_does_not_allocate_run_or_call_agent(
@@ -858,9 +618,8 @@ def test_loop_retain_diagnostics_preserves_event_timeline_and_summary(tmp_path: 
 
     assert state["diagnostics_enabled"] is True
     assert not (tmp_path / ".research/loop-test/.tmp/runs/001/events.jsonl").exists()
-    assert [event["event"] for event in events][-3:] == [
+    assert [event["event"] for event in events][-2:] == [
         "report_completed",
-        "test_skipped",
         "run_completed",
     ]
     assert summary["event_count"] == len(events)
@@ -1728,7 +1487,7 @@ def test_report_failure_does_not_change_loop_result(tmp_path: Path) -> None:
     assert state["report_path"] == "report.md"
     minimal = (state_path.parent.parent / "report.md").read_text(encoding="utf-8")
     assert "报告 Agent 未能生成完整复盘" in minimal
-    assert "Test 状态：not_configured" in minimal
+    assert "Test 状态" not in minimal
 
 
 def test_new_loop_on_same_root_tracks_only_its_own_experiments(tmp_path: Path) -> None:

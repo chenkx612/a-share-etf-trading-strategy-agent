@@ -9,6 +9,7 @@ Quant Agent 是一个以 **loop/harness engineering 驱动自动化量化交易�
 → Agent 提出假设并实现候选策略
 → Harness 运行测试与确定性回测
 → 在隔离的 Gate 数据上评测候选
+→ 对可晋级候选执行 Guard
 → 接受或拒绝候选并更新 Champion
 → 保存代码差异、指标、决策和研究记忆
 → 达到目标或预算耗尽前持续迭代
@@ -116,10 +117,10 @@ quant-agent loop active_etf_rerank_topk -d
   选参、下一交易日开盘生效。参数网格由策略模块的 `parameter_grid()` 声明，固定
   evaluator 通过 `select_with_params(...)` 评分并选参。评分区间若从月中开始，
   evaluator 会从此前最近的调参边界预热持仓和路径状态，但只统计配置区间内的指标。
-- Walk-Forward 区间既可继续使用绝对 `development`/`gate` 和可选
-  `[evaluation.test]`，也可通过 `[evaluation.walk_forward.relative]` 声明
+- Walk-Forward 区间既可继续使用绝对 `development`/`gate`/`guard`，也可通过
+  `[evaluation.walk_forward.relative]` 声明
   `anchor = "latest_complete_universe_date"` 以及可配置的
-  `development_months`、`gate_months`、可选 `test_months`。相对区间在新 Run
+  `development_months`、`gate_months`、可选 `guard_months`。相对区间在新 Run
   启动时按本地行情最新日期解析；该日期必须覆盖当前 Universe 的全部 symbol。
   Harness 会为 Run 冻结内容寻址的完整评测输入、解析后的绝对区间和 Development
   视图，恢复及后续 Round 不受工作区数据更新影响。历史不足以覆盖首个 Development
@@ -129,13 +130,15 @@ quant-agent loop active_etf_rerank_topk -d
   `objective`、`constraints`、`max_parameter_sets` 和 `schedule`。Research、逐日推荐
   与生产因果曲线共用该政策；`[production]` 只声明曲线窗口、基准和可选数据要求。
   策略调用内的迟滞等路径状态在调参边界重置，并在同一周期内连续回放。
-- 硬约束运算符为 `>=`、`<=` 和 `abs<=`；可选 Test 区间必须位于 Gate 之后。配置
-  `[evaluation.test]` 后，Harness 会在每个 Run 停止并完成终局报告后自动评测该 Run 的最终
-  Champion，结果只供人工观察，不参与晋级、停止条件、后续候选 Prompt 或研究记忆。兼容命令
-  `research test --task path/to/task.toml` 仍可按需对当前任务级 Champion 另行评测。
+- 硬约束运算符为 `>=`、`<=` 和 `abs<=`。可选 `[evaluation.guard]` 与 Guard 区间必须成对配置，
+  且严格位于 Gate 之后；每轮候选先通过 Primary Gate，才会执行 Guard。Harness 以冻结 Universe
+  的无费、日度再平衡 open-to-open 等权基准计算 Gate 与 Guard 年化超额收益；当其下滑超过
+  `max_excess_annual_return_degradation`（现有任务为 10 个百分点）即拒绝，Guard 通过后才晋级 Champion。
+  Guard 完整证据保存在该轮 `guard.json`，后续候选 Prompt 与研究记忆只会收到统一的拒绝原因，不会收到
+  Guard 精确指标。
 - `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
-- 配置 `[production]` 的任务在 Run 报告和可选 Test 完成后，会将该 Run 冻结的最终 Champion
+- 配置 `[production]` 的任务在 Run 报告完成后，会将该 Run 冻结的最终 Champion
   原子同步到 `scope.editable` 声明的生产策略文件。同步只在 Run 内产生新 Champion 时发生，
   不执行 `git add`、commit 或 push。若策略文件在 Run 启动时已与 Champion 不一致，Harness 会在
   分配 Run 后立即停止、不会启动 Round；若在 Run 期间被人工修改，同样不会覆盖。两种情况都会在
@@ -159,7 +162,7 @@ quant-agent loop active_etf_rerank_topk -d
   扣除 Round 时长的四分之一、最多 300 秒作为 finalization 预留；若预计超预算则提前拒绝，并把
   进度和估算写入本次 backtest 输出目录的 `progress.json`。Agent 可用
   `python3 -m quant_core.research.checkpoint submit <metadata.json>` 冻结当前策略；超时时
-  Harness 只恢复截止前最近的有效 checkpoint，随后照常执行固定测试、Development 和 Gate。
+  Harness 只恢复截止前最近的有效 checkpoint，随后照常执行固定测试、Development、Gate 和（仅当 Primary Gate 通过时的）Guard。
   每次成功的顶层 Development 请求按候选哈希形成一个不可重复的最小事实记录；Agent 可立即用
   `python3 -m quant_core.research.attempt learn <attempt-id> <learning.json>` 补充经验解释。
   `result.json.development_attempts` 保留所有同轮有效尝试并标识最终提交项；learning 缺失不影响
@@ -167,7 +170,7 @@ quant-agent loop active_etf_rerank_topk -d
   `research run-once --output` 必须与候选 workspace 不同，以保持 checkpoint 对 Agent 不可写。
 - 固定 evaluator 要求策略实现 `select(daily, universe, start, end)`，返回包含 `date`、
   `symbol`、`target_weight` 的 pandas DataFrame。权重必须有限且非负，每日总和不超过 1。
-- Harness 控制器、固定测试和 Development/Gate/Test 评测必须从 Conda `quant` 启动。Harness 会
+- Harness 控制器、固定测试和 Development/Gate/Guard 评测必须从 Conda `quant` 启动。Harness 会
   对实际 Python、ABI、平台、Conda build 和 Python distribution 生成稳定环境指纹；环境变化会使
   历史 Champion 指标变为 stale，并在下一次晋级比较前重评。完整清单保存在
   `.research/<task-id>/environments/<sha256>.json`。
@@ -194,7 +197,7 @@ finalization 预留和 Attempt 耐久记录保持由 Harness 控制。此边界�
 
 后续 Round 所需的脱敏研究历史继续由 Harness 注入 Prompt，不会通过挂载原始
 `.research` 提供。若 `research run-once` 的 workspace 自身包含 `.research`，该目录会在
-容器中以空目录覆盖。Agent 容器退出后，测试、Development 复核和 Gate 评估仍由 Harness
+容器中以空目录覆盖。Agent 容器退出后，测试、Development 复核、Gate 与 Guard 评估仍由 Harness
 执行。
 
 默认镜像为 `quant-agent-research:latest`，可通过
@@ -267,12 +270,10 @@ conda run --no-capture-output -n quant python -m quant_core.cli research clean \
 保存在 `runs/<run>/report.md`；冻结的叙述与指标输入保存在 `artifacts/report/input.json`，由最终 Champion
 反向重放 Accepted Patch、再正向核验所有 Candidate 得到的版本事实链保存在
 `artifacts/report/facts.json`。新 Run 的恢复状态与冻结输入契约位于 `artifacts/state.json` 和
-`artifacts/contracts/`；已存在的旧 Run 保持原布局且可继续读取或恢复。若任务配置了 Test，终局自动
-评测结果保存在 `runs/<run>/artifacts/test/result.json`；成功时删除冗余 `test.log`，失败时保留日志。
-Run state 记录 `test_status`、`test_path` 和 `test_error`；Harness 会在 Test 后向报告追加确定性的
-“Test 区间观察”，且 Test 指标不会进入报告 Agent 输入。Test 或报告失败均不会改变已完成的 Loop 结论；
-终局开始前会冻结该 Run 的最终 Champion，自动 Test 受 `budget.round_minutes` 限制，因此并发
-启动后续 Run 或 Test 超时不会破坏 Run 审计边界；
+`artifacts/contracts/`；已存在的旧 Run 保持原布局且可继续读取。Guard 启用时，仅通过 Primary Gate 的
+候选会在 `runs/<run>/artifacts/rounds/<round>/guard.json` 写入区间、策略/基准年化收益、超额收益、
+衰减、阈值及输入/策略指纹；`decision.json` 仅引用其路径和结果。Run state 记录
+`guard_query_count`。终局不再执行 Champion Test，也不再向报告追加 Test 附录；
 报告 Agent 失败时仍会生成最小 `report.md` 人类入口。报告只能基于事实链解释机制演进，
 组合变更不得自动归因为单一机制。报告认证失败
 不会改变 Loop 结果；重新认证后可用 `research report --run ...` 基于相同输入单独重试。活动 Loop

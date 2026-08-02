@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
 
 import quant_core.cli as cli
-from quant_core.research.workspace import copy_runtime_inputs
 
 
 TASK = """
@@ -53,9 +50,6 @@ end = "2021-12-31"
 start = "2022-01-01"
 end = "2024-12-31"
 
-[evaluation.test]
-start = "2025-01-01"
-end = "2025-12-31"
 """
 
 
@@ -103,7 +97,7 @@ def test_research_loop_exits_nonzero_when_production_sync_conflicts(
         "failed": 0,
         "report_status": "completed",
         "report_path": "report.md",
-        "test_status": "not_configured",
+        "guard_query_count": 0,
         "production_sync_status": "conflict",
         "production_sync_error": "production strategy changed outside the Run",
     }), encoding="utf-8")
@@ -183,78 +177,3 @@ def test_legacy_research_loop_command_remains_available() -> None:
     assert args.func is cli.command_research_loop
     assert args.task == "tasks/sample.toml"
     assert args.retain_diagnostics is True
-
-
-def test_research_test_snapshots_current_runtime_inputs(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    task_path = tmp_path / "task.toml"
-    task_path.write_text(TASK, encoding="utf-8")
-    (tmp_path / "strategy.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (tmp_path / "data").mkdir()
-    latest_data = b"date,value\n2025-12-31,2\n"
-    (tmp_path / "data/etf_daily.csv").write_bytes(latest_data)
-    stale_runtime = tmp_path / "stale-runtime"
-    (stale_runtime / "data").mkdir(parents=True)
-    (stale_runtime / "data/etf_daily.csv").write_text(
-        "date,value\n2024-12-31,1\n",
-        encoding="utf-8",
-    )
-
-    class FakeWorkspace:
-        def __init__(
-            self,
-            source: Path,
-            research_root: Path,
-            task_id: str,
-            evaluation_environment_sha256: str | None = None,
-        ) -> None:
-            self.source = source
-            self.root = research_root / task_id
-            self.evaluation_runtime = stale_runtime
-
-        def initialize(self, *args, **kwargs):
-            return {"champion_sha256": "champion-sha"}
-
-        def create_champion_test_evaluator(self, test_id: str, state):
-            evaluator = self.root / ".tmp" / test_id
-            evaluator.mkdir(parents=True)
-            return evaluator
-
-        def remove_evaluator(self, evaluator: Path) -> None:
-            pass
-
-    def fake_run(command, *, cwd, **kwargs):
-        copied = (cwd / "data/etf_daily.csv").read_bytes()
-        run_id = command[-1]
-        metrics_path = cwd / "outputs" / "backtests" / run_id / "metrics.json"
-        metrics_path.parent.mkdir(parents=True)
-        metrics_path.write_text(
-            json.dumps({"sortino": 2.0 if copied == latest_data else -1.0}),
-            encoding="utf-8",
-        )
-        return subprocess.CompletedProcess(command, 0, stdout="ok")
-
-    monkeypatch.setattr(cli, "ResearchWorkspace", FakeWorkspace)
-    monkeypatch.setattr(cli, "copy_runtime_inputs", copy_runtime_inputs)
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    cli.command_research_test(argparse.Namespace(
-        task=str(task_path),
-        root=str(tmp_path),
-        research_root=".research",
-    ))
-
-    result_path = next((tmp_path / ".research/test-snapshot/tests").glob("*/result.json"))
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    assert result["metrics"]["sortino"] == 2.0
-    assert len(result["evaluation_environment_sha256"]) == 64
-    assert (
-        tmp_path
-        / ".research/test-snapshot/environments"
-        / f"{result['evaluation_environment_sha256']}.json"
-    ).is_file()
-    assert result["runtime_inputs"] == {
-        "data/etf_daily.csv": hashlib.sha256(latest_data).hexdigest(),
-    }

@@ -446,7 +446,7 @@ def main() -> None:
     parser.add_argument("--walk-forward-config")
     parser.add_argument("--resolved-periods")
     parser.add_argument("--metrics-path")
-    parser.add_argument("--stage", choices=["development", "gate", "test"])
+    parser.add_argument("--stage", choices=["development", "gate", "guard"])
     args = parser.parse_args()
 
     paths = ProjectPaths(Path(args.root))
@@ -463,12 +463,7 @@ def main() -> None:
     if task is not None or config is not None:
         if task is not None and (task.evaluation_mode != "walk_forward" or args.stage is None):
             raise ValueError("--task requires walk_forward evaluation and --stage")
-        if task is not None and args.stage == "test":
-            test_period = task.test_period
-            if test_period is None:
-                raise ValueError("task.evaluation.test is required for test evaluation")
-            period = dict(test_period)
-        elif task is not None:
+        if task is not None:
             period = dict(task.evaluation_periods[args.stage])
         else:
             period = dict(config["period"])
