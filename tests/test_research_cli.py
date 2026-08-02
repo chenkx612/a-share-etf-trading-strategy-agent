@@ -59,19 +59,19 @@ def test_loop_shortcut_resolves_task_stem_and_enables_diagnostics(
 ) -> None:
     tasks = tmp_path / "tasks"
     tasks.mkdir()
-    task_path = tasks / "sample_task.toml"
+    task_path = tasks / "sample-task.toml"
     task_path.write_text(
         'id = "sample-task"\n',
         encoding="utf-8",
     )
     received: list[argparse.Namespace] = []
-    monkeypatch.setattr(cli, "command_research_loop", received.append)
+    monkeypatch.setattr("quant_core.commands.research.command_research_loop", received.append)
 
     args = cli.build_parser().parse_args([
         "--root",
         str(tmp_path),
         "loop",
-        "sample_task",
+        "sample-task",
         "-d",
     ])
     args.func(args)
@@ -101,7 +101,10 @@ def test_research_loop_exits_nonzero_when_production_sync_conflicts(
         "production_sync_status": "conflict",
         "production_sync_error": "production strategy changed outside the Run",
     }), encoding="utf-8")
-    monkeypatch.setattr(cli, "run_loop", lambda *args, **kwargs: state_path)
+    monkeypatch.setattr(
+        "quant_core.commands.research.run_loop",
+        lambda *args, **kwargs: state_path,
+    )
     args = argparse.Namespace(
         task="task.toml",
         root=str(tmp_path),
@@ -121,15 +124,15 @@ def test_loop_shortcut_accepts_task_id_and_explicit_path(
 ) -> None:
     tasks = tmp_path / "tasks"
     tasks.mkdir()
-    task_path = tasks / "sample_task.toml"
+    task_path = tasks / "sample-task.toml"
     task_path.write_text(
         'id = "sample-task"\n',
         encoding="utf-8",
     )
     received: list[argparse.Namespace] = []
-    monkeypatch.setattr(cli, "command_research_loop", received.append)
+    monkeypatch.setattr("quant_core.commands.research.command_research_loop", received.append)
 
-    for reference in ("sample-task", "sample_task.toml", str(task_path)):
+    for reference in ("sample-task", "sample-task.toml", str(task_path)):
         args = cli.build_parser().parse_args([
             "--root",
             str(tmp_path),

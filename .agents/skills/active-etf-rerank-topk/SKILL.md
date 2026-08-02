@@ -15,7 +15,7 @@ broker.
 
 ```bash
 conda run --no-capture-output -n quant \
-  quant-agent recommend active_etf_rerank_topk --date YYYY-MM-DD
+  quant-agent recommend active-etf-rerank-topk --date YYYY-MM-DD
 ```
 
 3. Use `--skip-refresh` only for an offline run whose repository data cache

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -10,24 +10,32 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from quant_core.universe import liquid as liquid_builder
+from quant_core.universe import common as universe_common
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = (
-    REPO_ROOT
-    / "scripts"
-    / "build_liquid_etf_universe.py"
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["build_liquid_etf_universe.py", "build_active_etf_universe.py"],
 )
+def test_universe_builder_script_help_smoke(script_name: str) -> None:
+    completed = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / script_name), "--help"],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--output-dir" in completed.stdout
 
 
 def load_builder():
-    module_name = "build_liquid_etf_universe"
-    spec = importlib.util.spec_from_file_location(module_name, SCRIPT_PATH)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    return liquid_builder
 
 
 def make_args(output_dir: Path, *, apply: bool = False) -> argparse.Namespace:
@@ -329,13 +337,13 @@ def test_apply_backs_up_and_atomically_replaces_only_liquid_universe(
     before.to_csv(destination, index=False)
     sector_rotation.write_text("symbol,name\nKEEP,原池\n", encoding="utf-8")
     replacements: list[tuple[Path, Path]] = []
-    real_replace = builder.os.replace
+    real_replace = universe_common.os.replace
 
     def recording_replace(source: Path, target: Path) -> None:
         replacements.append((Path(source), Path(target)))
         real_replace(source, target)
 
-    monkeypatch.setattr(builder.os, "replace", recording_replace)
+    monkeypatch.setattr(universe_common.os, "replace", recording_replace)
     backup = builder.apply_universe(
         after,
         apply=True,

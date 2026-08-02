@@ -517,7 +517,7 @@ def test_fixed_task_fingerprints_the_repository_around_the_editable_strategy() -
     ("task_name", "expected_constraints"),
     [
         (
-            "active_etf_rerank_topk.toml",
+            "active-etf-rerank-topk.toml",
             {
                 "annual_return": {"operator": ">=", "threshold": 0.03},
                 "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
@@ -525,7 +525,7 @@ def test_fixed_task_fingerprints_the_repository_around_the_editable_strategy() -
             },
         ),
         (
-            "active_etf_sharpe.toml",
+            "active-etf-sharpe.toml",
             {
                 "annual_return": {"operator": ">=", "threshold": 0.05},
                 "max_drawdown": {"operator": "abs<=", "threshold": 0.15},
@@ -533,7 +533,7 @@ def test_fixed_task_fingerprints_the_repository_around_the_editable_strategy() -
             },
         ),
         (
-            "liquid_etf_rerank_topk.toml",
+            "liquid-etf-rerank-topk.toml",
             {
                 "annual_return": {"operator": ">=", "threshold": 0.03},
                 "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
@@ -541,7 +541,7 @@ def test_fixed_task_fingerprints_the_repository_around_the_editable_strategy() -
             },
         ),
         (
-            "sharpe_corr_threshold_optimization.toml",
+            "sharpe-corr-threshold-optimization.toml",
             {
                 "annual_return": {"operator": ">=", "threshold": 0.05},
                 "max_drawdown": {"operator": "abs<=", "threshold": 0.15},
@@ -582,8 +582,8 @@ def test_repository_walk_forward_tasks_use_shared_parameter_selection(
 @pytest.mark.parametrize(
     "task_name",
     [
-        "liquid_etf_rerank_topk.toml",
-        "sharpe_corr_threshold_optimization.toml",
+        "liquid-etf-rerank-topk.toml",
+        "sharpe-corr-threshold-optimization.toml",
     ],
 )
 def test_repository_task_contracts_cover_local_python_imports(task_name: str) -> None:
@@ -712,7 +712,7 @@ def test_new_execution_contract_requires_explicit_round_timeout() -> None:
 
 
 def test_active_etf_sharpe_has_distinct_round_and_command_timeouts() -> None:
-    task = ResearchTask.load(REPOSITORY_ROOT / "tasks/active_etf_sharpe.toml")
+    task = ResearchTask.load(REPOSITORY_ROOT / "tasks/active-etf-sharpe.toml")
 
     assert task.round_timeout_minutes == 30
     assert task.command_timeout_minutes == 10

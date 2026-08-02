@@ -31,6 +31,14 @@ from quant_core.production import (
 from quant_core.schedule import schedule_boundaries
 
 
+def test_production_module_remains_a_compatibility_facade() -> None:
+    from quant_core import production
+    from quant_core.recommendation import run_recommendation as packaged_run
+
+    assert production.run_recommendation is packaged_run
+    assert production.ProductionContext is ProductionContext
+
+
 class FakeStrategy:
     @staticmethod
     def select_with_params(
@@ -192,9 +200,9 @@ def test_load_requirements_requires_strategy_or_task_declaration() -> None:
 def test_cli_recommend_is_task_action_and_old_today_options_are_rejected() -> None:
     parser = build_parser()
     args = parser.parse_args(
-        ["recommend", "active_etf_rerank_topk", "--date", "2026-07-24", "--skip-refresh"]
+        ["recommend", "active-etf-rerank-topk", "--date", "2026-07-24", "--skip-refresh"]
     )
-    assert args.task == "active_etf_rerank_topk"
+    assert args.task == "active-etf-rerank-topk"
     assert args.date == "2026-07-24"
     assert args.skip_refresh
     with pytest.raises(SystemExit):
@@ -250,11 +258,13 @@ def test_cli_prints_holdings_tuning_dates_and_curve_path(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        cli,
-        "resolve_research_task_reference",
+        "quant_core.commands.recommendation.resolve_research_task_reference",
         lambda task, root: tmp_path / "tasks" / "fake.toml",
     )
-    monkeypatch.setattr(cli, "run_recommendation", lambda *args, **kwargs: summary_path)
+    monkeypatch.setattr(
+        "quant_core.commands.recommendation.run_recommendation",
+        lambda *args, **kwargs: summary_path,
+    )
 
     cli.command_recommend(
         SimpleNamespace(
@@ -473,7 +483,7 @@ def test_production_refresh_requests_shared_five_year_history(
         captured["start"] = start
         return pd.DataFrame(), end
 
-    monkeypatch.setattr("quant_core.production.fetch_daily_if_stale", fake_fetch)
+    monkeypatch.setattr("quant_core.recommendation.replay.fetch_daily_if_stale", fake_fetch)
 
     _refresh_data(ctx, date(2026, 7, 24), skip_refresh=False)
 
@@ -562,7 +572,7 @@ def test_recommendation_applies_preclose_cutoff_before_refresh(
         tzinfo=pd.Timestamp.now(tz="Asia/Shanghai").tz,
     )
     monkeypatch.setattr(
-        "quant_core.production.load_production_context",
+        "quant_core.recommendation.service.load_production_context",
         lambda root, task_path: ctx,
     )
 
@@ -575,7 +585,7 @@ def test_recommendation_applies_preclose_cutoff_before_refresh(
         refresh_dates.append(requested)
         return daily
 
-    monkeypatch.setattr("quant_core.production._refresh_data", fake_refresh)
+    monkeypatch.setattr("quant_core.recommendation.service._refresh_data", fake_refresh)
 
     summary_path = run_recommendation(
         tmp_path,
@@ -607,11 +617,11 @@ def test_success_writes_holdings_summary_curve_and_png(
     ctx = context(tmp_path)
     daily = sample_daily()
     monkeypatch.setattr(
-        "quant_core.production.load_production_context",
+        "quant_core.recommendation.service.load_production_context",
         lambda root, task_path: ctx,
     )
     monkeypatch.setattr(
-        "quant_core.production._refresh_data",
+        "quant_core.recommendation.service._refresh_data",
         lambda context, requested, skip_refresh: daily,
     )
     summary_path = run_recommendation(
@@ -638,7 +648,7 @@ def test_success_writes_holdings_summary_curve_and_png(
     assert png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
     monkeypatch.setattr(
-        "quant_core.production.causal_replay",
+        "quant_core.recommendation.service.causal_replay",
         lambda context, daily, signal_date: (
             curve.assign(date=pd.to_datetime(curve["date"])),
             summary["curve_metrics"],
@@ -699,15 +709,15 @@ def test_midmonth_first_run_backfills_the_month_start_search(
         "benchmark_max_drawdown": 0.0,
     }
     monkeypatch.setattr(
-        "quant_core.production.load_production_context", lambda root, task_path: ctx
+        "quant_core.recommendation.service.load_production_context", lambda root, task_path: ctx
     )
     monkeypatch.setattr(
-        "quant_core.production._refresh_data",
+        "quant_core.recommendation.service._refresh_data",
         lambda context, requested, skip_refresh: daily,
     )
-    monkeypatch.setattr("quant_core.production.search_parameters", fake_search)
+    monkeypatch.setattr("quant_core.recommendation.service.search_parameters", fake_search)
     monkeypatch.setattr(
-        "quant_core.production.causal_replay",
+        "quant_core.recommendation.service.causal_replay",
         lambda context, daily, signal_date: (curve, metrics, []),
     )
     summary_path = run_recommendation(
@@ -743,14 +753,14 @@ def test_recommendation_reuses_legacy_parameter_freeze(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "quant_core.production.load_production_context", lambda root, task_path: ctx
+        "quant_core.recommendation.service.load_production_context", lambda root, task_path: ctx
     )
     monkeypatch.setattr(
-        "quant_core.production._refresh_data",
+        "quant_core.recommendation.service._refresh_data",
         lambda context, requested, skip_refresh: daily,
     )
     monkeypatch.setattr(
-        "quant_core.production.search_parameters",
+        "quant_core.recommendation.service.search_parameters",
         lambda *args, **kwargs: pytest.fail("legacy freeze should be reused"),
     )
     curve = pd.DataFrame(
@@ -769,7 +779,7 @@ def test_recommendation_reuses_legacy_parameter_freeze(
         "benchmark_max_drawdown": 0.0,
     }
     monkeypatch.setattr(
-        "quant_core.production.causal_replay",
+        "quant_core.recommendation.service.causal_replay",
         lambda context, daily, signal_date: (curve, metrics, []),
     )
 
@@ -801,14 +811,14 @@ def test_signal_date_is_resolved_only_from_strategy_universe(
         ~((daily["symbol"] == "A") & (daily["date"] == pd.Timestamp("2026-07-24")))
     ]
     monkeypatch.setattr(
-        "quant_core.production.load_production_context", lambda root, task_path: ctx
+        "quant_core.recommendation.service.load_production_context", lambda root, task_path: ctx
     )
     monkeypatch.setattr(
-        "quant_core.production._refresh_data",
+        "quant_core.recommendation.service._refresh_data",
         lambda context, requested, skip_refresh: daily,
     )
     monkeypatch.setattr(
-        "quant_core.production.search_parameters",
+        "quant_core.recommendation.service.search_parameters",
         lambda context, daily, signal_date: SearchResult(
             signal_date,
             signal_date - pd.DateOffset(months=3),
@@ -834,7 +844,7 @@ def test_signal_date_is_resolved_only_from_strategy_universe(
         "benchmark_max_drawdown": 0.0,
     }
     monkeypatch.setattr(
-        "quant_core.production.causal_replay",
+        "quant_core.recommendation.service.causal_replay",
         lambda context, daily, signal_date: (curve, metrics, []),
     )
     summary_path = run_recommendation(
@@ -857,11 +867,11 @@ def test_failed_search_writes_audit_without_recommendation(
     }
     daily = sample_daily()
     monkeypatch.setattr(
-        "quant_core.production.load_production_context",
+        "quant_core.recommendation.service.load_production_context",
         lambda root, task_path: ctx,
     )
     monkeypatch.setattr(
-        "quant_core.production._refresh_data",
+        "quant_core.recommendation.service._refresh_data",
         lambda context, requested, skip_refresh: daily,
     )
     with pytest.raises(RuntimeError, match="no set satisfying"):

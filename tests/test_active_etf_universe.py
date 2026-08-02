@@ -1,28 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "build_active_etf_universe.py"
+from quant_core.universe import active as active_builder
 
 
 def load_builder():
-    module_name = "build_active_etf_universe"
-    spec = importlib.util.spec_from_file_location(module_name, SCRIPT_PATH)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    return active_builder
 
 
 def make_args(output_dir: Path, *, apply: bool = False) -> argparse.Namespace:

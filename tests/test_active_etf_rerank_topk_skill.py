@@ -113,7 +113,7 @@ def make_contract(script, root: Path):
         }),
         encoding="utf-8",
     )
-    task = root / "tasks" / "active_etf_rerank_topk.toml"
+    task = root / "tasks" / "active-etf-rerank-topk.toml"
     task.parent.mkdir()
     task.write_text("id = 'active-etf-rerank-topk'\n", encoding="utf-8")
     return script.TaskContract(

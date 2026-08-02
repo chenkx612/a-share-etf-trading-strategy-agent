@@ -114,7 +114,7 @@ def load_task_contract(
     repo_root: Path = REPO_ROOT,
     task_path: Path | None = None,
 ) -> TaskContract:
-    task_path = (task_path or repo_root / "tasks" / "active_etf_rerank_topk.toml").resolve()
+    task_path = (task_path or repo_root / "tasks" / "active-etf-rerank-topk.toml").resolve()
     if not task_path.is_file():
         raise FileNotFoundError(f"Task configuration does not exist: {task_path}")
     with task_path.open("rb") as handle:

@@ -97,7 +97,7 @@ def test_relative_gate_command_receives_frozen_period_manifest(
     tmp_path: Path,
 ) -> None:
     task = ResearchTask.load(
-        Path(__file__).resolve().parents[1] / "tasks/active_etf_sharpe.toml"
+        Path(__file__).resolve().parents[1] / "tasks/active-etf-sharpe.toml"
     ).with_resolved_periods(
         {
             "development": {"start": "2022-08-01", "end": "2025-01-31"},

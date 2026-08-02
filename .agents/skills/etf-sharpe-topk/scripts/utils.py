@@ -22,7 +22,7 @@ if str(SRC_ROOT) not in sys.path:
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 from quant_core.backtest.engine import run_backtest  # noqa: E402
-from quant_core.cli import (  # noqa: E402
+from quant_core.commands.analysis import (  # noqa: E402
     build_strategy_params,
     command_factor_compute,
     command_recommend_today,

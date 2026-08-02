@@ -12,6 +12,7 @@ import pytest
 
 import quant_core.data.market_data as market_data_module
 import quant_core.cli as cli_module
+from quant_core.commands import analysis as analysis_commands
 from quant_core.data.market_data import (
     AkshareMarketDataClient,
     fetch_daily_if_stale,
@@ -507,9 +508,12 @@ def test_data_update_does_not_create_outputs_directory(
         def fetch_daily(self, *args: object, **kwargs: object) -> pd.DataFrame:
             raise AssertionError("fetch_daily should be supplied to the stale-fetch helper only")
 
-    monkeypatch.setattr(cli_module, "AkshareMarketDataClient", DummyMarketDataClient)
     monkeypatch.setattr(
-        cli_module,
+        "quant_core.commands.analysis.AkshareMarketDataClient",
+        DummyMarketDataClient,
+    )
+    monkeypatch.setattr(
+        analysis_commands,
         "fetch_daily_if_stale",
         lambda *args, **kwargs: (daily, TEST_DAY),
     )
@@ -551,17 +555,23 @@ def test_data_update_replaces_refreshed_symbol_history_and_keeps_current_symbols
     written: list[pd.DataFrame] = []
 
     monkeypatch.setattr(
-        cli_module,
+        analysis_commands,
         "AkshareMarketDataClient",
         lambda adjust: argparse.Namespace(fetch_daily=lambda *args, **kwargs: pd.DataFrame()),
     )
-    monkeypatch.setattr(cli_module, "read_daily", lambda paths: existing.copy())
     monkeypatch.setattr(
-        cli_module,
+        "quant_core.commands.analysis.read_daily",
+        lambda paths: existing.copy(),
+    )
+    monkeypatch.setattr(
+        analysis_commands,
         "fetch_daily_if_stale",
         lambda *args, **kwargs: (incoming.copy(), TEST_DAY),
     )
-    monkeypatch.setattr(cli_module, "write_table", lambda frame, path: written.append(frame.copy()) or path)
+    monkeypatch.setattr(
+        "quant_core.commands.analysis.write_table",
+        lambda frame, path: written.append(frame.copy()) or path,
+    )
 
     cli_module.command_data_update(
         argparse.Namespace(
@@ -589,14 +599,17 @@ def test_data_update_does_not_rewrite_cache_when_all_symbols_are_current(
     pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}]).to_csv(universe_path, index=False)
     existing = pd.DataFrame([{"date": TEST_DATE, "symbol": "510300", "close": 1.0}])
 
-    monkeypatch.setattr(cli_module, "read_daily", lambda paths: existing.copy())
     monkeypatch.setattr(
-        cli_module,
+        "quant_core.commands.analysis.read_daily",
+        lambda paths: existing.copy(),
+    )
+    monkeypatch.setattr(
+        analysis_commands,
         "fetch_daily_if_stale",
         lambda *args, **kwargs: (pd.DataFrame(), TEST_DAY),
     )
     monkeypatch.setattr(
-        cli_module,
+        analysis_commands,
         "write_table",
         lambda *args, **kwargs: pytest.fail("current cache must not be rewritten"),
     )

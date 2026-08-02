@@ -21,7 +21,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 def relative_task(tmp_path: Path) -> ResearchTask:
     payload = copy.deepcopy(
-        ResearchTask.load(REPOSITORY_ROOT / "tasks/active_etf_sharpe.toml").raw
+        ResearchTask.load(REPOSITORY_ROOT / "tasks/active-etf-sharpe.toml").raw
     )
     payload["data"]["universe"] = "universe.csv"
     pd.DataFrame({"symbol": ["A", "B"], "name": ["A", "B"]}).to_csv(

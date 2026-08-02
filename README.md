@@ -79,10 +79,10 @@ docker build \
 
 ```bash
 conda activate quant
-quant-agent loop active_etf_rerank_topk
+quant-agent loop active-etf-rerank-topk
 
 # 为事后 Codex 复盘保留可清理的诊断证据包
-quant-agent loop active_etf_rerank_topk -d
+quant-agent loop active-etf-rerank-topk -d
 ```
 
 `loop` 的任务参数可使用 `tasks/` 下的文件名、任务 ID 或 TOML 路径。原有
@@ -247,19 +247,19 @@ QUANT_TEST_AGENT_CONTAINER=1 pytest -q \
 ```bash
 # 运行一次候选研发，不管理 Champion
 conda run --no-capture-output -n quant python -m quant_core.cli research run-once \
-  --task tasks/sharpe_corr_threshold_optimization.toml \
+  --task tasks/sharpe-corr-threshold-optimization.toml \
   --experiment-id experiment-001 \
   --output path/to/experiment
 
 # 重新生成最近或指定 Run 的终局报告
 conda run --no-capture-output -n quant python -m quant_core.cli research report \
-  --task tasks/sharpe_corr_threshold_optimization.toml
+  --task tasks/sharpe-corr-threshold-optimization.toml
 conda run --no-capture-output -n quant python -m quant_core.cli research report \
-  --task tasks/sharpe_corr_threshold_optimization.toml --run 2
+  --task tasks/sharpe-corr-threshold-optimization.toml --run 2
 
 # 清理临时 worktree、派生缓存和冗余成功日志
 conda run --no-capture-output -n quant python -m quant_core.cli research clean \
-  --task tasks/sharpe_corr_threshold_optimization.toml
+  --task tasks/sharpe-corr-threshold-optimization.toml
 conda run --no-capture-output -n quant python -m quant_core.cli research clean \
   --task-id <task-id>
 ```
@@ -307,11 +307,11 @@ python3 -m quant_core.cli data update --universe path/to/universe.csv --universe
 python3 -m quant_core.cli factor compute --start 2024-01-01 --end 2024-12-31
 python3 -m quant_core.cli backtest run --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31
 python3 -m quant_core.cli optimize grid --universe path/to/universe.csv --strategy sharpe-corr-threshold --start 2024-03-01 --end 2024-12-31 --top-n 3,5,10
-quant-agent recommend active_etf_rerank_topk
-quant-agent recommend active_etf_rerank_topk --date 2026-07-24
+quant-agent recommend active-etf-rerank-topk
+quant-agent recommend active-etf-rerank-topk --date 2026-07-24
 
 # Offline verification against the existing local market-data cache
-quant-agent recommend active_etf_rerank_topk --date 2026-07-24 --skip-refresh
+quant-agent recommend active-etf-rerank-topk --date 2026-07-24 --skip-refresh
 ```
 
 `recommend` 会直接在终端打印次日 ETF/现金目标持仓、最近一次与下一次调参日，
@@ -373,17 +373,22 @@ ETF 均有 252 个共同收益观察，最大两两相关性为 `0.8931`。池�
 ## Project layout
 
 ```text
-src/quant_core/research/  # Loop/harness contracts, runner, evaluator, state, report
-src/quant_core/data/      # Market data download, cache, and table IO
-src/quant_core/factors/   # Deterministic factor calculations
-src/quant_core/strategy/  # Candidate and built-in strategy implementations
-src/quant_core/backtest/  # Fixed simulation engine and metrics
-scripts/                  # Repository-level operational and universe-building commands
-tests/                    # Framework and harness tests
-universes/                # Repository-level stock pools shared across skills
-ISSUES.md                 # Prioritized Harness issue and resolution history
-.agents/skills/           # Skill-specific knowledge, prompts, scripts, parameters, and outputs
-.research/<task-id>/      # Champion, environment manifests, Run history, cache, and temp observation
+src/quant_core/backtest/        # Fixed simulation engine and metrics
+src/quant_core/commands/        # CLI command handlers
+src/quant_core/data/            # Market data download, cache, and table IO
+src/quant_core/factors/         # Deterministic factor calculations
+src/quant_core/recommendation/  # Parameter search, causal replay, and next-day holdings
+src/quant_core/research/        # Loop/harness contracts, runner, evaluator, state, report
+src/quant_core/strategy/        # Candidate and built-in strategy implementations
+src/quant_core/universe/        # Deterministic repository-level universe builders
+scripts/                        # Thin repository-level command entry points
+tasks/                          # Canonical task-id TOML contracts
+tests/                          # Framework and harness tests
+universes/                      # Repository-level stock pools shared across skills
+data/ and outputs/              # Ignored local market data and general CLI artifacts
+.agents/skills/                 # Skill-specific knowledge, scripts, and outputs
+.research/<task-id>/            # Champion, manifests, immutable Run history, cache, and temp state
+ISSUES.md                       # Prioritized Harness issue and resolution history
 ```
 
 运行命令默认把本地日线缓存写到当前工作目录下的 `data/etf_daily.*`，把因子、回测和推荐等中间结果写到 `outputs/`。跨技能共享的股票池放在 `universes/`，当前 sector-rotation 的 canonical 股票池为 `universes/sector_rotation.csv`；技能目录只保存技能专属输入和产物。股票池不保存在 `data/` 下；调用框架 CLI 时通过 `--universe path/to/universe.csv` 显式传入。
