@@ -207,6 +207,10 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert "Historical hypothesis from an earlier loop" not in attached
     assert '"decision": "accepted"' in attached
     assert '"relative_improvement_required": false' in attached
+    assert '"minimum_improvement_mode": "absolute_objective_points"' in attached
+    assert '"improvement_mode": "absolute_objective_points"' in attached
+    assert '"required_candidate_objective": null' in attached
+    assert '"absolute_improvement": null' in attached
     assert '"source_round": "001/001"' in attached
     assert '"strategy_source_round": "001/001"' in attached
     assert '"metrics_source_round": "001/001"' in attached
@@ -218,6 +222,8 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert "accepted Round lacks replayable Candidate evidence" in facts
     assert "Use a faster risk filter" not in prompt
     assert "第一条非空行必须精确为 `# Research Loop 总结`" in prompt
+    assert "candidate >= champion + minimum_improvement" in prompt
+    assert "绝不是百分比或比例改善" in prompt
     assert command[command.index("--file") + 1] == "/workspace/artifacts/report/input.json"
     second_file = command.index("--file", command.index("--file") + 1)
     assert command[second_file + 1] == "/workspace/artifacts/report/facts.json"
@@ -278,6 +284,52 @@ def test_generate_loop_report_uses_current_loop_rounds_and_champion(tmp_path: Pa
     assert "以下 Champion 指标适用性状态" not in str(captured["prompt"])
     assert report_input.read_bytes() == frozen_input
     assert report_facts.read_bytes() == frozen_facts
+
+
+@pytest.mark.parametrize(
+    ("champion", "candidate", "required", "improvement"),
+    [
+        (7.757116458872026, 7.95814329689549, 7.787116458872026, 0.2010268380234641),
+        (0.01, 0.04, 0.04, 0.03),
+        (-0.10, -0.06, -0.07, 0.04),
+        (None, 0.04, None, None),
+    ],
+)
+def test_report_input_precomputes_absolute_objective_improvement(
+    tmp_path: Path,
+    champion: float | None,
+    candidate: float,
+    required: float | None,
+    improvement: float | None,
+) -> None:
+    experiment = tmp_path / "001"
+    experiment.mkdir()
+    write_json_atomic(experiment / "result.json", {"status": "completed"})
+    write_json_atomic(experiment / "decision.json", {
+        "decision": "accepted",
+        "objective": {
+            "name": "sortino",
+            "champion": champion,
+            "candidate": candidate,
+            "minimum_improvement": 0.03,
+            "champion_constraints_passed": champion is not None,
+            "relative_improvement_required": champion is not None,
+        },
+    })
+
+    objective = research_report._experiment_records(tmp_path, ["001"])[0][
+        "decision_objective"
+    ]
+
+    assert objective["improvement_mode"] == "absolute_objective_points"
+    if required is None:
+        assert objective["required_candidate_objective"] is None
+    else:
+        assert objective["required_candidate_objective"] == pytest.approx(required)
+    if improvement is None:
+        assert objective["absolute_improvement"] is None
+    else:
+        assert objective["absolute_improvement"] == pytest.approx(improvement)
 
 
 def _candidate_patch(

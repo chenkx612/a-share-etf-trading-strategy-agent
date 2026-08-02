@@ -33,29 +33,9 @@
 
 | 优先级 | 问题 |
 | --- | --- |
-| P1 | 终局报告将绝对 objective 改善门槛误写为百分比 |
 | P2 | Agent 执行阶段缺少心跳事件，长时间停滞无法及时诊断 |
 
 ## 一、待解决问题
-
-### P1：推荐解决
-
-#### 终局报告将绝对 objective 改善门槛误写为百分比
-
-- **问题**：`active-etf-sharpe` Run 005 的固定 Decision 正确按
-  `candidate_sortino >= champion_sortino + 0.03` 执行绝对 objective 点数改善，但终局
-  `report.md` 将 `minimum_improvement=0.03` 写成“相对改善阈值 3%”。Round 001 的 Sortino
-  从 `7.757116` 升至 `7.958143`，绝对改善 `0.201027` 因而正确晋级，百分比改善却只约
-  `2.59%`；报告因此出现“+ 约 2.6%”与“已过 3% 门槛”的内部矛盾。Promotion、Champion
-  和冻结指标未受影响，但报告误述了晋级契约，会误导人工复盘和下游摘要。
-- **方案**：报告输入与模板显式将 `minimum_improvement` 标注为“objective 绝对点数”，并为每轮
-  预计算 `required_candidate_objective = champion + minimum_improvement` 与绝对差值；禁止报告模型
-  仅根据小数形式自行推断百分比语义。如未来需要真正的比例改善，应在版本化契约中增加独立 mode，
-  不得复用现有字段并改变历史语义。
-- **验证**：覆盖高基数 objective（如 `7.757 -> 7.958`）、低基数、负值和无 Champion 的报告事实；
-  生成报告必须与 `runner.py` 的绝对加法判定一致，且不出现未由契约明确定义的 `%` 表述。
-- **风险**：修复终局文案不应回写或重判历史 Decision；历史 Run 005 报告应保持不可变，需在
-  新报告或外部复盘中明确更正。
 
 ### P2：有时间时优化
 
@@ -102,6 +82,18 @@ Prompt 表述和其他低风险修补由代码、测试及版本历史承载，�
   这是避免静态依赖闭包误判的确定性成本。
 
 ### P1：曾影响终局复盘完整性
+
+#### 终局报告不得把绝对 objective 改善门槛解释为百分比
+
+- **问题**：报告 Agent 曾把 `minimum_improvement=0.03` 解释为 3%，与 Harness 实际执行的
+  `candidate >= champion + 0.03` 绝对点数契约矛盾。该问题只影响终局叙述，不影响固定 Decision、
+  Promotion、Champion 或冻结指标。
+- **解决**：冻结报告输入现在显式声明 `absolute_objective_points` mode，并为每轮预计算
+  `required_candidate_objective` 和 `absolute_improvement`；报告模板写明绝对加法公式，并澄清
+  `relative_improvement_required` 仅表示是否需要与 Champion 比较，不表示比例改善。
+- **验证**：报告输入测试覆盖高基数、低基数、负 objective 和无 Champion；README 同步记录字段单位。
+- **风险**：历史 Run 005 工件保持不可变，修复不回写报告、不重判历史 Decision。若未来支持比例改善，
+  必须新增版本化 mode，不得改变现有字段语义。
 
 #### 失败 Round 必须保留 Agent 事件
 

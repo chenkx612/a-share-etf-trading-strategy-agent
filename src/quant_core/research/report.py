@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -137,7 +138,9 @@ def _experiment_records(
             "status": result.get("status"),
             "decision": decision.get("decision"),
             "decision_reasons": decision.get("reasons", []),
-            "decision_objective": decision.get("objective"),
+            "decision_objective": _report_decision_objective(
+                decision.get("objective")
+            ),
             "decision_constraints": decision.get("constraints"),
             "hypothesis": result.get("hypothesis"),
             "attempts": result.get("attempts"),
@@ -149,6 +152,37 @@ def _experiment_records(
             "failure_code": result.get("failure_code"),
         })
     return records
+
+
+def _report_decision_objective(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    objective = dict(value)
+    champion = objective.get("champion")
+    candidate = objective.get("candidate")
+    minimum = objective.get("minimum_improvement")
+
+    def finite_number(number: Any) -> bool:
+        return (
+            isinstance(number, (int, float))
+            and not isinstance(number, bool)
+            and math.isfinite(float(number))
+        )
+
+    objective["improvement_mode"] = "absolute_objective_points"
+    objective["required_candidate_objective"] = (
+        float(champion) + float(minimum)
+        if objective.get("relative_improvement_required") is True
+        and finite_number(champion)
+        and finite_number(minimum)
+        else None
+    )
+    objective["absolute_improvement"] = (
+        float(candidate) - float(champion)
+        if finite_number(champion) and finite_number(candidate)
+        else None
+    )
+    return objective
 
 
 def _loop_integrity_warnings(
@@ -293,7 +327,13 @@ def _report_prompt(champion_applicability: Mapping[str, Any]) -> str:
         "如果 loop.preflight_failure 非空，必须在总览和遗留风险中说明该 Run 在分配下一 Round 前"
         "因基础设施预检失败停止；不得把它计作候选失败。",
         "接受或拒绝原因必须以 decision_objective、decision_constraints 和 decision_reasons "
-        "为准；特别要准确说明当时 champion 是否可行、是否要求相对目标改善。",
+        "为准；特别要准确说明当时 champion 是否可行、是否要求与 champion 比较。",
+        "objective 晋级契约的 improvement_mode 固定为 absolute_objective_points："
+        "minimum_improvement 是与 objective 同量纲的绝对点数，判定公式为 "
+        "candidate >= champion + minimum_improvement，绝不是百分比或比例改善。",
+        "decision_objective.relative_improvement_required 只表示是否需要与当时 champion 比较，"
+        "不表示采用相对百分比公式。报告必须优先使用预计算的 required_candidate_objective 和 "
+        "absolute_improvement；不得把 minimum_improvement 或 objective 差值写成未由契约定义的百分比。",
         "如果 champion.metrics_status 是 stale，仍可展示历史指标，但必须明确其适用性已过期，"
         "且这些指标未用于当前晋级或停止决策。",
         "报告固定包含以下结构：",
@@ -400,6 +440,7 @@ def generate_loop_report(
             "minimum_improvement": (
                 task.raw["evaluation"].get("acceptance", {}).get("minimum_improvement", 0.0)
             ),
+            "minimum_improvement_mode": "absolute_objective_points",
             "development_period": task.development_period,
             "gate_period": task.gate_period,
             "guard_period": task.guard_period,

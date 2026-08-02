@@ -137,7 +137,8 @@ quant-agent loop active-etf-rerank-topk -d
   通过后才晋级 Champion。
   Guard 完整证据保存在该轮 `guard.json`，后续候选 Prompt 与研究记忆只会收到统一的拒绝原因，不会收到
   Guard 精确指标。
-- `evaluation.acceptance.minimum_improvement` 控制合格 Champion 之上的最小改善；
+- `evaluation.acceptance.minimum_improvement` 是与 objective 同量纲的绝对点数，按
+  `candidate >= champion + minimum_improvement` 控制合格 Champion 之上的最小改善，不表示百分比；
   `evaluation.target.objective_at_least` 可在目标达成后提前停止。
 - 配置 `[production]` 的任务在 Run 报告完成后，会将该 Run 冻结的最终 Champion
   原子同步到 `scope.editable` 声明的生产策略文件。同步只在 Run 内产生新 Champion 时发生，
