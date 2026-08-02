@@ -75,6 +75,25 @@ def _write_loop_state(path: Path, state: dict[str, Any]) -> None:
     write_json_atomic(path, state)
 
 
+def _test_observation_metrics(value: object) -> list[tuple[str, object]]:
+    if not isinstance(value, Mapping):
+        return []
+    aggregate = value.get("aggregate")
+    source = aggregate if isinstance(aggregate, Mapping) else value
+    metrics = {
+        str(key): item
+        for key, item in source.items()
+        if isinstance(item, (str, int, float, bool)) or item is None
+    }
+    if source is not value:
+        metrics.update({
+            str(key): item
+            for key, item in value.items()
+            if isinstance(item, (str, int, float, bool)) or item is None
+        })
+    return sorted(metrics.items())
+
+
 def append_test_observation(
     report_path: Path,
     task: ResearchTask,
@@ -113,15 +132,7 @@ def append_test_observation(
         f"- Champion SHA-256：{champion_sha256 or '不可用'}",
     ]
     metrics = result.get("metrics")
-    scalar_metrics = (
-        sorted(
-            (str(key), value)
-            for key, value in metrics.items()
-            if isinstance(value, (str, int, float, bool)) or value is None
-        )
-        if isinstance(metrics, Mapping)
-        else []
-    )
+    scalar_metrics = _test_observation_metrics(metrics)
     if scalar_metrics:
         lines.extend(["", "### 核心聚合指标", "", "| 指标 | 值 |", "|---|---:|"])
         for key, value in scalar_metrics:

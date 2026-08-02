@@ -1113,3 +1113,45 @@ def test_harness_test_observation_replaces_existing_section(tmp_path: Path) -> N
     assert report.count("<!-- harness:test-observation:start -->") == 1
     assert report.count("## Test 区间观察") == 1
     assert "| sortino | 1.5 |" in report
+
+
+def test_harness_test_observation_renders_walk_forward_aggregate_metrics(
+    tmp_path: Path,
+) -> None:
+    task_path = tmp_path / "task.toml"
+    task_path.write_text(
+        TASK
+        + "\n[evaluation.test]\nstart = \"2025-01-01\"\nend = \"2025-12-31\"\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+    base = ResearchWorkspace(tmp_path, tmp_path / ".research", "report-test")
+    base.initialize(
+        date(2021, 12, 31),
+        strategy_path="src/quant_core/strategy/example.py",
+    )
+    manager = base.for_run(1)
+    manager.run_artifacts_root.mkdir(parents=True)
+    manager.report_path.write_text("# Research Loop 总结\n", encoding="utf-8")
+    manager.run_test_root.mkdir(parents=True)
+    write_json_atomic(manager.run_test_result_path, {
+        "strategy_sha256": "a" * 64,
+        "metrics": {
+            "aggregate": {"annual_return": -0.02, "sortino": -0.2},
+            "folds": [{"status": "selected"}],
+            "no_feasible_parameter_folds": 0,
+        },
+    })
+
+    research_report.append_test_observation(
+        manager.report_path,
+        ResearchTask.load(task_path),
+        manager,
+        {"test_status": "completed"},
+    )
+
+    report = manager.report_path.read_text(encoding="utf-8")
+    assert "| annual_return | -0.02 |" in report
+    assert "| sortino | -0.2 |" in report
+    assert "| no_feasible_parameter_folds | 0 |" in report
+    assert "| folds |" not in report
