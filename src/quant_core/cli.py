@@ -37,6 +37,8 @@ from quant_core.commands.research import (
     command_research_run_once,
     resolve_research_task_reference,
 )
+from quant_core.universe import active as active_universe
+from quant_core.universe import liquid as liquid_universe
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,6 +67,23 @@ def build_parser() -> argparse.ArgumentParser:
     data_update.add_argument("--universe-name", default="default")
     data_update.add_argument("--adjust")
     data_update.set_defaults(func=command_data_update)
+
+    universe = sub.add_parser("universe", help="build repository-level ETF universes")
+    universe_sub = universe.add_subparsers(dest="command", required=True)
+    universe_active = universe_sub.add_parser(
+        "build-active",
+        description=active_universe.DESCRIPTION,
+        help="build the active ETF rotation universe",
+    )
+    active_universe.add_arguments(universe_active)
+    universe_active.set_defaults(func=active_universe.command_build)
+    universe_liquid = universe_sub.add_parser(
+        "build-liquid",
+        description=liquid_universe.DESCRIPTION,
+        help="build the low-cost liquid ETF rotation universe",
+    )
+    liquid_universe.add_arguments(universe_liquid)
+    universe_liquid.set_defaults(func=liquid_universe.command_build)
 
     factor = sub.add_parser("factor")
     factor_sub = factor.add_subparsers(dest="command", required=True)

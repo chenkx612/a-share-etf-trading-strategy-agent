@@ -10,20 +10,22 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from quant_core import cli
 from quant_core.universe import liquid as liquid_builder
 from quant_core.universe import common as universe_common
+from quant_core.universe import active as active_builder
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    "script_name",
-    ["build_liquid_etf_universe.py", "build_active_etf_universe.py"],
+    "command",
+    ["build-liquid", "build-active"],
 )
-def test_universe_builder_script_help_smoke(script_name: str) -> None:
+def test_universe_builder_cli_help_smoke(command: str) -> None:
     completed = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "scripts" / script_name), "--help"],
+        [sys.executable, "-m", "quant_core.cli", "universe", command, "--help"],
         cwd=REPO_ROOT,
         check=False,
         capture_output=True,
@@ -32,6 +34,90 @@ def test_universe_builder_script_help_smoke(script_name: str) -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--output-dir" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("command", "builder"),
+    [
+        ("build-liquid", liquid_builder),
+        ("build-active", active_builder),
+    ],
+)
+def test_universe_builder_cli_routes_arguments(command: str, builder) -> None:
+    args = cli.build_parser().parse_args(
+        [
+            "universe",
+            command,
+            "--date",
+            "2026-07-24",
+            "--output-dir",
+            "custom-output",
+            "--apply",
+        ],
+    )
+
+    assert args.func is builder.command_build
+    assert args.date == "2026-07-24"
+    assert args.output_dir == "custom-output"
+    assert args.apply is True
+
+
+@pytest.mark.parametrize(
+    ("command", "builder", "output_name", "destination_name"),
+    [
+        (
+            "build-liquid",
+            liquid_builder,
+            "liquid_etf_universe",
+            "liquid_etf_rotation.csv",
+        ),
+        (
+            "build-active",
+            active_builder,
+            "active_etf_universe",
+            "active_etf_rotation.csv",
+        ),
+    ],
+)
+def test_universe_builder_cli_honors_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    builder,
+    output_name: str,
+    destination_name: str,
+) -> None:
+    args = cli.build_parser().parse_args(
+        ["--root", str(tmp_path), "universe", command, "--apply"],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(builder, "fetch_spot", lambda: pd.DataFrame())
+    monkeypatch.setattr(
+        builder,
+        "make_shortlist",
+        lambda *_args, **_kwargs: (pd.DataFrame(), {}),
+    )
+
+    def fake_refresh(*_args, **kwargs):
+        captured["refresh_root"] = kwargs["root"]
+        return pd.DataFrame(), {}
+
+    def fake_build_outputs(build_args, **kwargs):
+        captured["output_dir"] = build_args.output_dir
+        captured["destination"] = kwargs["destination"]
+        return {}
+
+    monkeypatch.setattr(builder, "refresh_shared_daily", fake_refresh)
+    monkeypatch.setattr(builder, "build_outputs", fake_build_outputs)
+
+    args.func(args)
+
+    assert captured == {
+        "refresh_root": tmp_path,
+        "output_dir": str(tmp_path / "outputs" / output_name),
+        "destination": tmp_path / "universes" / destination_name,
+    }
 
 
 def load_builder():

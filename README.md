@@ -327,12 +327,12 @@ quant-agent recommend active-etf-rerank-topk --date 2026-07-24 --skip-refresh
 仓库级建池命令与各技能解耦，默认只生成预览：
 
 ```bash
-python3 scripts/build_liquid_etf_universe.py --date YYYY-MM-DD
+quant-agent universe build-liquid --date YYYY-MM-DD
 ```
 
 预览产物写入 `outputs/liquid_etf_universe/`，包括 `shortlist.csv`、
 `selected_universe.csv`、`correlation.csv` 和带完整剔除原因的 `summary.json`。
-显式增加 `--apply` 时，命令会备份旧池并原子更新
+显式增加 `--apply` 时，命令会备份旧池并原子更新所选 `--root` 下的
 `universes/liquid_etf_rotation.csv`；它不会修改 `universes/sector_rotation.csv`。
 任一入围 ETF 行情刷新失败或最终池为空时，命令保留预览和审计产物但拒绝更新正式池。
 
@@ -350,13 +350,13 @@ python3 scripts/build_liquid_etf_universe.py --date YYYY-MM-DD
 成交额过滤产品，并按流动性顺序进行贪心收益相关性去重：
 
 ```bash
-python3 scripts/build_active_etf_universe.py --date YYYY-MM-DD
+quant-agent universe build-active --date YYYY-MM-DD
 ```
 
 预览产物写入 `outputs/active_etf_universe/`，包括规模和流动性审计、相关性矩阵、
 共同观察数矩阵、逐产品选择决策及最终池。显式增加 `--apply` 时，命令会备份并原子
-更新 `universes/active_etf_rotation.csv`，不会修改其他正式股票池。默认要求近 60 日
-至少 50 个有效成交额观察值、成交额中位数不低于 5000 万元，并使用近 252 日收益和
+更新所选 `--root` 下的 `universes/active_etf_rotation.csv`，不会修改其他正式股票池。
+默认要求近 60 日至少 50 个有效成交额观察值、成交额中位数不低于 5000 万元，并使用近 252 日收益和
 至少 120 个共同观察值。候选按成交额中位数、规模和代码确定顺序；只有与所有已选
 ETF 的普通 Pearson 相关性均不高于 `0.90` 时才入池。共同历史不足的候选拒绝入池，
 负相关不取绝对值，最终池不强制补足数量。
@@ -381,7 +381,6 @@ src/quant_core/recommendation/  # Parameter search, causal replay, and next-day 
 src/quant_core/research/        # Loop/harness contracts, runner, evaluator, state, report
 src/quant_core/strategy/        # Candidate and built-in strategy implementations
 src/quant_core/universe/        # Deterministic repository-level universe builders
-scripts/                        # Thin repository-level command entry points
 tasks/                          # Canonical task-id TOML contracts
 tests/                          # Framework and harness tests
 universes/                      # Repository-level stock pools shared across skills

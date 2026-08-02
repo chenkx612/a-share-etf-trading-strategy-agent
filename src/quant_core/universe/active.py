@@ -37,15 +37,16 @@ DEFAULT_MIN_MEDIAN_AMOUNT = 50_000_000
 DEFAULT_LOOKBACK_DAYS = 252
 DEFAULT_MIN_OBSERVATIONS = 120
 DEFAULT_CORR_THRESHOLD = 0.90
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "active_etf_universe"
 DEFAULT_DESTINATION = REPO_ROOT / "universes" / "active_etf_rotation.csv"
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Build an active ETF rotation universe using fund-size preselection, "
-            "trading-amount filters, and greedy pairwise correlation selection."
-        ),
-    )
+
+
+DESCRIPTION = (
+    "Build an active ETF rotation universe using fund-size preselection, "
+    "trading-amount filters, and greedy pairwise correlation selection."
+)
+
+
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--date", default=date.today().isoformat(), help="As-of date, YYYY-MM-DD.")
     parser.add_argument("--min-fund-size", type=float, default=DEFAULT_MIN_FUND_SIZE)
     parser.add_argument("--shortlist-size", type=int, default=DEFAULT_SHORTLIST_SIZE)
@@ -67,8 +68,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
     parser.add_argument("--min-observations", type=int, default=DEFAULT_MIN_OBSERVATIONS)
     parser.add_argument("--corr-threshold", type=float, default=DEFAULT_CORR_THRESHOLD)
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--output-dir")
     parser.add_argument("--apply", action="store_true")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=DESCRIPTION)
+    add_arguments(parser)
     return parser.parse_args()
 
 
@@ -656,9 +662,11 @@ def build_outputs(
     return summary
 
 
-def main() -> None:
-    args = parse_args()
+def command_build(args: argparse.Namespace) -> None:
     validate_args(args)
+    root = Path(getattr(args, "root", REPO_ROOT))
+    if args.output_dir is None:
+        args.output_dir = str(root / "outputs" / "active_etf_universe")
     spot = fetch_spot()
     shortlist, _ = make_shortlist(
         spot,
@@ -672,14 +680,20 @@ def main() -> None:
         min_observations=args.min_observations,
         liquidity_lookback_days=args.liquidity_lookback_days,
         min_amount_observations=args.min_amount_observations,
+        root=root,
     )
     summary = build_outputs(
         args,
         spot=spot,
         daily=daily,
         refresh_audit=refresh_audit,
+        destination=root / "universes" / "active_etf_rotation.csv",
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+def main() -> None:
+    command_build(parse_args())
 
 
 if __name__ == "__main__":
