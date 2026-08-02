@@ -1,4 +1,0 @@
-interface:
-  display_name: "Active ETF Rerank Top-K"
-  short_description: "生成经 Champion 校验的次交易日 ETF 目标仓位"
-  default_prompt: "Use $active-etf-rerank-topk to generate auditable next-trading-day ETF target holdings."

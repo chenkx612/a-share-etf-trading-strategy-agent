@@ -1,4 +1,0 @@
-interface:
-  display_name: "ETF Vol-Adaptive Top-K"
-  short_description: "每日生成次日持仓并执行周度 ETF 股票池与参数自适应研究"
-  default_prompt: "使用 $etf-vol-adaptive-topk 生成次日持仓，或执行周度股票池与参数研究。"
