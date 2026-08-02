@@ -26,7 +26,7 @@ active_etf_rotation.csv 是当前时点筛出的高活跃、低同质化 ETF 快
 
 参数必须少、有经济含义、网格确定且不超过 Harness 上限。每轮应固定与主要机制无关且已稳定的维度，只加入少量邻近值；当前稳定的 `mom_sleeve_weight=0.30`、`vol_window=60`、允许袖套重合和禁用 `use_sharpe` 不应重新搜索。不得恢复整套历史参数网格来掩盖机制贡献。Development 内必须检查无未来函数、边界窗口、动态上市日期、缺失值、确定性、网格唯一性、纯多头权重、信号日至次日开盘时序，以及相对当前 Champion 的真实行为差异。只有改善来自多个预先存在的滚动折、不是单一阶段、少数标的或持续降低暴露，才值得提交。
 
-固定评测按 12 个月训练窗口逐折选参，在随后 1 个月验证折计算样本外表现；Development 与 Gate 不重叠。候选必须先满足所有 Gate 折训练可行性及 Gate 汇总年化收益、最大回撤、平均换手率硬约束，再以 Sortino 相对本任务当前 Champion 达到最小改善门槛。Promotion 完全由 Harness 决定；不得修改 active_etf_rotation.csv、市场数据、回测器、评测区间、指标、约束、晋级逻辑或测试来配合候选。
+固定评测按 12 个月训练窗口逐折选参，在随后 1 个月验证折计算样本外表现；Development 与 Gate 不重叠。候选必须先满足所有 Gate 折训练可行性及 Gate 汇总年化收益、最大回撤、平均换手率硬约束，再以 Sharpe 相对本任务当前 Champion 达到最小改善门槛。Promotion 完全由 Harness 决定；不得修改 active_etf_rotation.csv、市场数据、回测器、评测区间、指标、约束、晋级逻辑或测试来配合候选。
 """
 
 [budget]
@@ -53,7 +53,7 @@ universe = "universes/active_etf_rotation.csv"
 
 [parameter_selection]
 train_months = 12
-objective = "sortino"
+objective = "sharpe"
 max_parameter_sets = 128
 
 [parameter_selection.schedule]

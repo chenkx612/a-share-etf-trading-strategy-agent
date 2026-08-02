@@ -9,7 +9,7 @@ goal = """
 
 每轮只验证一个机制。提交前先量化候选相对 Champion 在 Development 的不同信号日、持仓变化、总暴露、触发次数和换手变化；若行为几乎等价，应停止该机制而不是提交。还应检查改善是否跨越多个预先存在的市场阶段，而非由单一事件贡献；这些诊断只用于稳健性判断，不得改变固定 evaluator、数据区间、Gate 或晋级规则，也不得根据诊断结果反复切分区间挖参数。参数应少且有经济含义，并检查少量合理邻近设定，避免尖点最优。
 
-首要目标是在保留风险偏好恢复后上行参与能力的同时，减少深度回撤和连续亏损；不得仅靠长期降低总仓位抬高风险指标。保留 select(daily, universe, start, end) 接口，返回包含 date、symbol 和 target_weight 的 pandas DataFrame。策略必须纯多头并允许现金，每个信号日只能使用当时已可获得的信息，不得使用未来数据。所有候选使用固定资金、整手规则和交易费率。在满足最低收益、最大回撤和平均换手率约束后，以 Sortino 为唯一晋级目标；优先选择机制简单、行为差异充分、可解释且对合理邻近参数不敏感的方案。
+首要目标是在保留风险偏好恢复后上行参与能力的同时，减少深度回撤和连续亏损；不得仅靠长期降低总仓位抬高风险指标。保留 select(daily, universe, start, end) 接口，返回包含 date、symbol 和 target_weight 的 pandas DataFrame。策略必须纯多头并允许现金，每个信号日只能使用当时已可获得的信息，不得使用未来数据。所有候选使用固定资金、整手规则和交易费率。在满足最低收益、最大回撤和平均换手率约束后，以 Sharpe 为唯一晋级目标；优先选择机制简单、行为差异充分、可解释且对合理邻近参数不敏感的方案。
 """
 
 [budget]
@@ -36,7 +36,7 @@ universe = "universes/sector_rotation.csv"
 
 [parameter_selection]
 train_months = 18
-objective = "sortino"
+objective = "sharpe"
 max_parameter_sets = 256
 
 [parameter_selection.schedule]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 from datetime import date
 from types import SimpleNamespace
@@ -101,6 +102,30 @@ def test_metrics_include_sortino() -> None:
 
     assert "sortino" in metrics
     assert metrics["sortino"] > 0
+
+
+def test_metrics_sharpe_uses_mean_daily_net_return_and_zero_risk_free_rate() -> None:
+    daily_returns = pd.DataFrame({
+        "net_return": [0.02, -0.01, 0.03, -0.005],
+        "turnover": [0.1, 0.2, 0.1, 0.2],
+    })
+
+    metrics = compute_metrics(daily_returns)
+    net_return = daily_returns["net_return"]
+    expected = net_return.mean() / net_return.std(ddof=0) * math.sqrt(252)
+
+    assert metrics["sharpe"] == pytest.approx(expected)
+
+
+def test_metrics_sharpe_is_zero_when_daily_returns_have_zero_volatility() -> None:
+    daily_returns = pd.DataFrame({
+        "net_return": [0.01, 0.01, 0.01],
+        "turnover": [0.1, 0.1, 0.1],
+    })
+
+    metrics = compute_metrics(daily_returns)
+
+    assert metrics["sharpe"] == 0.0
 
 
 def test_drawdown_lt_return_constraint_and_sorting() -> None:

@@ -178,8 +178,9 @@ def compute_metrics(daily_returns: pd.DataFrame) -> dict[str, float]:
     equity = (1.0 + ret).cumprod()
     total_return = float(equity.iloc[-1] - 1.0)
     annual_return = float(equity.iloc[-1] ** (252 / max(len(equity), 1)) - 1.0)
-    annual_vol = float(ret.std(ddof=0) * math.sqrt(252))
-    sharpe = float(annual_return / annual_vol) if annual_vol else 0.0
+    daily_vol = float(ret.std(ddof=0))
+    annual_vol = float(daily_vol * math.sqrt(252))
+    sharpe = float(ret.mean() / daily_vol * math.sqrt(252)) if daily_vol else 0.0
     downside = ret[ret < 0.0]
     downside_vol = float(downside.std(ddof=0) * math.sqrt(252)) if not downside.empty else 0.0
     sortino = float(annual_return / downside_vol) if downside_vol else 0.0

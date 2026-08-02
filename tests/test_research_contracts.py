@@ -514,21 +514,53 @@ def test_fixed_task_fingerprints_the_repository_around_the_editable_strategy() -
 
 
 @pytest.mark.parametrize(
-    "task_name",
+    ("task_name", "expected_constraints"),
     [
-        "active_etf_rerank_topk.toml",
-        "active_etf_sharpe.toml",
-        "liquid_etf_rerank_topk.toml",
-        "sharpe_corr_threshold_optimization.toml",
+        (
+            "active_etf_rerank_topk.toml",
+            {
+                "annual_return": {"operator": ">=", "threshold": 0.03},
+                "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
+                "avg_turnover": {"operator": "<=", "threshold": 0.35},
+            },
+        ),
+        (
+            "active_etf_sharpe.toml",
+            {
+                "annual_return": {"operator": ">=", "threshold": 0.05},
+                "max_drawdown": {"operator": "abs<=", "threshold": 0.15},
+                "avg_turnover": {"operator": "<=", "threshold": 0.30},
+            },
+        ),
+        (
+            "liquid_etf_rerank_topk.toml",
+            {
+                "annual_return": {"operator": ">=", "threshold": 0.03},
+                "max_drawdown": {"operator": "abs<=", "threshold": 0.20},
+                "avg_turnover": {"operator": "<=", "threshold": 0.35},
+            },
+        ),
+        (
+            "sharpe_corr_threshold_optimization.toml",
+            {
+                "annual_return": {"operator": ">=", "threshold": 0.05},
+                "max_drawdown": {"operator": "abs<=", "threshold": 0.15},
+                "avg_turnover": {"operator": "<=", "threshold": 0.30},
+            },
+        ),
     ],
 )
 def test_repository_walk_forward_tasks_use_shared_parameter_selection(
     task_name: str,
+    expected_constraints: dict[str, dict[str, float | str]],
 ) -> None:
     task = ResearchTask.load(REPOSITORY_ROOT / "tasks" / task_name)
 
     assert task.evaluation_mode == "walk_forward"
     assert task.parameter_selection is not None
+    assert task.parameter_selection["objective"] == "sharpe"
+    assert task.parameter_selection["constraints"] == expected_constraints
+    assert task.raw["evaluation"]["acceptance"]["minimum_improvement"] == 0.03
     assert "objective" not in task.raw["evaluation"]
     assert "constraints" not in task.raw["evaluation"]
     assert task.relative_period_config == {

@@ -59,7 +59,7 @@ Development 之后的信息构造特征。所有信号只能使用交易日 t �
 由固定回测器在 t+1 执行。
 
 评估必须使用 Harness 固定的 walk-forward：每个自然月首个交易日以此前 12 个月为训练窗，
-仅在训练窗内按硬约束和 Sortino 选择 parameter_grid() 中的参数，然后将该参数冻结到随后
+仅在训练窗内按硬约束和 Sharpe 选择 parameter_grid() 中的参数，然后将该参数冻结到随后
 一个月的样本外验证折。Development 用于候选研发；Gate 与 Development 不重叠，Gate 的
 逐折参数、持仓、收益和指标不得反馈给后续候选。不得修改 evaluator、数据区间、股票池、
 硬约束、晋级规则或测试来配合候选。
@@ -73,7 +73,7 @@ symbol、target_weight 的 DataFrame。权重必须有限、非负且每日总�
 每轮只验证一个主要机制。候选提交前须在 Development 中检查因果性、确定性、上市边界、
 缺失行情、信号日至次日开盘时序、纯多头权重和参数网格唯一性，并量化相对当前 Champion
 的持仓差异、触发次数、总暴露和换手变化。候选先满足年化收益、最大回撤和平均换手率约束，
-再以 Gate 汇总 Sortino 达到最小改善门槛；Promotion 完全由 Harness 决定。
+再以 Gate 汇总 Sharpe 达到最小改善门槛；Promotion 完全由 Harness 决定。
 """
 
 [budget]
@@ -100,7 +100,7 @@ universe = "universes/active_etf_rotation.csv"
 
 [parameter_selection]
 train_months = 12
-objective = "sortino"
+objective = "sharpe"
 max_parameter_sets = 64
 
 [parameter_selection.schedule]
