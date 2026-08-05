@@ -13,6 +13,7 @@ from quant_core.config import BacktestConfig
 from quant_core.data.market_data import (
     AkshareMarketDataClient,
     DEFAULT_ADJUST,
+    PartialMarketDataRefreshError,
     ProjectPaths,
     fetch_daily_if_stale,
     load_universe,
@@ -295,15 +296,23 @@ def command_data_update(args: argparse.Namespace) -> None:
         existing = read_daily(paths)
     except FileNotFoundError:
         existing = None
-    incoming, target_trade_date = fetch_daily_if_stale(
-        universe,
-        parse_date(args.start),
-        parse_date(args.end),
-        existing=existing,
-        fetch_one=market_data.fetch_daily,
-        log=print,
-    )
+    refresh_error: PartialMarketDataRefreshError | None = None
+    try:
+        incoming, target_trade_date = fetch_daily_if_stale(
+            universe,
+            parse_date(args.start),
+            parse_date(args.end),
+            existing=existing,
+            fetch_one=market_data.fetch_daily,
+            log=print,
+        )
+    except PartialMarketDataRefreshError as error:
+        incoming = error.incoming
+        target_trade_date = error.target_trade_date
+        refresh_error = error
     if incoming.empty:
+        if refresh_error is not None:
+            raise refresh_error
         print(f"local daily data unchanged through {target_trade_date}")
         return
     daily = replace_symbol_history(existing, incoming)
@@ -315,6 +324,8 @@ def command_data_update(args: argparse.Namespace) -> None:
         print("data warnings:")
         for problem in problems:
             print(f"- {problem}")
+    if refresh_error is not None:
+        raise refresh_error
 
 
 def command_factor_compute(args: argparse.Namespace) -> None:

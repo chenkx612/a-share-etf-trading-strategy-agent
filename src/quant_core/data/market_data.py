@@ -27,6 +27,26 @@ REFRESH_HISTORY_YEARS = 5
 REFRESH_START_BUFFER_DAYS = 14
 
 
+class PartialMarketDataRefreshError(RuntimeError):
+    """A refresh fetched usable histories, but not for every requested symbol."""
+
+    def __init__(
+        self,
+        target_trade_date: date,
+        missing_symbols: list[str],
+        incoming: pd.DataFrame,
+    ) -> None:
+        self.target_trade_date = target_trade_date
+        self.missing_symbols = missing_symbols
+        # Only histories with a current bar are safe to replace in the cache.
+        self.incoming = incoming
+        super().__init__(
+            "Market data refresh did not return complete data for latest trade date "
+            f"{target_trade_date}; missing symbols={missing_symbols}; "
+            "successful symbol histories were returned for persistence"
+        )
+
+
 def parquet_available() -> bool:
     try:
         import pyarrow  # noqa: F401
@@ -378,9 +398,16 @@ def fetch_daily_if_stale(
     incoming = fetch_one(stale_universe, effective_start, end)
     missing = missing_symbols_for_date(incoming, stale_universe, target_trade_date)
     if missing:
-        raise RuntimeError(
-            "Market data refresh did not return complete data for latest trade date "
-            f"{target_trade_date}; missing symbols={missing}; local daily data was not updated"
+        complete_symbols = set(stale_symbols) - set(missing)
+        complete_incoming = (
+            incoming[incoming["symbol"].astype(str).isin(complete_symbols)].copy()
+            if not incoming.empty
+            else incoming
+        )
+        raise PartialMarketDataRefreshError(
+            target_trade_date,
+            missing,
+            complete_incoming,
         )
     return incoming, target_trade_date
 

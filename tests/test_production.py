@@ -12,6 +12,7 @@ import pytest
 
 import quant_core.cli as cli
 from quant_core.cli import build_parser
+from quant_core.data.market_data import PartialMarketDataRefreshError, ProjectPaths, read_daily
 from quant_core.production import (
     ProductionContext,
     SearchResult,
@@ -488,6 +489,42 @@ def test_production_refresh_requests_shared_five_year_history(
     _refresh_data(ctx, date(2026, 7, 24), skip_refresh=False)
 
     assert captured["start"] == date(2021, 7, 10)
+
+
+def test_production_refresh_persists_complete_symbols_before_rejecting_partial_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = context(tmp_path)
+    target = date(2026, 7, 24)
+    incoming = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp(target),
+                "symbol": "A",
+                "name": "A",
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+                "amount": 1.0,
+                "turnover": 1.0,
+            }
+        ]
+    )
+
+    def partial_fetch(*_args: object, **_kwargs: object) -> tuple[pd.DataFrame, date]:
+        raise PartialMarketDataRefreshError(target, ["B"], incoming)
+
+    monkeypatch.setattr("quant_core.recommendation.replay.fetch_daily_if_stale", partial_fetch)
+
+    with pytest.raises(PartialMarketDataRefreshError, match="missing symbols=\\['B'\\]"):
+        _refresh_data(ctx, target, skip_refresh=False)
+
+    stored = read_daily(ProjectPaths(tmp_path))
+    assert stored["symbol"].tolist() == ["A"]
+    assert pd.to_datetime(stored["date"]).dt.date.tolist() == [target]
 
 
 def test_refresh_history_guard_allows_recently_listed_etf() -> None:

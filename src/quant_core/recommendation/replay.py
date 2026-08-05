@@ -14,6 +14,7 @@ from quant_core import schedule as schedule_policy
 from quant_core.backtest.engine import compute_metrics, run_backtest
 from quant_core.data.market_data import (
     AkshareMarketDataClient,
+    PartialMarketDataRefreshError,
     ProjectPaths,
     fetch_daily_if_stale,
     read_daily,
@@ -95,15 +96,22 @@ def _refresh_data(
         )
     start = refresh_window_start(requested)
     client = AkshareMarketDataClient()
-    incoming, _ = fetch_daily_if_stale(
-        refresh_universe,
-        start,
-        requested,
-        existing=existing if not existing.empty else None,
-        fetch_one=client.fetch_daily,
-        log=print,
-    )
+    refresh_error: PartialMarketDataRefreshError | None = None
+    try:
+        incoming, _ = fetch_daily_if_stale(
+            refresh_universe,
+            start,
+            requested,
+            existing=existing if not existing.empty else None,
+            fetch_one=client.fetch_daily,
+            log=print,
+        )
+    except PartialMarketDataRefreshError as error:
+        incoming = error.incoming
+        refresh_error = error
     if incoming.empty:
+        if refresh_error is not None:
+            raise refresh_error
         return existing
     _validate_refresh_preserves_available_history(existing, incoming, start)
     merged = replace_symbol_history(existing if not existing.empty else None, incoming)
@@ -111,6 +119,8 @@ def _refresh_data(
     if problems:
         raise RuntimeError(f"refreshed market data is invalid: {problems}")
     write_table(merged, paths.data_daily)
+    if refresh_error is not None:
+        raise refresh_error
     return merged
 
 

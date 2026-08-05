@@ -15,6 +15,7 @@ import quant_core.cli as cli_module
 from quant_core.commands import analysis as analysis_commands
 from quant_core.data.market_data import (
     AkshareMarketDataClient,
+    PartialMarketDataRefreshError,
     fetch_daily_if_stale,
     resolve_complete_universe_date,
 )
@@ -1074,7 +1075,7 @@ def test_fetch_daily_if_stale_refuses_partial_market_data_refresh(monkeypatch: p
             }
         ])
 
-    with pytest.raises(RuntimeError, match="missing symbols=\\['510500'\\]"):
+    with pytest.raises(PartialMarketDataRefreshError, match="missing symbols=\\['510500'\\]") as raised:
         fetch_daily_if_stale(
             universe,
             date(2026, 1, 1),
@@ -1082,3 +1083,22 @@ def test_fetch_daily_if_stale_refuses_partial_market_data_refresh(monkeypatch: p
             existing=None,
             fetch_one=fetch_one,
         )
+    assert raised.value.incoming["symbol"].tolist() == ["510300"]
+
+
+def test_fetch_daily_if_stale_reports_all_missing_for_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market_data_module, "latest_trade_date_on_or_before", lambda target: TEST_DAY)
+    universe = pd.DataFrame([{"symbol": "510300", "name": "沪深300ETF"}])
+
+    with pytest.raises(PartialMarketDataRefreshError, match="missing symbols=\\['510300'\\]") as raised:
+        fetch_daily_if_stale(
+            universe,
+            date(2026, 1, 1),
+            TEST_END_DAY,
+            existing=None,
+            fetch_one=lambda *_args: pd.DataFrame(),
+        )
+
+    assert raised.value.incoming.empty
