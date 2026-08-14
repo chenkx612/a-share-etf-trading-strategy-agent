@@ -108,6 +108,26 @@ def test_rejects_insufficient_training_history(tmp_path: Path) -> None:
         resolve_relative_periods(task, source=tmp_path, runtime=tmp_path)
 
 
+def test_accepts_monday_after_weekend_training_boundary(tmp_path: Path) -> None:
+    task = relative_task(tmp_path)
+    write_daily(tmp_path, start="2021-08-02")
+
+    resolved = resolve_relative_periods(
+        task, source=tmp_path, runtime=tmp_path
+    )
+
+    assert resolved.period_resolution is not None
+    assert resolved.period_resolution["actual_data_start"] == "2021-08-02"
+
+
+def test_rejects_missing_weekday_after_training_boundary(tmp_path: Path) -> None:
+    task = relative_task(tmp_path)
+    write_daily(tmp_path, start="2021-08-03")
+
+    with pytest.raises(ValueError, match="insufficient market-data history"):
+        resolve_relative_periods(task, source=tmp_path, runtime=tmp_path)
+
+
 def test_evaluation_views_are_content_addressed_and_run_frozen(
     tmp_path: Path,
 ) -> None:

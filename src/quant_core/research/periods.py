@@ -11,6 +11,27 @@ from quant_core.research.contracts import ResearchTask
 from quant_core.schedule import latest_schedule_boundary
 
 
+def _first_weekday_on_or_after(value: pd.Timestamp) -> pd.Timestamp:
+    """Return the first weekday on or after a calendar period boundary."""
+    value = pd.Timestamp(value).normalize()
+    while value.weekday() >= 5:
+        value += pd.Timedelta(days=1)
+    return value
+
+
+def _has_required_history(
+    actual_start: pd.Timestamp,
+    required_start: pd.Timestamp,
+) -> bool:
+    """Accept a start on Monday when a month offset lands on a weekend.
+
+    Relative windows are calendar-month based, while market data only contains
+    trading sessions.  A weekday requirement remains exact so missing market
+    data is not treated as sufficient history.
+    """
+    return actual_start <= _first_weekday_on_or_after(required_start)
+
+
 def _period(
     dates: pd.DatetimeIndex,
     start: pd.Timestamp,
@@ -81,7 +102,7 @@ def resolve_relative_periods(
     minimum_required_start = development_start - pd.DateOffset(
         months=train_months
     )
-    if actual_start > minimum_required_start:
+    if not _has_required_history(actual_start, minimum_required_start):
         raise ValueError(
             "insufficient market-data history for relative walk-forward periods: "
             f"required_start<={minimum_required_start.date().isoformat()}, "
@@ -109,7 +130,7 @@ def resolve_relative_periods(
     required_start = replay_start - pd.DateOffset(
         months=train_months
     )
-    if actual_start > required_start:
+    if not _has_required_history(actual_start, required_start):
         raise ValueError(
             "insufficient market-data history for relative walk-forward periods: "
             f"required_start<={required_start.date().isoformat()}, "
