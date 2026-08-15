@@ -7,14 +7,33 @@ import re
 import shutil
 import time
 from collections.abc import Callable, Sequence
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.agent_errors import (
+    AgentContainerInfrastructureError,
+    CandidateBindPreflightError,
+)
+from quant_core.research.decision import metrics_key
+from quant_core.research.loop_state import (
+    new_loop_state as _new_state,
+    normalize_loop_state as _normalize_state,
+    record_decision as _record_decision,
+    stop_reason as _stop_reason,
+    timestamp as _timestamp,
+)
 from quant_core.research.periods import (
     bind_persisted_periods,
     resolve_relative_periods,
+)
+from quant_core.research.production_sync import (
+    production_sync_record as _production_sync_record,
+    recover_unresolved_production_sync as _recover_unresolved_production_sync,
+    sha256_path as _sha256_path,
+    synchronize_production_strategy as _synchronize_production_strategy,
+    write_production_sync_record as _write_production_sync_record,
 )
 from quant_core.research.environment import (
     EvaluationEnvironment,
@@ -26,23 +45,18 @@ from quant_core.research.report import (
     write_minimal_loop_report,
 )
 from quant_core.research.runner import (
-    AgentContainerInfrastructureError,
-    CandidateBindPreflightError,
-    _metrics_key,
     preflight_agent_container,
     preflight_provider_authentication,
     probe_candidate_bind_source,
     run_parent_fixed_tests,
     run_managed_once,
-    target_reached,
 )
 from quant_core.research.workspace import (
-    _write_bytes_atomic,
     build_evaluation_view,
     DevelopmentInputsError,
     ResearchWorkspace,
-    write_json_atomic,
 )
+from quant_core.research.storage import write_bytes_atomic, write_json_atomic
 
 
 ManagedRunner = Callable[..., Path]
@@ -54,383 +68,9 @@ ParentTestPreflight = Callable[..., dict[str, Any] | None]
 _ROUND_ID = re.compile(r"^(\d+)$")
 
 
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _task_fingerprint(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-
-def _new_state(
-    task: ResearchTask,
-    fingerprint: str,
-    run_number: int,
-    evaluation_environment_sha256: str,
-    diagnostics_enabled: bool,
-    development_view_sha256: str,
-    development_end: str,
-    evaluation_inputs_sha256: str | None = None,
-    resolved_periods: dict[str, Any] | None = None,
-    initial_champion_sha256: str | None = None,
-    initial_champion_number: int | None = None,
-    initial_champion_round_id: str | None = None,
-    initial_production_strategy_sha256: str | None = None,
-) -> dict[str, Any]:
-    now = _timestamp()
-    return {
-        "schema_version": 7,
-        "task_id": task.task_id,
-        "run_number": run_number,
-        "task_fingerprint": fingerprint,
-        "evaluation_environment_sha256": evaluation_environment_sha256,
-        "status": "running",
-        "started_at": now,
-        "updated_at": now,
-        "elapsed_seconds": 0.0,
-        "rounds_completed": 0,
-        "accepted": 0,
-        "rejected": 0,
-        "failed": 0,
-        "consecutive_failures": 0,
-        "round_ids": [],
-        "current_round": None,
-        "last_round": None,
-        "stop_reason": None,
-        "report_status": None,
-        "report_path": None,
-        "report_error": None,
-        "report_failure_kind": None,
-        "report_failure_code": None,
-        "guard_query_count": 0,
-        "diagnostics_enabled": diagnostics_enabled,
-        "development_view_sha256": development_view_sha256,
-        "development_end": development_end,
-        "evaluation_inputs_sha256": evaluation_inputs_sha256,
-        "resolved_periods": resolved_periods,
-        "production_sync_baseline_available": True,
-        "initial_champion_sha256": initial_champion_sha256,
-        "initial_champion_number": initial_champion_number,
-        "initial_champion_round_id": initial_champion_round_id,
-        "initial_production_strategy_sha256": initial_production_strategy_sha256,
-        "production_sync_status": None,
-        "production_sync_path": None,
-        "production_sync_error": None,
-    }
-
-
-def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
-    if "round_ids" not in state:
-        state["round_ids"] = state.pop("experiment_ids", [])
-    if "current_round" not in state:
-        state["current_round"] = state.pop("current_experiment_id", None)
-    if "last_round" not in state:
-        state["last_round"] = state.pop("last_experiment_id", None)
-    schema_version = state.get("schema_version")
-    if schema_version not in {2, 3, 4, 5, 6, 7}:
-        raise ValueError("research loop uses an incompatible state schema")
-    if schema_version != 7:
-        state["schema_version"] = 7
-        state.pop("test_status", None)
-        state.pop("test_path", None)
-        state.pop("test_error", None)
-    state.setdefault("guard_query_count", 0)
-    if schema_version not in {6, 7}:
-        state.setdefault("production_sync_baseline_available", False)
-    state.setdefault("production_sync_status", None)
-    state.setdefault("production_sync_path", None)
-    state.setdefault("production_sync_error", None)
-    return state
-
-
-def _sha256_path(path: Path) -> str | None:
-    if not path.is_file():
-        return None
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_production_sync_record(
-    manager: ResearchWorkspace,
-    state: dict[str, Any],
-    record: dict[str, Any],
-) -> None:
-    manager.production_sync_path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(manager.production_sync_path, record)
-    state["production_sync_status"] = record["status"]
-    state["production_sync_path"] = manager.production_sync_path.relative_to(
-        manager.run_artifacts_root
-    ).as_posix()
-    state["production_sync_error"] = record.get("error")
-    _save(manager.loop_state_path, state)
-
-
-def _production_sync_record(
-    task: ResearchTask,
-    manager: ResearchWorkspace,
-    state: dict[str, Any],
-    *,
-    status: str,
-    observed_sha256: str | None,
-    error: str | None = None,
-    recovered: bool = False,
-) -> dict[str, Any]:
-    existing: dict[str, Any] = {}
-    if manager.production_sync_path.is_file():
-        try:
-            loaded = json.loads(manager.production_sync_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = {}
-        if isinstance(loaded, dict):
-            existing = loaded
-    return {
-        "schema_version": 1,
-        "task_id": task.task_id,
-        "run": manager.run_id,
-        "strategy_path": task.strategy_path,
-        "initial_champion_sha256": state.get("initial_champion_sha256"),
-        "initial_champion_number": state.get("initial_champion_number"),
-        "initial_champion_round_id": state.get("initial_champion_round_id"),
-        "initial_production_strategy_sha256": state.get(
-            "initial_production_strategy_sha256"
-        ),
-        "final_champion_sha256": state.get("final_champion_sha256"),
-        "final_champion_number": state.get("final_champion_number"),
-        "final_champion_round_id": state.get("final_champion_round_id"),
-        "observed_production_strategy_sha256": observed_sha256,
-        "production_strategy_sha256": (
-            observed_sha256
-            if status not in {"completed", "already_synchronized"}
-            else state.get("final_champion_sha256")
-        ),
-        "status": status,
-        "error": error,
-        "started_at": existing.get("started_at", _timestamp()),
-        "updated_at": _timestamp(),
-        "completed_at": (
-            _timestamp()
-            if status in {"completed", "already_synchronized", "not_needed", "not_configured"}
-            else None
-        ),
-        "recovered": recovered or bool(existing.get("recovered", False)),
-    }
-
-
-def _synchronize_production_strategy(
-    task: ResearchTask,
-    manager: ResearchWorkspace,
-    state: dict[str, Any],
-    *,
-    recovered: bool = False,
-) -> None:
-    if task.production is None:
-        state["production_sync_status"] = "not_configured"
-        state["production_sync_path"] = None
-        state["production_sync_error"] = None
-        return
-
-    target = manager.source / task.strategy_path
-    observed = _sha256_path(target)
-    final_sha256 = state.get("final_champion_sha256")
-    initial_sha256 = state.get("initial_champion_sha256")
-    if not state.get("production_sync_baseline_available", False):
-        error = "legacy Run does not contain a production synchronization baseline"
-        record = _production_sync_record(
-            task, manager, state, status="legacy_unavailable", observed_sha256=observed,
-            error=error, recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_failed", message=error)
-        return
-    if final_sha256 == initial_sha256:
-        expected = state.get("initial_production_strategy_sha256")
-        if isinstance(initial_sha256, str) and (
-            expected != initial_sha256 or observed != expected
-        ):
-            error = (
-                "production strategy changed outside the Run"
-                if expected == initial_sha256
-                else "production strategy was not synchronized with the initial Champion"
-            )
-            record = _production_sync_record(
-                task,
-                manager,
-                state,
-                status="conflict",
-                observed_sha256=observed,
-                error=error,
-                recovered=recovered,
-            )
-            _write_production_sync_record(manager, state, record)
-            manager.emit_event("production_sync_conflict", message=error)
-            return
-        record = _production_sync_record(
-            task, manager, state, status="not_needed", observed_sha256=observed,
-            recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_not_needed", message="production sync not needed")
-        return
-    if not isinstance(final_sha256, str):
-        error = "Run does not have a final Champion to synchronize"
-        record = _production_sync_record(
-            task, manager, state, status="failed", observed_sha256=observed,
-            error=error, recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_failed", message=error)
-        return
-
-    frozen = (
-        manager.production_sync_champion_path
-        if recovered
-        else manager.terminal_champion_path
-    )
-    if not frozen.is_file() or _sha256_path(frozen) != final_sha256:
-        error = "frozen final Champion is unavailable or has an invalid hash"
-        record = _production_sync_record(
-            task, manager, state, status="failed", observed_sha256=observed,
-            error=error, recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_failed", message=error)
-        return
-    try:
-        current_champion_sha256 = manager.load_state(task.strategy_path).get(
-            "champion_sha256"
-        )
-    except (OSError, ValueError) as exc:
-        error = f"task Champion could not be validated before production sync: {exc}"
-        record = _production_sync_record(
-            task,
-            manager,
-            state,
-            status="failed",
-            observed_sha256=observed,
-            error=error,
-            recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_failed", message=error)
-        return
-    if current_champion_sha256 != final_sha256:
-        error = "task Champion changed after the Run terminal snapshot was frozen"
-        if frozen != manager.production_sync_champion_path:
-            _write_bytes_atomic(manager.production_sync_champion_path, frozen.read_bytes())
-        record = _production_sync_record(
-            task,
-            manager,
-            state,
-            status="conflict",
-            observed_sha256=observed,
-            error=error,
-            recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_conflict", message=error)
-        return
-    if observed == final_sha256:
-        record = _production_sync_record(
-            task, manager, state, status="already_synchronized", observed_sha256=observed,
-            recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.production_sync_champion_path.unlink(missing_ok=True)
-        manager.emit_event(
-            "production_sync_completed", message="production strategy already synchronized"
-        )
-        return
-
-    expected = state.get("initial_production_strategy_sha256")
-    baseline_is_safe = initial_sha256 is None or expected == initial_sha256
-    if not baseline_is_safe or observed != expected:
-        error = (
-            "production strategy changed outside the Run"
-            if baseline_is_safe
-            else "production strategy was not synchronized with the initial Champion"
-        )
-        if frozen != manager.production_sync_champion_path:
-            _write_bytes_atomic(manager.production_sync_champion_path, frozen.read_bytes())
-        record = _production_sync_record(
-            task, manager, state, status="conflict", observed_sha256=observed,
-            error=error, recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_conflict", message=error)
-        return
-
-    if frozen != manager.production_sync_champion_path:
-        _write_bytes_atomic(manager.production_sync_champion_path, frozen.read_bytes())
-        frozen = manager.production_sync_champion_path
-    pending = _production_sync_record(
-        task, manager, state, status="pending", observed_sha256=observed,
-        recovered=recovered,
-    )
-    _write_production_sync_record(manager, state, pending)
-    manager.emit_event("production_sync_started", message="production sync started")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _write_bytes_atomic(target, frozen.read_bytes())
-        synchronized = _sha256_path(target)
-        if synchronized != final_sha256:
-            raise RuntimeError("production strategy hash does not match the final Champion")
-    except Exception as exc:
-        record = _production_sync_record(
-            task, manager, state, status="failed", observed_sha256=_sha256_path(target),
-            error=str(exc), recovered=recovered,
-        )
-        _write_production_sync_record(manager, state, record)
-        manager.emit_event("production_sync_failed", message="production sync failed")
-        return
-    record = _production_sync_record(
-        task, manager, state, status="completed", observed_sha256=observed,
-        recovered=recovered,
-    )
-    _write_production_sync_record(manager, state, record)
-    manager.production_sync_champion_path.unlink(missing_ok=True)
-    manager.emit_event("production_sync_completed", message="production sync completed")
-
-
-def _recover_unresolved_production_sync(
-    task: ResearchTask,
-    manager: ResearchWorkspace,
-) -> Path | None:
-    run_numbers = manager.run_numbers()
-    if run_numbers:
-        run = manager.for_run(run_numbers[-1])
-        try:
-            state = json.loads(run.loop_state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if state.get("schema_version") not in {6, 7} or state.get("production_sync_status") not in {
-            "pending",
-            "conflict",
-            "failed",
-        }:
-            return None
-        if not isinstance(state.get("final_champion_sha256"), str):
-            return None
-        record: dict[str, Any] = {}
-        if run.production_sync_path.is_file():
-            try:
-                loaded = json.loads(run.production_sync_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                loaded = {}
-            if isinstance(loaded, dict):
-                record = loaded
-        if (
-            record.get("task_id") != task.task_id
-            or record.get("strategy_path") != task.strategy_path
-        ):
-            state["production_sync_status"] = "failed"
-            state["production_sync_error"] = (
-                "task contract changed before production synchronization recovery"
-            )
-            _save(run.loop_state_path, state)
-            return run.loop_state_path
-        _synchronize_production_strategy(task, run, state, recovered=True)
-        run.cleanup_transient(remove_development_cache=True)
-        return run.loop_state_path
-    return None
 
 
 def _applied_round_decision(
@@ -497,32 +137,6 @@ def _adopt_legacy_runner_round(
     return canonical_round if canonical_round.is_dir() else None
 
 
-def _record_decision(state: dict[str, Any], round_id: str, decision: str) -> None:
-    round_ids = state.get("round_ids")
-    if not isinstance(round_ids, list):
-        round_ids = []
-        state["round_ids"] = round_ids
-    completed = int(state["rounds_completed"])
-    counted = int(state["accepted"]) + int(state["rejected"]) + int(state["failed"])
-    if completed != len(round_ids) or counted != completed:
-        raise RuntimeError("research loop round counters are inconsistent")
-    if round_id in round_ids:
-        raise RuntimeError(f"round decision was already recorded: {round_id}")
-    round_ids.append(round_id)
-    state["rounds_completed"] = completed + 1
-    state["last_round"] = round_id
-    state["current_round"] = None
-    if decision == "accepted":
-        state["accepted"] = int(state["accepted"]) + 1
-        state["consecutive_failures"] = 0
-    elif decision == "rejected":
-        state["rejected"] = int(state["rejected"]) + 1
-        state["consecutive_failures"] = 0
-    else:
-        state["failed"] = int(state["failed"]) + 1
-        state["consecutive_failures"] = int(state["consecutive_failures"]) + 1
-
-
 def _sync_guard_query_count(
     state: dict[str, Any], manager: ResearchWorkspace
 ) -> None:
@@ -534,23 +148,6 @@ def _sync_guard_query_count(
         for round_path in manager.rounds.iterdir()
         if round_path.is_dir()
     )
-
-
-def _stop_reason(
-    state: dict[str, Any],
-    task: ResearchTask,
-    champion_metrics: dict[str, Any] | None,
-) -> str | None:
-    budget = task.raw["budget"]
-    if target_reached(task, champion_metrics):
-        return "target_reached"
-    if int(state["rounds_completed"]) >= int(budget["max_rounds"]):
-        return "max_rounds"
-    if float(state["elapsed_seconds"]) >= float(budget["max_hours"]) * 3600:
-        return "max_hours"
-    if int(state["consecutive_failures"]) >= int(budget["max_consecutive_failures"]):
-        return "max_consecutive_failures"
-    return None
 
 
 def _save(path: Path, state: dict[str, Any]) -> None:
@@ -748,11 +345,11 @@ def run_loop(
     development_view_sha256 = str(
         development_manifest["development_view_sha256"]
     )
-    metrics_key = _metrics_key(task)
+    metrics_key_value = metrics_key(task)
     task_state = base_manager.load_state(task.strategy_path)
     base_manager.refresh_champion_metrics_status(
         task_state,
-        metrics_key,
+        metrics_key_value,
         task.evaluator_contract_paths,
         evaluator_contract_sha256=evaluator_contract_sha256,
         gate_runtime=evaluation_view,
@@ -1032,7 +629,7 @@ def run_loop(
         task_state = manager.load_state(task.strategy_path)
         manager.refresh_champion_metrics_status(
             task_state,
-            metrics_key,
+            metrics_key_value,
             task.evaluator_contract_paths,
         )
         champion_metrics = manager.valid_champion_metrics(task_state)

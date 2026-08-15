@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "quant-agent"
 version = "0.1.0"
-description = "Manual-first A-share ETF multi-factor research workflow."
+description = "Deterministic research loop for automated quantitative strategy R&D."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

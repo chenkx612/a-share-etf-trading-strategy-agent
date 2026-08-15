@@ -14,7 +14,7 @@ from quant_core.research.environment import (
     capture_evaluation_environment,
     persist_evaluation_environment,
 )
-from quant_core.research.runner import _decide, target_reached
+from quant_core.research.decision import decide as _decide, target_reached
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]

@@ -23,7 +23,7 @@ from quant_core.research.candidate_evaluator import (
 )
 from quant_core.research.contracts import ResearchTask
 from quant_core.research.periods import bind_persisted_periods
-from quant_core.research.workspace import write_json_atomic
+from quant_core.research.storage import write_json_atomic
 from quant_core.schedule import latest_schedule_boundary, schedule_boundaries
 
 

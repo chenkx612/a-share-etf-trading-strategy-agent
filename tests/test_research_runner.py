@@ -20,6 +20,7 @@ from quant_core.research import ResearchTask, run_once
 from quant_core.research.attempt import evaluate as evaluate_attempt
 from quant_core.research.attempt import record_learning
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
+from quant_core.research.decision import metrics_key as _metrics_key
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     CandidateBindPreflightError,
@@ -28,7 +29,6 @@ from quant_core.research.runner import (
     _docker_opencode_command,
     _development_finalization_reserve,
     _evaluation_command,
-    _metrics_key,
     _persist_resolved_periods,
     _load_research_history,
     _RoundClock,
@@ -377,7 +377,11 @@ def test_round_clock_emits_convergence_warnings_and_updates_phase(tmp_path: Path
     clock = _RoundClock(
         tmp_path / ".quant-research-round.json",
         901,
-        lambda event, **details: events.append((event, details["remaining_minutes"])),
+        lambda event, **details: (
+            events.append((event, details["remaining_minutes"]))
+            if event == "round_time_warning"
+            else None
+        ),
         {"round": "001"},
         lambda: current_time[0],
     )
@@ -397,6 +401,37 @@ def test_round_clock_emits_convergence_warnings_and_updates_phase(tmp_path: Path
         ("round_time_warning", 5),
         ("round_time_warning", 1),
     ]
+    clock.stop()
+
+
+def test_round_clock_emits_content_free_liveness_heartbeats(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    current_time = [0.0]
+    clock = _RoundClock(
+        tmp_path / ".quant-research-round.json",
+        600,
+        lambda event, **details: events.append((event, details)),
+        {"round": "003"},
+        lambda: current_time[0],
+        heartbeat_interval_seconds=60,
+    )
+
+    current_time[0] = 59.0
+    clock._write_status()
+    assert events == []
+    current_time[0] = 60.0
+    clock._write_status()
+
+    assert events == [(
+        "agent_heartbeat",
+        {
+            "sequence": 1,
+            "elapsed_seconds": 60.0,
+            "process_alive": True,
+            "message": "agent process remains active",
+            "round": "003",
+        },
+    )]
     clock.stop()
 
 

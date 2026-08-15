@@ -12,12 +12,12 @@ import pytest
 import quant_core.research.loop as research_loop
 from quant_core.research import run_loop
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.decision import metrics_key as _metrics_key
 from quant_core.research.environment import EvaluationEnvironment
 from quant_core.research.runner import (
     AgentContainerInfrastructureError,
     CandidateBindPreflightError,
     ParentFixedTestsError,
-    _metrics_key,
     run_parent_fixed_tests,
     run_managed_once,
 )

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -10,17 +9,35 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from quant_core.research.contracts import ExperimentResult, ResearchTask
+from quant_core.research.agent_errors import (
+    AgentContainerInfrastructureError,
+    CandidateBindPreflightError,
+    InfrastructureFailure,
+    container_infrastructure_error as _container_infrastructure_error,
+    infrastructure_failure as _infrastructure_failure,
+    opencode_runtime_sources as _opencode_runtime_sources,
+    redact_authentication_log as _redact_authentication_log,
+)
+from quant_core.research.agent_auth import (
+    configured_provider as _configured_provider,
+    opencode_auth_lock as _opencode_auth_lock,
+    recover_rotated_oauth as _recover_rotated_oauth_impl,
+    stage_opencode_runtime as _stage_opencode_runtime,
+)
+from quant_core.research.decision import (
+    constraint_rule as _constraint_rule,
+    decide as _decide,
+    metrics_key as _metrics_key,
+    target_reached,
+)
 from quant_core.research.environment import (
     EvaluationEnvironment,
     capture_evaluation_environment,
@@ -38,9 +55,10 @@ from quant_core.research.workspace import (
     remove_runtime_inputs,
     runtime_inputs_sha256,
     validate_development_view,
-    write_json_atomic,
     workspace_python_env,
 )
+from quant_core.research.storage import write_json_atomic
+from quant_core.research.round_clock import RoundClock as _RoundClock
 
 
 CommandRunner = Callable[[Sequence[str], Path, Path, int], int]
@@ -71,24 +89,6 @@ _NO_TOOL_PERMISSIONS = {
 }
 
 
-class AgentContainerInfrastructureError(RuntimeError):
-    """Raised when the isolated Agent container cannot be started safely."""
-
-    def __init__(self, message: str, code: str = "agent_container_preflight_failed") -> None:
-        super().__init__(message)
-        self.code = code
-        self.failure_kind = "infrastructure"
-        self.failure_code = code
-
-
-class CandidateBindPreflightError(AgentContainerInfrastructureError):
-    """Raised before a Round is allocated when Docker cannot see its worktree."""
-
-    def __init__(self, message: str, code: str, evidence_path: Path) -> None:
-        super().__init__(message, code)
-        self.evidence_path = evidence_path
-
-
 class ParentFixedTestsError(RuntimeError):
     """Raised when the immutable Parent cannot satisfy the fixed test contract."""
 
@@ -107,110 +107,6 @@ def _development_finalization_reserve(round_timeout: int) -> int:
         _DEVELOPMENT_FINALIZATION_RESERVE_SECONDS,
         max(1, round_timeout // 4),
     )
-
-
-@dataclass(frozen=True)
-class InfrastructureFailure:
-    code: str
-    message: str
-
-
-@dataclass
-class _RoundClock:
-    path: Path
-    timeout_seconds: int
-    event_sink: EventSink | None
-    event_details: Mapping[str, Any]
-    monotonic: Callable[[], float] = time.monotonic
-
-    def __post_init__(self) -> None:
-        self.started_at = datetime.now(timezone.utc)
-        self.deadline = self.started_at + timedelta(seconds=self.timeout_seconds)
-        self._started_monotonic = self.monotonic()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._warnings_emitted: set[int] = set()
-
-    @property
-    def deadline_text(self) -> str:
-        return self.deadline.isoformat()
-
-    @property
-    def deadline_monotonic(self) -> float:
-        return self._started_monotonic + self.timeout_seconds
-
-    def _remaining_seconds(self) -> int:
-        elapsed = max(0.0, self.monotonic() - self._started_monotonic)
-        return max(0, int(math.ceil(self.timeout_seconds - elapsed)))
-
-    @staticmethod
-    def _phase(remaining: int) -> str:
-        if remaining <= 60:
-            return "submit_now"
-        if remaining <= 5 * 60:
-            return "finalize"
-        if remaining <= 15 * 60:
-            return "converge"
-        return "research"
-
-    def _write_status(self) -> None:
-        remaining = self._remaining_seconds()
-        write_json_atomic(self.path, {
-            "schema_version": 1,
-            "started_at": self.started_at.isoformat(),
-            "deadline": self.deadline_text,
-            "timeout_seconds": self.timeout_seconds,
-            "remaining_seconds": remaining,
-            "phase": self._phase(remaining),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
-        for threshold in (15, 5, 1):
-            if (
-                threshold not in self._warnings_emitted
-                and self.timeout_seconds > threshold * 60
-                and remaining <= threshold * 60
-            ):
-                self._warnings_emitted.add(threshold)
-                _emit(
-                    self.event_sink,
-                    "round_time_warning",
-                    remaining_minutes=threshold,
-                    message=f"{threshold} minutes remaining",
-                    **self.event_details,
-                )
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            self._write_status()
-            remaining = self._remaining_seconds()
-            if remaining == 0:
-                return
-            self._stop.wait(min(5.0, float(remaining)))
-
-    def start(self) -> None:
-        self._write_status()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="quant-research-round-clock",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self, finished_monotonic: float | None = None) -> dict[str, Any]:
-        finished = self.monotonic() if finished_monotonic is None else finished_monotonic
-        duration = max(0.0, finished - self._started_monotonic)
-        finished_at = datetime.now(timezone.utc).isoformat()
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1)
-        self.path.unlink(missing_ok=True)
-        return {
-            "started_at": self.started_at.isoformat(),
-            "deadline": self.deadline_text,
-            "finished_at": finished_at,
-            "timeout_seconds": self.timeout_seconds,
-            "duration_seconds": duration,
-        }
 
 
 def _emit(event_sink: EventSink | None, event: str, **details: Any) -> None:
@@ -369,162 +265,6 @@ def _candidate_evaluator_facade() -> str:
     )
 
 
-def _opencode_runtime_sources() -> tuple[tuple[Path, Path], ...]:
-    return (
-        (
-            Path(
-                os.environ.get(
-                    "QUANT_OPENCODE_AUTH_FILE",
-                    Path.home() / ".local" / "share" / "opencode" / "auth.json",
-                )
-            ).expanduser(),
-            Path(".local/share/opencode/auth.json"),
-        ),
-        (
-            Path(
-                os.environ.get(
-                    "QUANT_OPENCODE_CONFIG_FILE",
-                    Path.home() / ".config" / "opencode" / "opencode.jsonc",
-                )
-            ).expanduser(),
-            Path(".config/opencode/opencode.jsonc"),
-        ),
-        (
-            Path(
-                os.environ.get(
-                    "QUANT_OPENCODE_MODELS_FILE",
-                    Path.home() / ".cache" / "opencode" / "models.json",
-                )
-            ).expanduser(),
-            Path(".cache/opencode/models.json"),
-        ),
-    )
-
-
-def _stage_opencode_runtime(runtime_home: Path) -> None:
-    for source, relative in _opencode_runtime_sources():
-        if not source.is_file():
-            continue
-        destination = runtime_home / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
-        destination.chmod(0o600)
-
-
-_OAUTH_ACCESS_FIELDS = ("access", "access_token")
-_OAUTH_REFRESH_FIELDS = ("refresh", "refresh_token")
-_OAUTH_EXPIRY_FIELDS = ("expires", "expiry", "expires_at")
-_OAUTH_MUTABLE_FIELDS = frozenset(
-    (*_OAUTH_ACCESS_FIELDS, *_OAUTH_REFRESH_FIELDS, *_OAUTH_EXPIRY_FIELDS)
-)
-_AUTH_RECOVERY_TIMEOUT = 60
-
-
-def _read_auth_payload(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("OpenCode authentication file must contain a JSON object")
-    return payload
-
-
-def _oauth_provider_auth(
-    payload: Mapping[str, Any],
-    provider: str | None,
-) -> dict[str, Any] | None:
-    if provider is None:
-        return None
-    value = payload.get(provider)
-    if not isinstance(value, dict) or value.get("type") != "oauth":
-        return None
-    if not any(field in value for field in _OAUTH_REFRESH_FIELDS):
-        return None
-    return dict(value)
-
-
-def _validated_rotated_provider_auth(
-    original: Mapping[str, Any],
-    candidate: Any,
-) -> dict[str, Any]:
-    if not isinstance(candidate, dict) or candidate.get("type") != original.get("type"):
-        raise ValueError("OpenCode OAuth credential type changed")
-    unexpected = set(candidate) - set(original) - _OAUTH_MUTABLE_FIELDS
-    if unexpected:
-        raise ValueError("OpenCode OAuth credential contains unexpected fields")
-    for key, value in original.items():
-        if key not in _OAUTH_MUTABLE_FIELDS and candidate.get(key) != value:
-            raise ValueError("OpenCode OAuth credential identity fields changed")
-    for fields, label in (
-        (_OAUTH_ACCESS_FIELDS, "access token"),
-        (_OAUTH_REFRESH_FIELDS, "refresh token"),
-    ):
-        present = [field for field in fields if field in original or field in candidate]
-        if not present or not any(
-            isinstance(candidate.get(field), str) and bool(candidate[field])
-            for field in present
-        ):
-            raise ValueError(f"OpenCode OAuth credential is missing its {label}")
-    for field in _OAUTH_EXPIRY_FIELDS:
-        if field not in candidate:
-            continue
-        value = candidate[field]
-        if (
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math.isfinite(float(value))
-            or float(value) <= 0
-        ):
-            raise ValueError("OpenCode OAuth credential has an invalid expiry")
-    return dict(candidate)
-
-
-def _write_auth_payload_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(0o600)
-        os.replace(temporary, path)
-        try:
-            directory = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _authentication_probe_command(
-    command: Sequence[str],
-    workspace: Path,
-) -> list[str]:
-    try:
-        model = command[command.index("--model") + 1]
-    except (ValueError, IndexError) as exc:
-        raise ValueError("OpenCode OAuth session is missing its configured model") from exc
-    probe = [
-        "opencode", "run", "--pure", "--format", "json",
-        "--model", model, "--dir", str(workspace),
-    ]
-    try:
-        variant = command[command.index("--variant") + 1]
-    except (ValueError, IndexError):
-        pass
-    else:
-        probe.extend(["--variant", variant])
-    return probe
-
-
 def _recover_rotated_oauth(
     host_auth: Path | None,
     original_auth: bytes | None,
@@ -533,139 +273,16 @@ def _recover_rotated_oauth(
     command: Sequence[str],
     temporary_root: Path,
 ) -> tuple[InfrastructureFailure | None, list[Any]]:
-    snapshots: list[Any] = []
-    if host_auth is None or original_auth is None or provider is None:
-        return None, snapshots
-    try:
-        original_payload = json.loads(original_auth)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None, snapshots
-    if not isinstance(original_payload, dict):
-        return None, snapshots
-    snapshots.append(original_payload)
-    original_provider = _oauth_provider_auth(original_payload, provider)
-    if original_provider is None:
-        return None, snapshots
-    runtime_auth = runtime_home / ".local/share/opencode/auth.json"
-    try:
-        runtime_payload = _read_auth_payload(runtime_auth)
-        snapshots.append(runtime_payload)
-        rotated_provider = _validated_rotated_provider_auth(
-            original_provider,
-            runtime_payload.get(provider),
-        )
-    except (OSError, ValueError, json.JSONDecodeError):
-        return InfrastructureFailure(
-            "provider_authentication_state",
-            "Provider authentication state produced by OpenCode is invalid; re-authenticate before retrying",
-        ), snapshots
-    if rotated_provider == original_provider:
-        return None, snapshots
-
-    validation_home = temporary_root / "validation-home"
-    validation_workspace = temporary_root / "validation-workspace"
-    validation_home.mkdir(mode=0o700)
-    validation_workspace.mkdir()
-    _stage_opencode_runtime(validation_home)
-    validation_auth = validation_home / ".local/share/opencode/auth.json"
-    try:
-        validation_payload = _read_auth_payload(validation_auth)
-    except (OSError, ValueError, json.JSONDecodeError):
-        validation_payload = dict(original_payload)
-    validation_payload[provider] = rotated_provider
-    _write_auth_payload_atomic(validation_auth, validation_payload)
-    validation_log = temporary_root / "credential-validation.jsonl"
-    probe_command = _authentication_probe_command(command, validation_workspace)
-    probe_exit = _run_prompt_process(
-        probe_command,
-        "Reply exactly OK. Do not use tools.",
-        validation_workspace,
-        validation_log,
-        _AUTH_RECOVERY_TIMEOUT,
-        {
-            "HOME": str(validation_home),
-            "OPENCODE_PERMISSION": json.dumps(dict(_NO_TOOL_PERMISSIONS)),
-        },
+    return _recover_rotated_oauth_impl(
+        host_auth,
+        original_auth,
+        runtime_home,
+        provider,
+        command,
+        temporary_root,
+        prompt_runner=_run_prompt_process,
+        no_tool_permissions=_NO_TOOL_PERMISSIONS,
     )
-    try:
-        verified_payload = _read_auth_payload(validation_auth)
-        snapshots.append(verified_payload)
-        verified_provider = _validated_rotated_provider_auth(
-            original_provider,
-            verified_payload.get(provider),
-        )
-    except (OSError, ValueError, json.JSONDecodeError):
-        return InfrastructureFailure(
-            "provider_authentication_state",
-            "Provider authentication validation produced invalid state; re-authenticate before retrying",
-        ), snapshots
-    probe_failure = (
-        InfrastructureFailure(
-            "provider_authentication",
-            "Provider authentication failed during rotated credential validation; re-authenticate before retrying",
-        )
-        if probe_exit != 0
-        else None
-    )
-    if probe_failure is not None and verified_provider == rotated_provider:
-        return probe_failure, snapshots
-
-    try:
-        current_payload = _read_auth_payload(host_auth)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return InfrastructureFailure(
-            "provider_authentication_state",
-            "Provider authentication file changed or became invalid during the session",
-        ), snapshots
-    if current_payload.get(provider) != original_payload.get(provider):
-        return InfrastructureFailure(
-            "provider_authentication_state",
-            "Provider authentication state changed concurrently; refusing to overwrite it",
-        ), snapshots
-    current_payload[provider] = verified_provider
-    try:
-        _write_auth_payload_atomic(host_auth, current_payload)
-    except OSError:
-        return InfrastructureFailure(
-            "provider_authentication_state",
-            "Provider authentication state could not be persisted safely",
-        ), snapshots
-    snapshots.append(current_payload)
-    return probe_failure, snapshots
-
-
-def _configured_provider(command: Sequence[str]) -> str | None:
-    try:
-        model = command[command.index("--model") + 1]
-    except (ValueError, IndexError):
-        return None
-    provider, separator, _ = model.partition("/")
-    return provider if separator and provider else None
-
-
-@contextmanager
-def _opencode_auth_lock(provider: str | None, timeout: float):
-    auth_path = _opencode_runtime_sources()[0][0]
-    if provider is None or not auth_path.is_file():
-        yield None
-        return
-    lock_path = auth_path.with_name(f"{auth_path.name}.quant-research.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock:
-        lock_path.chmod(0o600)
-        started = time.monotonic()
-        while True:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() - started >= timeout:
-                    raise ValueError("OpenCode credential lock timed out")
-                time.sleep(0.1)
-        try:
-            yield auth_path
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _docker_opencode_command(
@@ -1179,101 +796,6 @@ def _run_opencode_container(
         return 127
 
 
-def _infrastructure_failure(log_path: Path) -> InfrastructureFailure | None:
-    try:
-        detail = log_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    folded = detail.casefold()
-    if "argument list too long" in folded or "e2big" in folded:
-        return InfrastructureFailure(
-            "invocation_argument_too_long",
-            "Local process invocation exceeded the operating system argument limit",
-        )
-    authentication_markers = (
-        "invalid_grant",
-        "token refresh failed",
-        "refresh token has been revoked",
-        "refresh token is revoked",
-        "refresh token has expired",
-        "provider authentication failed",
-    )
-    if any(marker in folded for marker in authentication_markers):
-        return InfrastructureFailure(
-            "provider_authentication",
-            "Provider authentication failed; re-authenticate before retrying",
-        )
-    if (
-        "opencode credential lock timed out" in folded
-        or "provider authentication state" in folded
-    ):
-        return InfrastructureFailure(
-            "provider_authentication_state",
-            "Provider authentication state could not be updated safely",
-        )
-    container_markers = (
-        "docker: Error response from daemon",
-        "Cannot connect to the Docker daemon",
-        "failed to connect to the docker API",
-        "invalid mount config for type",
-        "OCI runtime create failed",
-        "Unable to find image",
-        "pull access denied",
-        "No such image",
-        "Failed to remove Agent container",
-    )
-    if not any(marker.casefold() in folded for marker in container_markers):
-        return None
-    compact = " ".join(detail.split())
-    return InfrastructureFailure("container_runtime", compact[:2000])
-
-
-def _container_infrastructure_error(log_path: Path) -> str | None:
-    failure = _infrastructure_failure(log_path)
-    return failure.message if failure is not None else None
-
-
-def _redact_authentication_log(
-    log_path: Path,
-    additional_payloads: Sequence[Any] = (),
-) -> None:
-    auth_path = _opencode_runtime_sources()[0][0]
-    try:
-        detail = log_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    payloads = list(additional_payloads)
-    try:
-        payloads.append(json.loads(auth_path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        pass
-    secrets: set[str] = set()
-    secret_fields = {
-        "access", "access_token", "apikey", "api_key", "key",
-        "refresh", "refresh_token", "secret", "token",
-    }
-
-    def collect(value: Any, field: str | None = None) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                collect(child, str(key).casefold())
-        elif isinstance(value, list):
-            for child in value:
-                collect(child, field)
-        elif field in secret_fields and isinstance(value, str) and value:
-            secrets.add(value)
-
-    for payload in payloads:
-        collect(payload)
-    redacted = detail
-    for secret in sorted(secrets, key=len, reverse=True):
-        redacted = redacted.replace(secret, "[REDACTED]")
-    if redacted != detail:
-        temporary = log_path.with_suffix(log_path.suffix + ".tmp")
-        temporary.write_text(redacted, encoding="utf-8")
-        os.replace(temporary, log_path)
-
-
 def preflight_agent_container(
     task: ResearchTask,
     research_root: Path,
@@ -1317,7 +839,7 @@ def preflight_agent_container(
             for source, relative in _opencode_runtime_sources()
             if source.is_file()
         ]
-        configured_model = str(task.raw["opencode"]["model"])
+        configured_model = str(task.agent["model"])
         provider = configured_model.partition("/")[0]
         script = "\n".join([
             "import hashlib",
@@ -1496,7 +1018,7 @@ def preflight_provider_authentication(
         workspace = root / "workspace"
         workspace.mkdir()
         events_path = root / "events.jsonl"
-        opencode = task.raw["opencode"]
+        opencode = task.agent
         command = [
             "opencode", "run", "--pure", "--format", "json",
             "--model", str(opencode["model"]), "--dir", str(workspace),
@@ -1544,7 +1066,7 @@ def _run_opencode_read_only(
     )
 
 
-def _run_opencode_report_read_only(
+def run_report_agent_read_only(
     command: Sequence[str],
     prompt: str,
     cwd: Path,
@@ -1570,6 +1092,11 @@ def _run_opencode_report_read_only(
         read_only_paths=frozen_inputs,
         permissions=_NO_TOOL_PERMISSIONS,
     )
+
+
+# Compatibility for existing injected tests and external callers of the former
+# private helper. New code should use ``run_report_agent_read_only``.
+_run_opencode_report_read_only = run_report_agent_read_only
 
 
 def _snapshot(root: Path, excluded: Path) -> dict[str, str]:
@@ -1684,7 +1211,7 @@ def _agent_read_only_paths(
 def _values(task: ResearchTask, period: dict[str, str], run_id: str, workspace: Path) -> dict[str, str]:
     values = {
         "python": sys.executable,
-        "universe": str(task.raw["data"]["universe"]),
+        "universe": task.universe_path,
         "workspace": str(workspace),
         "start": period["start"],
         "end": period["end"],
@@ -1711,7 +1238,7 @@ def _parent_test_contract(task: ResearchTask) -> dict[str, Any]:
     """Describe command expansion without requiring every placeholder to exist."""
     values = {
         "python": sys.executable,
-        "universe": str(task.raw["data"]["universe"]),
+        "universe": task.universe_path,
         "workspace": "<evaluation-workspace>",
         "start": task.evaluation_periods["development"]["start"],
         "end": task.evaluation_periods["development"]["end"],
@@ -1894,7 +1421,7 @@ def _evaluation_command(
     resolved_periods_path: Path | None = None,
 ) -> list[str]:
     if task.evaluation_mode == "fixed":
-        return _format_command(task.raw["commands"]["backtest"], values)
+        return _format_command(task.commands["backtest"], values)
     command = [
         sys.executable, "-m", "quant_core.research.evaluator",
         "--root", values["workspace"], "--universe", values["universe"],
@@ -1933,10 +1460,6 @@ def _persist_resolved_periods(
     else:
         write_json_atomic(path, payload)
     return path
-
-
-def _constraint_rule(constraint: Mapping[str, Any]) -> tuple[str, float]:
-    return str(constraint["operator"]), float(constraint["threshold"])
 
 
 def _constraint_descriptions(constraints: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2951,147 +2474,6 @@ def _evaluate_existing(
     return metrics
 
 
-def _constraint_passes(value: Any, constraint: Mapping[str, Any]) -> bool:
-    if not _is_finite_number(value):
-        return False
-    operator, threshold = _constraint_rule(constraint)
-    if operator == ">=":
-        return float(value) >= threshold
-    if operator == "abs<=":
-        return abs(float(value)) <= threshold
-    return float(value) <= threshold
-
-
-def _is_finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-    )
-
-
-def _walk_forward_gate_is_feasible(
-    task: ResearchTask,
-    metrics: Mapping[str, Any] | None,
-) -> bool:
-    if task.evaluation_mode != "walk_forward":
-        return True
-    if not isinstance(metrics, Mapping):
-        return False
-    gate = metrics.get("gate")
-    if not isinstance(gate, Mapping):
-        return False
-    no_feasible_folds = gate.get("no_feasible_parameter_folds")
-    return (
-        isinstance(no_feasible_folds, int)
-        and not isinstance(no_feasible_folds, bool)
-        and no_feasible_folds == 0
-    )
-
-
-def target_reached(task: ResearchTask, metrics: Mapping[str, Any] | None) -> bool:
-    target = task.raw["evaluation"].get("target")
-    if not isinstance(target, dict) or not isinstance(metrics, Mapping):
-        return False
-    if not _walk_forward_gate_is_feasible(task, metrics):
-        return False
-    gate = metrics.get("gate")
-    if task.evaluation_mode == "walk_forward" and isinstance(gate, Mapping):
-        gate = gate.get("aggregate")
-    if not isinstance(gate, Mapping):
-        return False
-    objective = gate.get(task.objective)
-    threshold = target["objective_at_least"]
-    if not _is_finite_number(objective):
-        return False
-    return float(objective) >= float(threshold) and all(
-        _constraint_passes(gate.get(name), constraint)
-        for name, constraint in task.constraints.items()
-    )
-
-
-def _decide(
-    task: ResearchTask,
-    champion: Mapping[str, Any] | None,
-    candidate: Mapping[str, Any],
-) -> dict[str, Any]:
-    evaluation = task.raw["evaluation"]
-    objective = task.objective
-
-    def gate_metrics(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-        if not isinstance(value, Mapping):
-            return {}
-        gate = value.get("gate", {})
-        if task.evaluation_mode == "walk_forward" and isinstance(gate, Mapping):
-            gate = gate.get("aggregate", {})
-        return gate if isinstance(gate, Mapping) else {}
-    champion_gate, candidate_gate = gate_metrics(champion), gate_metrics(candidate)
-    champion_gate_is_feasible = _walk_forward_gate_is_feasible(task, champion)
-    candidate_gate_is_feasible = _walk_forward_gate_is_feasible(task, candidate)
-    champion_value = champion_gate.get(objective) if champion is not None else None
-    candidate_value = candidate_gate.get(objective)
-    champion_constraints_passed = (
-        champion is not None
-        and champion_gate_is_feasible
-        and all(
-            _constraint_passes(champion_gate.get(name), constraint)
-            for name, constraint in task.constraints.items()
-        )
-    )
-    champion_objective_is_finite = _is_finite_number(champion_value)
-    acceptance = evaluation.get("acceptance", {})
-    minimum_improvement = float(acceptance.get("minimum_improvement", 0.0))
-    constraints: dict[str, Any] = {}
-    constraints_passed = True
-    for name, constraint in task.constraints.items():
-        actual = candidate_gate.get(name)
-        operator, threshold = _constraint_rule(constraint)
-        passed = _constraint_passes(actual, constraint)
-        constraints[name] = {
-            "operator": operator,
-            "threshold": threshold,
-            "actual": actual,
-            "passed": passed,
-        }
-        constraints_passed = constraints_passed and passed
-    candidate_objective_is_finite = _is_finite_number(candidate_value)
-    relative_improvement_required = (
-        champion is not None
-        and champion_constraints_passed
-        and champion_objective_is_finite
-    )
-    objective_passed = candidate_objective_is_finite if not relative_improvement_required else (
-        candidate_objective_is_finite
-        and float(candidate_value) >= float(champion_value) + minimum_improvement
-        and (minimum_improvement > 0 or float(candidate_value) > float(champion_value))
-    )
-    accepted = candidate_gate_is_feasible and constraints_passed and objective_passed
-    reasons: list[str] = []
-    if not candidate_gate_is_feasible:
-        reasons.append("gate has folds with no feasible parameters")
-    if not constraints_passed:
-        reasons.append("gate constraints failed")
-    if not objective_passed and not relative_improvement_required:
-        reasons.append("gate objective is not finite")
-    elif not objective_passed:
-        reasons.append("gate objective did not improve over champion")
-    return {
-        "decision": "accepted" if accepted else "rejected",
-        "objective": {
-            "name": objective,
-            "champion": champion_value,
-            "candidate": candidate_value,
-            "minimum_improvement": minimum_improvement,
-            "champion_constraints_passed": (
-                champion_constraints_passed if champion is not None else None
-            ),
-            "relative_improvement_required": relative_improvement_required,
-        },
-        "constraints": constraints,
-        "reasons": reasons,
-    }
-
-
 class GuardEvaluationError(RuntimeError):
     pass
 
@@ -3101,7 +2483,7 @@ def _guard_input_fingerprints(
     workspace: Path,
     runtime: Path,
 ) -> dict[str, str]:
-    universe_path = Path(str(task.raw["data"]["universe"]))
+    universe_path = Path(task.universe_path)
     if not universe_path.is_absolute():
         universe_path = workspace / universe_path
     if not universe_path.is_file():
@@ -3177,7 +2559,7 @@ def _evaluate_guard(
             raise GuardEvaluationError("Guard metrics are invalid")
         gate_strategy = metric_annual_return(gate_metrics)
         guard_strategy = metric_annual_return(guard_metrics)
-        universe_path = Path(str(task.raw["data"]["universe"]))
+        universe_path = Path(task.universe_path)
         if not universe_path.is_absolute():
             universe_path = workspace / universe_path
         gate_benchmark = universe_equal_weight_annual_return(
@@ -3257,36 +2639,6 @@ def _evaluate_guard(
         })
         _emit(event_sink, "guard_failed", round=round_id, message="guard evaluation failed")
         raise exc
-
-
-def _metrics_key(task: ResearchTask) -> str:
-    periods = dict(task.evaluation_periods)
-    if task.evaluation_mode == "walk_forward":
-        assert task.parameter_selection is not None
-        periods = {
-            key: task.parameter_selection[key]
-            for key in ("train_months", "max_parameter_sets", "schedule")
-        } | periods
-    relevant = {
-        "strategy": {
-            "name": task.strategy_name,
-            "module": task.strategy_module,
-        },
-        "data": task.raw["data"],
-        "commands": {
-            **task.raw["commands"],
-            "test_prefix": [sys.executable, "-m", "pytest", "-q"],
-            "metrics_path": task.metrics_path_template,
-        },
-        "evaluation": {
-            "mode": task.evaluation_mode,
-            "objective": task.objective,
-            "constraints": task.constraints,
-            "periods": periods,
-        },
-    }
-    encoded = json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _fail_candidate_evidence(
@@ -3511,7 +2863,7 @@ def run_managed_once(
         candidate_patch_sha256 = manager.write_candidate_patch(
             candidate,
             state,
-            task.raw["scope"]["editable"],
+            task.editable_paths,
             candidate_patch,
             str(result["submission"]["strategy_sha256"]),
         )
@@ -3671,7 +3023,7 @@ def run_managed_once(
             state,
             record_id,
             result["metrics"],
-            task.raw["scope"]["editable"],
+            task.editable_paths,
             metrics_key,
             task.evaluator_contract_paths,
             evaluator_contract_sha256,

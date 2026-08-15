@@ -60,7 +60,7 @@ def resolve_relative_periods(
     if config is None:
         return task
 
-    universe_path = Path(str(task.raw["data"]["universe"]))
+    universe_path = Path(task.universe_path)
     if not universe_path.is_absolute():
         universe_path = source / universe_path
     universe = load_universe(universe_path)

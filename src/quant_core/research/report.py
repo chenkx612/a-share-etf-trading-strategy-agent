@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.agent_errors import (
+    AgentContainerInfrastructureError,
+    infrastructure_failure as _infrastructure_failure,
+    redact_authentication_log as _redact_authentication_log,
+)
+from quant_core.research.decision import metrics_key
 from quant_core.research.periods import bind_persisted_periods
 from quant_core.research.environment import (
     EvaluationEnvironment,
@@ -18,18 +24,15 @@ from quant_core.research.environment import (
     persist_evaluation_environment,
 )
 from quant_core.research.runner import (
-    AgentContainerInfrastructureError,
-    _metrics_key,
-    _infrastructure_failure,
-    _redact_authentication_log,
-    _run_opencode_report_read_only,
     preflight_provider_authentication,
+    run_report_agent_read_only,
 )
 from quant_core.research.report_facts import (
     build_report_facts,
     validate_report_facts,
 )
-from quant_core.research.workspace import ResearchWorkspace, write_json_atomic
+from quant_core.research.storage import write_json_atomic
+from quant_core.research.workspace import ResearchWorkspace
 
 
 ReportAgentRunner = Callable[[Sequence[str], str, Path, Path, int], int]
@@ -369,7 +372,7 @@ def generate_loop_report(
     manager: ResearchWorkspace,
     loop_state: Mapping[str, Any],
     *,
-    agent_runner: ReportAgentRunner = _run_opencode_report_read_only,
+    agent_runner: ReportAgentRunner = run_report_agent_read_only,
 ) -> Path:
     task = ResearchTask.load(task_path)
     if task.relative_period_config is not None:
@@ -394,7 +397,7 @@ def generate_loop_report(
     else:
         manager.refresh_champion_metrics_status(
             task_state,
-            _metrics_key(task),
+            metrics_key(task),
             task.evaluator_contract_paths,
         )
     round_ids = _loop_round_ids(manager.rounds, loop_state)
@@ -433,12 +436,12 @@ def generate_loop_report(
     payload = {
         "task": {
             "id": task.task_id,
-            "goal": task.raw["goal"],
+            "goal": task.goal,
             "strategy": task.raw.get("strategy"),
             "objective": task.objective,
             "constraints": task.constraints,
             "minimum_improvement": (
-                task.raw["evaluation"].get("acceptance", {}).get("minimum_improvement", 0.0)
+                task.acceptance.get("minimum_improvement", 0.0)
             ),
             "minimum_improvement_mode": "absolute_objective_points",
             "development_period": task.development_period,
@@ -558,7 +561,7 @@ def generate_loop_report(
             "Report facts attachment path exceeds the safe process argument budget",
             "invocation_argument_too_long",
         )
-    opencode = task.raw["opencode"]
+    opencode = task.agent
     command = [
         "opencode", "run", "--auto", "--format", "json",
         "--file", report_input_container_path,
@@ -570,7 +573,7 @@ def generate_loop_report(
     timeout = min(task.command_timeout_minutes * 60, 600)
     events_path = manager.run_temp / "report-events.jsonl"
     events_path.parent.mkdir(parents=True, exist_ok=True)
-    if agent_runner is _run_opencode_report_read_only:
+    if agent_runner is run_report_agent_read_only:
         try:
             preflight_provider_authentication(task, manager.research_root)
         except AgentContainerInfrastructureError as exc:
@@ -616,7 +619,7 @@ def regenerate_loop_report(
     workspace: str | Path = ".",
     research_root: str | Path = ".research",
     run_number: int | None = None,
-    agent_runner: ReportAgentRunner = _run_opencode_report_read_only,
+    agent_runner: ReportAgentRunner = run_report_agent_read_only,
     evaluation_environment: EvaluationEnvironment | None = None,
 ) -> Path:
     task_file = Path(task_path).resolve()

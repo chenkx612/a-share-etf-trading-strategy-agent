@@ -176,7 +176,7 @@ def load_production_context(root: str | Path, task_path: str | Path) -> Producti
         else None,
     )
 
-    universe_path = root_path / str(task.raw["data"]["universe"])
+    universe_path = root_path / task.universe_path
     universe = load_universe(universe_path)
     if universe.empty or "symbol" not in universe or universe["symbol"].duplicated().any():
         raise ValueError("production universe must contain unique symbol rows")

@@ -15,10 +15,10 @@ import pytest
 import quant_core.research.workspace as workspace_module
 from quant_core.research.checkpoint import RUNTIME_DIR, submit
 from quant_core.research.contracts import ResearchTask
+from quant_core.research.decision import metrics_key as _metrics_key
 from quant_core.research.environment import EvaluationEnvironment
 from quant_core.research.runner import (
     ParentFixedTestsError,
-    _metrics_key,
     _run_opencode_container,
     run_managed_once,
     run_parent_fixed_tests,

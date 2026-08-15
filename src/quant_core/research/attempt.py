@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from quant_core.research.checkpoint import FrozenCheckpoint
-from quant_core.research.workspace import write_json_atomic
+from quant_core.research.storage import write_json_atomic
 
 
 CONTROL_FILE = ".quant-research-attempt.json"

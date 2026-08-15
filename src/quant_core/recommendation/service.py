@@ -39,7 +39,7 @@ from quant_core.recommendation.search import (
     _valid_freeze,
     search_parameters,
 )
-from quant_core.research.workspace import write_json_atomic
+from quant_core.research.storage import write_json_atomic
 from quant_core.schedule import latest_schedule_boundary
 
 def run_recommendation(

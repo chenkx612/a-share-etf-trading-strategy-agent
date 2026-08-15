@@ -3,27 +3,37 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
-
-_SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_GIT_IDENTITY = {
-    "GIT_AUTHOR_NAME": "Quant Research Harness",
-    "GIT_AUTHOR_EMAIL": "quant-research@example.invalid",
-    "GIT_COMMITTER_NAME": "Quant Research Harness",
-    "GIT_COMMITTER_EMAIL": "quant-research@example.invalid",
-}
+from quant_core.research.storage import (
+    file_sha256 as _file_sha256,
+    write_bytes_atomic as _write_bytes_atomic,
+    write_json_atomic,
+)
+from quant_core.research.git_utils import (
+    GIT_IDENTITY as _GIT_IDENTITY,
+    git as _git,
+    git_bytes as _git_bytes,
+    temporary_git_write_environment as _temporary_git_write_environment,
+)
+from quant_core.research.workspace_layout import WorkspaceLayout
+from quant_core.research.workspace_migrations import (
+    migrate_champion_layout,
+    migrate_legacy_loop,
+)
+from quant_core.research.workspace_promotion import (
+    promote_candidate,
+    recover_promotion,
+)
 
 
 def workspace_python_env(workspace: Path) -> dict[str, str]:
@@ -33,71 +43,6 @@ def workspace_python_env(workspace: Path) -> dict[str, str]:
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = source_root if not existing else os.pathsep.join((source_root, existing))
     return env
-
-
-def _git(
-    root: Path,
-    *args: str,
-    env: Mapping[str, str] | None = None,
-) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(root), *args],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env={**os.environ, **(env or {})},
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
-    return completed.stdout.strip()
-
-
-def _git_bytes(
-    root: Path,
-    *args: str,
-    env: Mapping[str, str] | None = None,
-) -> bytes:
-    completed = subprocess.run(
-        ["git", "-C", str(root), *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env={**os.environ, **(env or {})},
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.decode(errors="replace").strip()
-        if not detail:
-            detail = completed.stdout.decode(errors="replace").strip()
-        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
-    return completed.stdout
-
-
-@contextmanager
-def _temporary_git_write_environment(
-    root: Path,
-    *,
-    prefix: str,
-) -> Iterator[dict[str, str]]:
-    """Keep temporary index and object writes outside the source repository."""
-    common_dir = Path(_git(root, "rev-parse", "--git-common-dir"))
-    if not common_dir.is_absolute():
-        common_dir = (root / common_dir).resolve()
-    source_objects = common_dir / "objects"
-    with tempfile.TemporaryDirectory(prefix=prefix) as temporary:
-        temporary_root = Path(temporary)
-        object_directory = temporary_root / "objects"
-        object_directory.mkdir()
-        alternates = json.dumps(str(source_objects), ensure_ascii=False)
-        inherited_alternates = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        if inherited_alternates:
-            alternates = os.pathsep.join((alternates, inherited_alternates))
-        yield {
-            "GIT_INDEX_FILE": str(temporary_root / "index"),
-            "GIT_OBJECT_DIRECTORY": str(object_directory),
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates,
-        }
 
 
 _RUNTIME_ROOTS = (Path("data"), Path("outputs") / "factors")
@@ -466,208 +411,13 @@ def evaluator_contract_sha256_for_commit(
     return _evaluator_contract_digest(contract_paths, "\n".join(lines))
 
 
-def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def _write_bytes_atomic(path: Path, content: bytes) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(content)
-    os.replace(temporary, path)
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 @dataclass
-class ResearchWorkspace:
-    source: Path
-    research_root: Path
-    task_id: str
-    run_number: int | None = None
-    evaluation_environment_sha256: str | None = None
-    diagnostics_enabled: bool = False
-    evaluation_runtime_override: Path | None = None
-
+class ResearchWorkspace(WorkspaceLayout):
     def __post_init__(self) -> None:
-        self.source = self.source.resolve()
-        self.research_root = self.research_root.resolve()
-        if not _SAFE_TASK_ID.fullmatch(self.task_id):
-            raise ValueError("task.id may contain only letters, numbers, '.', '_' and '-'")
-        if self.run_number is not None and self.run_number < 1:
-            raise ValueError("run number must be positive")
-        if self.evaluation_environment_sha256 is not None and (
-            len(self.evaluation_environment_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.evaluation_environment_sha256
-            )
-        ):
-            raise ValueError("evaluation environment must be a SHA-256 digest")
+        super().__post_init__()
         repository = Path(_git(self.source, "rev-parse", "--show-toplevel")).resolve()
         if repository != self.source:
             raise ValueError("research workspace must be the Git repository root")
-        if self.research_root == self.source:
-            raise ValueError("research root must not be the source workspace")
-        if self.source not in self.research_root.parents and self.research_root in self.source.parents:
-            raise ValueError("research root must not contain the source workspace")
-
-    @property
-    def root(self) -> Path:
-        return self.research_root / self.task_id
-
-    @property
-    def state_path(self) -> Path:
-        return self.root / "champion.json"
-
-    @property
-    def legacy_state_path(self) -> Path:
-        return self.root / "state.json"
-
-    @property
-    def champion_path(self) -> Path:
-        return self.root / "champion.py"
-
-    @property
-    def champion_next_path(self) -> Path:
-        return self.root / ".tmp" / "champion.next.py"
-
-    @property
-    def runs(self) -> Path:
-        return self.root / "runs"
-
-    @property
-    def run_id(self) -> str:
-        if self.run_number is None:
-            raise RuntimeError("research workspace is not bound to a run")
-        return f"{self.run_number:03d}"
-
-    @property
-    def run_root(self) -> Path:
-        return self.runs / self.run_id
-
-    @property
-    def uses_legacy_run_layout(self) -> bool:
-        """Return whether an allocated Run uses the pre-schema-5 layout."""
-        return not (self.run_root / "artifacts").exists() and (
-            (self.run_root / "state.json").exists()
-            or (self.run_root / "rounds").exists()
-        )
-
-    @property
-    def run_artifacts_root(self) -> Path:
-        if self.uses_legacy_run_layout:
-            return self.run_root
-        return self.run_root / "artifacts"
-
-    @property
-    def run_contracts_root(self) -> Path:
-        if self.uses_legacy_run_layout:
-            return self.run_root
-        return self.run_artifacts_root / "contracts"
-
-    @property
-    def run_report_root(self) -> Path:
-        if self.uses_legacy_run_layout:
-            return self.run_root
-        return self.run_artifacts_root / "report"
-
-    @property
-    def loop_state_path(self) -> Path:
-        return self.run_artifacts_root / "state.json"
-
-    @property
-    def report_path(self) -> Path:
-        return self.run_root / "report.md"
-
-    @property
-    def report_facts_path(self) -> Path:
-        if self.uses_legacy_run_layout:
-            return self.run_root / "report-facts.json"
-        return self.run_report_root / "facts.json"
-
-    @property
-    def report_input_path(self) -> Path:
-        if self.uses_legacy_run_layout:
-            return self.run_root / "report-input.json"
-        return self.run_report_root / "input.json"
-
-    @property
-    def report_events_path(self) -> Path:
-        if self.uses_legacy_run_layout:
-            return self.run_root / "report-events.jsonl"
-        return self.run_report_root / "events.jsonl"
-
-    @property
-    def production_sync_path(self) -> Path:
-        return self.run_artifacts_root / "production-sync.json"
-
-    @property
-    def production_sync_champion_path(self) -> Path:
-        return self.run_artifacts_root / "production-sync-champion.py"
-
-    @property
-    def run_temp(self) -> Path:
-        return self.root / ".tmp" / "runs" / self.run_id
-
-    @property
-    def terminal_champion_path(self) -> Path:
-        return self.run_temp / "final-champion.py"
-
-    @property
-    def event_path(self) -> Path:
-        return self.run_temp / "events.jsonl"
-
-    @property
-    def diagnostics_root(self) -> Path:
-        if self.run_number is None:
-            raise RuntimeError("research workspace is not bound to a run")
-        if self.uses_legacy_run_layout:
-            return self.root / ".cache" / "diagnostics" / self.run_id
-        return self.run_artifacts_root / "diagnostics"
-
-    @property
-    def diagnostics_event_path(self) -> Path:
-        return self.diagnostics_root / "events.jsonl"
-
-    @property
-    def candidates(self) -> Path:
-        return self.root / ".tmp" / "worktrees" / self.run_id / "candidates"
-
-    @property
-    def evaluators(self) -> Path:
-        return self.root / ".tmp" / "worktrees" / self.run_id / "evaluators"
-
-    @property
-    def test_evaluators(self) -> Path:
-        return self.root / ".tmp" / "worktrees" / "tests"
-
-    @property
-    def rounds(self) -> Path:
-        return self.run_artifacts_root / "rounds"
-
-    @property
-    def legacy_experiments(self) -> Path:
-        return self.root / "experiments"
-
-    @property
-    def runtime(self) -> Path:
-        return self.root / ".cache" / "runtime"
-
-    @property
-    def development_views(self) -> Path:
-        return self.runtime / "development-views"
-
-    @property
-    def evaluation_views(self) -> Path:
-        return self.runtime / "evaluation-views"
 
     @property
     def development_runtime(self) -> Path:
@@ -679,26 +429,6 @@ class ResearchWorkspace:
         return self.development_views / (
             digest if isinstance(digest, str) else ".uninitialized"
         )
-
-    @property
-    def development_inputs_path(self) -> Path:
-        return self.run_contracts_root / "development-inputs.json"
-
-    @property
-    def evaluation_inputs_path(self) -> Path:
-        return self.run_contracts_root / "evaluation-inputs.json"
-
-    @property
-    def resolved_periods_path(self) -> Path:
-        return self.run_contracts_root / "resolved-periods.json"
-
-    @property
-    def preflight_failures_root(self) -> Path:
-        return self.run_artifacts_root / "preflight-failures"
-
-    @property
-    def run_diagnostics_root(self) -> Path:
-        return self.run_artifacts_root / "diagnostics"
 
     @property
     def evaluation_runtime(self) -> Path:
@@ -782,93 +512,7 @@ class ResearchWorkspace:
         )
 
     def migrate_legacy_loop(self) -> int | None:
-        legacy_loop_state = self.root / "loop-state.json"
-        if not legacy_loop_state.exists():
-            return None
-        state = json.loads(legacy_loop_state.read_text(encoding="utf-8"))
-        legacy_experiments = self.legacy_experiments
-        available = (
-            sorted(path.name for path in legacy_experiments.iterdir() if path.is_dir())
-            if legacy_experiments.exists()
-            else []
-        )
-        configured = state.get("round_ids", state.get("experiment_ids"))
-        if isinstance(configured, list):
-            selected = [item for item in configured if isinstance(item, str) and item in available]
-        else:
-            rounds = max(0, int(state.get("rounds_completed", 0)))
-            selected = available[-rounds:] if rounds else []
-        current = state.get("current_round", state.get("current_experiment_id"))
-        if isinstance(current, str) and current in available and current not in selected:
-            selected.append(current)
-
-        run_number = self.next_run_number()
-        bound = self.for_run(run_number)
-        # A migrated pre-Run Loop remains on its historical schema/layout.
-        (bound.run_root / "rounds").mkdir(parents=True, exist_ok=False)
-        mapping: dict[str, str] = {}
-        for index, legacy_id in enumerate(selected, start=1):
-            round_id = f"{index:03d}"
-            mapping[legacy_id] = round_id
-            destination = bound.rounds / round_id
-            shutil.move(str(legacy_experiments / legacy_id), str(destination))
-            for name in ("result.json", "decision.json"):
-                path = destination / name
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                payload["experiment_id"] = f"{bound.run_id}/{round_id}"
-                payload["run_number"] = run_number
-                payload["round_number"] = index
-                write_json_atomic(path, payload)
-
-        state["schema_version"] = 2
-        state["run_number"] = run_number
-        state["round_ids"] = [mapping[item] for item in selected if item in mapping]
-        current_value = state.get("current_round", state.get("current_experiment_id"))
-        last_value = state.get("last_round", state.get("last_experiment_id"))
-        state["current_round"] = (
-            mapping.get(current_value) if isinstance(current_value, str) else None
-        )
-        state["last_round"] = (
-            mapping.get(last_value) if isinstance(last_value, str) else None
-        )
-        for legacy_key in (
-            "experiment_ids",
-            "current_experiment_id",
-            "last_experiment_id",
-        ):
-            state.pop(legacy_key, None)
-        report_path = self.root / "loop-report.md"
-        if report_path.exists():
-            shutil.move(str(report_path), str(bound.report_path))
-            state["report_path"] = "report.md"
-        write_json_atomic(bound.loop_state_path, state)
-        if self.state_path.exists():
-            champion_state = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if isinstance(state.get("last_round"), str):
-                champion_state["last_round_id"] = f"{bound.run_id}/{state['last_round']}"
-            accepted_rounds: list[str] = []
-            for legacy_id, round_id in mapping.items():
-                decision_path = bound.rounds / round_id / "decision.json"
-                try:
-                    decision = json.loads(decision_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if decision.get("decision") == "accepted":
-                    accepted_rounds.append(round_id)
-            if accepted_rounds:
-                champion_state["champion_round_id"] = (
-                    f"{bound.run_id}/{accepted_rounds[-1]}"
-                )
-            write_json_atomic(self.state_path, champion_state)
-        legacy_loop_state.unlink()
-        try:
-            legacy_experiments.rmdir()
-        except OSError:
-            pass
-        return run_number
+        return migrate_legacy_loop(self)
 
     def _snapshot_commit(
         self,
@@ -1160,105 +804,7 @@ class ResearchWorkspace:
         return accepted
 
     def _migrate_champion_layout(self, strategy_path: str | None = None) -> None:
-        source = self.state_path if self.state_path.exists() else self.legacy_state_path
-        if not source.exists():
-            return
-        state = json.loads(source.read_text(encoding="utf-8"))
-        schema_version = state.get("schema_version")
-        if schema_version in {7, 8, 9} and source == self.state_path:
-            changed = False
-            if "last_experiment_id" in state and "last_round_id" not in state:
-                state["last_round_id"] = state.pop("last_experiment_id")
-                changed = True
-            if schema_version == 7:
-                state["schema_version"] = 9
-                state["champion_fixed_test_record"] = None
-                state["champion_guard_evidence_sha256"] = None
-                changed = True
-            if schema_version == 8:
-                state["schema_version"] = 9
-                state["champion_guard_evidence_sha256"] = None
-                changed = True
-            if "champion_guard_evidence_sha256" not in state:
-                state["champion_guard_evidence_sha256"] = None
-                changed = True
-            if changed:
-                write_json_atomic(self.state_path, state)
-            return
-        if schema_version not in {2, 3, 4, 5, 6}:
-            raise ValueError("research workspace uses an incompatible champion schema")
-        if schema_version in {4, 5} and isinstance(state.get("pending_promotion"), dict):
-            state = self._recover_promotion(state)
-        if schema_version in {5, 6}:
-            metrics_record = state.get("champion_metrics_record")
-            if isinstance(metrics_record, dict):
-                reasons = metrics_record.get("stale_reasons")
-                stale_reasons = list(reasons) if isinstance(reasons, list) else []
-                if schema_version == 5 and "legacy_missing_evaluation_environment" not in stale_reasons:
-                    stale_reasons.append("legacy_missing_evaluation_environment")
-                if schema_version == 6 and "legacy_missing_development_view" not in stale_reasons:
-                    stale_reasons.append("legacy_missing_development_view")
-                metrics_record["status"] = "stale"
-                metrics_record["stale_reasons"] = stale_reasons
-            state["schema_version"] = 9
-            state["champion_fixed_test_record"] = None
-            state["champion_guard_evidence_sha256"] = None
-            state["development_view_sha256"] = None
-            state["development_end"] = None
-            write_json_atomic(self.state_path, state)
-            if source != self.state_path:
-                source.unlink()
-            return
-        editable = self._strategy_path(state, strategy_path)
-        champion_commit = state.get("champion_commit")
-        champion_sha256 = (
-            str(state["champion_sha256"])
-            if isinstance(state.get("champion_sha256"), str)
-            else None
-        )
-        if champion_sha256 is None and isinstance(champion_commit, str):
-            if not self._extract_champion(champion_commit, editable):
-                raise ValueError("legacy Champion strategy cannot be read from its Git commit")
-            champion_sha256 = _file_sha256(self.champion_path)
-        legacy_metrics = state.get("champion_metrics")
-        metrics_record = None
-        if isinstance(legacy_metrics, dict):
-            metrics_record = {
-                "metrics": legacy_metrics,
-                "status": "stale",
-                "stale_reasons": ["legacy_missing_applicability"],
-                "evaluated_in_round": None,
-                "evaluated_at": state.get("updated_at"),
-                "applicability": None,
-            }
-        champion_round_id = state.get("champion_round_id")
-        if champion_round_id is None:
-            champion_round_id = self._latest_accepted_round()
-        migrated = {
-            "schema_version": 9,
-            "task_id": self.task_id,
-            "baseline_mode": state.get("baseline_mode", "workspace"),
-            "baseline_exclude": list(state.get("baseline_exclude", [])),
-            "strategy_path": editable,
-            "project_revision": _git(self.source, "rev-parse", "HEAD"),
-            "champion_number": int(state.get("champion_number", 0)),
-            "champion_sha256": champion_sha256,
-            "champion_round_id": champion_round_id,
-            "champion_metrics_record": metrics_record,
-            "champion_fixed_test_record": None,
-            "champion_guard_evidence_sha256": None,
-            "last_round_id": state.get(
-                "last_round_id",
-                state.get("last_experiment_id"),
-            ),
-            "pending_promotion": None,
-            "development_view_sha256": None,
-            "development_end": state.get("development_end"),
-            "updated_at": state.get("updated_at"),
-        }
-        write_json_atomic(self.state_path, migrated)
-        if source != self.state_path:
-            source.unlink()
+        migrate_champion_layout(self, strategy_path)
 
     def cleanup_transient(
         self,
@@ -1583,44 +1129,7 @@ class ResearchWorkspace:
         print(f"[{scope}] {message}", flush=True)
 
     def _recover_promotion(self, state: dict[str, Any]) -> dict[str, Any]:
-        pending = state.get("pending_promotion")
-        if not isinstance(pending, dict):
-            return state
-        target_sha256 = str(pending["sha256"])
-        if (
-            self.champion_next_path.is_file()
-            and _file_sha256(self.champion_next_path) == target_sha256
-        ):
-            os.replace(self.champion_next_path, self.champion_path)
-        if self.champion_path.is_file() and _file_sha256(self.champion_path) == target_sha256:
-            state["champion_sha256"] = target_sha256
-            state["champion_number"] = int(pending["champion_number"])
-            if state.get("schema_version") == 4:
-                state["champion_metrics"] = pending["metrics"]
-            else:
-                metrics_record = pending.get("metrics_record")
-                if not isinstance(metrics_record, dict) and isinstance(pending.get("metrics"), dict):
-                    metrics_record = {
-                        "metrics": dict(pending["metrics"]),
-                        "status": "stale",
-                        "stale_reasons": ["legacy_missing_applicability"],
-                        "evaluated_in_round": str(pending["round_id"]),
-                        "evaluated_at": None,
-                        "applicability": None,
-                    }
-                state["champion_metrics_record"] = metrics_record
-            state["champion_round_id"] = str(pending["round_id"])
-            state["last_round_id"] = str(pending["round_id"])
-            state["project_revision"] = str(pending["project_revision"])
-            state["champion_fixed_test_record"] = None
-            state["champion_guard_evidence_sha256"] = pending.get(
-                "guard_evidence_sha256"
-            )
-        self.champion_next_path.unlink(missing_ok=True)
-        state["pending_promotion"] = None
-        state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        write_json_atomic(self.state_path, state)
-        return state
+        return recover_promotion(self, state)
 
     def _prepare_runtime(
         self,
@@ -2044,44 +1553,18 @@ class ResearchWorkspace:
         *,
         guard_evidence_sha256: str | None = None,
     ) -> str:
-        strategy_path = str(state["strategy_path"])
-        if list(editable) != [strategy_path]:
-            raise ValueError("editable strategy path does not match champion.json")
-        candidate_strategy = candidate / strategy_path
-        if not candidate_strategy.is_file():
-            raise FileNotFoundError(f"Candidate strategy does not exist: {candidate_strategy}")
-        self.champion_next_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(candidate_strategy, self.champion_next_path)
-        sha256 = _file_sha256(self.champion_next_path)
-        number = int(state["champion_number"]) + 1
-        applicability = self.metrics_applicability(
+        return promote_candidate(
+            self,
+            candidate,
             state,
+            round_id,
+            metrics,
+            editable,
             metrics_key,
             evaluator_contract_paths,
-            champion_sha256=sha256,
-            evaluator_contract_sha256=evaluator_contract_sha256,
+            evaluator_contract_sha256,
+            guard_evidence_sha256=guard_evidence_sha256,
         )
-        metrics_record = self.metrics_record(metrics, applicability, round_id)
-        state["pending_promotion"] = {
-            "round_id": round_id,
-            "sha256": sha256,
-            "champion_number": number,
-            "metrics_record": metrics_record,
-            "project_revision": _git(self.source, "rev-parse", "HEAD"),
-            "guard_evidence_sha256": guard_evidence_sha256,
-        }
-        write_json_atomic(self.state_path, state)
-        os.replace(self.champion_next_path, self.champion_path)
-        state["champion_sha256"] = sha256
-        state["champion_number"] = number
-        state["champion_round_id"] = round_id
-        state["champion_fixed_test_record"] = None
-        state["champion_guard_evidence_sha256"] = guard_evidence_sha256
-        state["project_revision"] = state["pending_promotion"]["project_revision"]
-        state["pending_promotion"] = None
-        self.record_state(state, round_id, metrics_record)
-        self._remove_worktree(candidate)
-        return sha256
 
     def reject(self, candidate: Path, state: dict[str, Any], round_id: str) -> None:
         self.record_state(state, round_id)

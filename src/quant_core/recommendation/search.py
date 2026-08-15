@@ -15,7 +15,7 @@ from quant_core.recommendation.models import (
     SearchResult,
 )
 from quant_core.research.evaluator import evaluate_candidate
-from quant_core.research.workspace import write_json_atomic
+from quant_core.research.storage import write_json_atomic
 from quant_core.schedule import schedule_bucket
 
 def _passes_constraints(
