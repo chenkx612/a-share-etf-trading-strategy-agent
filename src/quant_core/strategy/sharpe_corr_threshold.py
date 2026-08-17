@@ -42,6 +42,12 @@ class SharpeCorrThresholdParams:
     # 0.0 disables (Parent raw mean_corr). Shrinks extreme pair-corr estimates without
     # changing corr_window, corr_lambda, rank factor, or hold inertia.
     corr_pen_median_mix: float = 0.0
+    # Missing-pair corr prior for soft-corr: when a pair lacks min_pair_observations
+    # (NaN corr), treat the pair as missing_corr_prior instead of 0 penalty.
+    # missing_corr_prior_mix in [0,1] scales a causal CS median pairwise prior:
+    # fill = missing_corr_prior_mix * median_pair_corr_among_eligible (0 => Parent zero-pen).
+    # Keeps min_pair=40, median mix on observed pens, rank, and hold inertia unchanged.
+    missing_corr_prior_mix: float = 0.0
 
     def __post_init__(self) -> None:
         if isinstance(self.top_n, bool) or not isinstance(self.top_n, int) or self.top_n <= 0:
@@ -88,6 +94,8 @@ class SharpeCorrThresholdParams:
             raise ValueError("min_pair_observations must be an integer >= 0")
         if not math.isfinite(self.corr_pen_median_mix) or not 0.0 <= self.corr_pen_median_mix <= 1.0:
             raise ValueError("corr_pen_median_mix must be in [0, 1]")
+        if not math.isfinite(self.missing_corr_prior_mix) or not 0.0 <= self.missing_corr_prior_mix <= 1.0:
+            raise ValueError("missing_corr_prior_mix must be in [0, 1]")
 
     @property
     def factor_name(self) -> str:
@@ -114,8 +122,8 @@ def select(
 
 def parameter_grid() -> list[dict[str, object]]:
     """Small, deterministic grid used by the research walk-forward harness."""
-    # Parent anchor: corr_pen_median_mix=0.0 with min_pair_observations=40.
-    # Compact 4-set grid: top_n x corr_pen_median_mix; fix reb/cooloff/min_pair.
+    # Parent anchor: missing_corr_prior_mix=0.0, corr_pen_median_mix=0.25, min_pair=40.
+    # Compact 4-set grid: top_n x missing_corr_prior_mix; fix median-mix/reb/cooloff.
     return [
         {
             "top_n": top_n,
@@ -131,10 +139,11 @@ def parameter_grid() -> list[dict[str, object]]:
             "vol_power": 1.5,
             "cooloff_days": 5,
             "min_pair_observations": 40,
-            "corr_pen_median_mix": corr_pen_median_mix,
+            "corr_pen_median_mix": 0.25,
+            "missing_corr_prior_mix": missing_corr_prior_mix,
         }
         for top_n in (3, 4)
-        for corr_pen_median_mix in (0.0, 0.25)
+        for missing_corr_prior_mix in (0.0, 1.0)
     ]
 
 
@@ -334,6 +343,7 @@ def select_sharpe_corr_threshold(
                     date,
                     names,
                     corr_pen_median_mix=float(params.corr_pen_median_mix),
+                    missing_corr_prior_mix=float(params.missing_corr_prior_mix),
                 )
             else:
                 held = _select_hard_corr(
@@ -439,6 +449,7 @@ def _select_soft_corr(
     date: pd.Timestamp,
     names: dict[str, str],
     corr_pen_median_mix: float = 0.0,
+    missing_corr_prior_mix: float = 0.0,
 ) -> list[str]:
     if candidates.empty:
         return []
@@ -450,12 +461,14 @@ def _select_soft_corr(
         z_scores = raw * 0.0
 
     mix = float(corr_pen_median_mix)
+    miss_mix = float(missing_corr_prior_mix)
     median_pair = 0.0
-    if mix > 0.0:
+    if mix > 0.0 or miss_mix > 0.0:
         median_pair = _eligible_median_pairwise_corr(
             [str(a) for a in raw.index.tolist()],
             curr_corr,
         )
+    missing_fill = miss_mix * median_pair
 
     selected: list[str] = []
     remaining = [str(a) for a in raw.sort_values(ascending=False).index.tolist()]
@@ -465,7 +478,9 @@ def _select_soft_corr(
         best_pen = 0.0
         best_raw_pen = 0.0
         for asset in remaining:
-            raw_pen = _mean_corr_to_selected(asset, selected, curr_corr)
+            raw_pen = _mean_corr_to_selected(
+                asset, selected, curr_corr, missing_fill=missing_fill
+            )
             if mix > 0.0:
                 pen = (1.0 - mix) * raw_pen + mix * median_pair
             else:
@@ -484,7 +499,9 @@ def _select_soft_corr(
                 continue
             if float(raw.loc[asset]) <= float(raw.loc[best_asset]):
                 continue
-            asset_raw_pen = _mean_corr_to_selected(asset, selected, curr_corr)
+            asset_raw_pen = _mean_corr_to_selected(
+                asset, selected, curr_corr, missing_fill=missing_fill
+            )
             asset_pen = (
                 (1.0 - mix) * asset_raw_pen + mix * median_pair
                 if mix > 0.0
@@ -502,6 +519,8 @@ def _select_soft_corr(
                 "mean_corr_to_selected": float(asset_raw_pen),
                 "corr_pen_used": float(asset_pen),
                 "corr_pen_median_mix": float(mix),
+                "missing_corr_prior_mix": float(miss_mix),
+                "missing_corr_fill": float(missing_fill),
                 "median_pair_corr": float(median_pair),
                 "selected_symbol": str(best_asset),
                 "selected_name": names.get(str(best_asset), str(best_asset)),
@@ -517,15 +536,19 @@ def _mean_corr_to_selected(
     asset: str,
     selected: list[str],
     corr: pd.DataFrame,
+    missing_fill: float = 0.0,
 ) -> float:
-    if not selected or corr.empty or asset not in corr.index:
+    if not selected:
         return 0.0
     values: list[float] = []
     for selected_asset in selected:
-        if selected_asset in corr.columns:
+        value = float("nan")
+        if not corr.empty and asset in corr.index and selected_asset in corr.columns:
             value = corr.loc[asset, selected_asset]
-            if pd.notna(value):
-                values.append(float(value))
+        if pd.notna(value):
+            values.append(float(value))
+        else:
+            values.append(float(missing_fill))
     if not values:
         return 0.0
     return float(sum(values) / len(values))
