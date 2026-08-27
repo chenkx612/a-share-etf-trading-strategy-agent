@@ -24,7 +24,8 @@ STANDARD_COLUMNS = [
 
 DEFAULT_ADJUST = "qfq"
 REFRESH_HISTORY_YEARS = 5
-REFRESH_START_BUFFER_DAYS = 14
+# Cover month-boundary alignment used by calendar-month walk-forward folds.
+REFRESH_START_BUFFER_DAYS = 31
 
 
 class PartialMarketDataRefreshError(RuntimeError):

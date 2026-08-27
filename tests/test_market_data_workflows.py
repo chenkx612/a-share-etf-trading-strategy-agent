@@ -9,6 +9,7 @@ import quant_core.data.market_data as market_data_module
 from quant_core.data.market_data import (
     PartialMarketDataRefreshError,
     fetch_daily_if_stale,
+    refresh_window_start,
     resolve_complete_universe_date,
 )
 
@@ -102,7 +103,7 @@ def test_fetch_daily_if_stale_refreshes_only_missing_symbols(
     fetched: list[str] = []
 
     def fetch_one(single: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-        assert start == date(2021, 5, 31)
+        assert start == date(2021, 5, 14)
         assert end == REQUEST_END
         fetched.extend(single["symbol"].astype(str))
         return pd.DataFrame([_daily("510300")])
@@ -118,6 +119,10 @@ def test_fetch_daily_if_stale_refreshes_only_missing_symbols(
     assert target == TEST_DATE
     assert fetched == ["510300"]
     assert incoming["symbol"].tolist() == ["510300"]
+
+
+def test_refresh_window_start_includes_one_month_buffer() -> None:
+    assert refresh_window_start(date(2026, 8, 27)) == date(2021, 7, 27)
 
 
 def test_fetch_daily_if_stale_preserves_partial_refresh_evidence(

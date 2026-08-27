@@ -1,24 +1,40 @@
 id = "active-etf-sharpe"
 goal = """
-在固定的 universes/active_etf_rotation.csv 候选池上继续研发并评估
-sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后验收益筛选的股票池。
+在固定的 universes/active_etf_rotation.csv 候选池上继续研发并评估每日重评、因果响应且
+换手受控的 sharpe-corr-threshold 纯多头 ETF 轮动策略，替代任何按全样本后验收益筛选的股票池。
 本任务使用独立 task id；不得继承旧 sector_rotation.csv 股票池下的 Champion、参数结论、
 Gate 指标或研究记忆。后续 Run 必须以 Harness 管理并同步到工作区的本任务当前 Champion
 作为 Parent，不得重置为任务创建前的工作区基线。
 
-当前 Parent 是 Run 005 / Round 004 晋级并同步到工作区的 Champion 组合体：滚动 Sharpe
-负责准入，Sharpe / rolling_vol^vol_power 负责排序，sticky 再平衡期间只响应止损退出，
+当前 Parent 是按截至 2026-08-27 的最新统一 Gate/Guard 诊断复评，从历史候选回滚的
+Run 004 / Round 008 Champion 组合体：滚动 Sharpe 负责准入，
+Sharpe / rolling_vol^vol_power 负责排序，多信号日 sticky 再平衡期间只响应止损退出，
 max_gross 按 top_n 槽位等权且空槽持有现金，soft-correlation 贪心选择负责分散，止损后的
-ETF 在 cooloff_days 内禁止重新进入；相关性使用真实成对观测并要求
-min_pair_observations，soft-correlation 惩罚还包含截面 median mix。当前 parameter_grid
-固定 sharpe_window=25、factor_lower_bound=0.25、corr_window=100、corr_lambda=4、
-vol_window=15、vol_power=1.5、max_gross=0.75、stop_loss_pct=0.10、rebalance_every=5、
-cooloff_days=5、min_pair_observations=40，并搜索 top_n={3,4}、
-corr_pen_median_mix={0,0.25}。历史接受补丁均被 facts 判为 combined_change；这些结构只能
-作为待继续改进的整体，不得把历史表现归因于 sticky、soft correlation、波动率缩放、
-观测感知相关、median mix、参数重配或 cooloff 中的任一单独机制。后续每轮只改变一个
+ETF 在 cooloff_days 内禁止重新进入。该版本的相关性沿用当时的缺失收益填零滚动估计，
+不包含后续候选引入的 min_pair_observations、corr_pen_median_mix 或
+missing_corr_prior_mix。当前 parameter_grid 固定 sharpe_window=25、
+factor_lower_bound=0.25、corr_window=100、corr_lambda=4、vol_window=15、
+vol_power=1.5、max_gross=0.75、stop_loss_pct=0.10，并搜索 top_n={3,4}、
+rebalance_every={5,10}、cooloff_days={5,10}。历史接受补丁均被 facts 判为
+combined_change；这些结构只能作为待继续改进的整体，不得把历史表现归因于 sticky、
+soft correlation、波动率缩放、参数重配或 cooloff 中的任一单独机制。后续每轮只改变一个
 可证伪的主要机制，保持其余 Parent 逻辑不变，并用最小补丁和小型、确定的参数网格建立
-清晰对照；候选网格必须保留至少一个精确 Parent 锚点，避免把移除当前可行配置误当作新机制效果。
+清晰对照。Development 对照必须保留精确 Parent 参数集，避免把移除当前可行配置误当作新机制
+效果；但确认日频机制可行后，拟提交晋级的最终 parameter_grid 必须只包含每日决策配置，避免
+Walk-Forward 在部分月份重新选回 rebalance_every={5,10} 而名义上宣称已经日频化。
+
+本阶段的明确产品目标是把迟钝的多日 Parent 改造成真正灵活的每日决策策略。这里的“灵活”不是
+仅把数据频率、输出行频率或参数名称称为日频，而是每个有效交易日都必须使用当日收盘前可得信息
+重新计算完整的准入集合、排序、相关分散和目标持仓，并由固定回测器在 t+1 执行。拟晋级策略必须
+采用 rebalance_every=1 或语义等价的每日状态机，不得依靠固定 5/10 日时钟跳过决策。
+
+灵活性的最低验收标准是：所有有效信号日的 decision_evaluation_coverage=100%；准入失败、止损和
+预先声明的重大目标变化不得因日历锁定延迟，首次可执行动作延迟不得超过 1 个信号日至下一开盘；
+允许重新评估后保持原仓，也允许用因果的入场/退出分带、分数优势阈值或部分更新抑制边际抖动，
+但每次“不交易”都必须能由当日状态和预声明规则解释，而不是 days_since_rebalance 尚未到期。
+候选必须报告相对 Parent 的 stale_holding_days、decision_delay_days 分布、当日目标变化覆盖率、
+实际改变持仓日比例、进入/退出触发次数、平均总暴露和换手增量。响应更快只是产品资格，不替代
+Sharpe 晋级条件；不得放宽 avg_turnover、annual_return、max_drawdown、Gate 或 Guard。
 
 Run 005 及更早记录使用 Sortino 作为参数选择和晋级目标，当前任务契约已经切换为 Sharpe。
 旧 Run 的精确 Gate 指标只属于不可变历史，不是现行 Sharpe 契约下可直接比较的 Parent 基准；
@@ -27,33 +43,31 @@ Run 005 及更早记录使用 Sortino 作为参数选择和晋级目标，当前
 放宽硬约束或原样重跑已拒候选。后续研发判断以新 Run 暴露的 Development 证据及 Harness
 持有的现行 Parent 比较为准。
 
-下一阶段优先改善 Development walk-forward 的跨折稳健性和训练窗参数可行性。Run 005 的
-Champion 有 8 个 Development 训练折找不到满足硬约束的参数；官方诊断显示这些折全部受
-annual_return 约束影响，其中多折同时受 max_drawdown 约束影响，avg_turnover 从未成为瓶颈。
-该诊断来自旧冻结区间；新 Run 先在当前相对区间和 Sharpe 契约下复核失败折、约束余量与 Parent
-参数选择，再提出作用路径直接对应的候选。减少 no_feasible_parameter_folds 是诊断目标，不是
-绕过晋级条件的替代指标；候选仍须先满足硬约束，并在 Development 中显示相对 Parent 的可解释
-Sharpe 改善，才值得提交 Gate。除聚合指标外，提交前还要检查改善是否分布在多个验证折、参数
-是否集中于单个边界点、相邻参数是否方向一致，以及新增机制实际改变了多少持仓日、触发事件、
-总暴露和换手；不得只凭全区间回测、最佳参数点或少数可行折送 Gate。
+下一阶段优先验证每日重新评估能否在行情转折时更快改变持仓，同时维持 Development
+walk-forward 的跨折稳健性和训练窗参数可行性。新 Run 先在当前相对区间和 Sharpe 契约下量化
+Parent 的多日锁定造成的响应延迟：逐日记录完整日频目标与实际 Parent 持仓的首次分叉、延迟天数、
+期间机会收益、回撤和换手；这些 Development 诊断不得读取或推断 Gate。首个候选只改变决策频率，
+不得同时改 Sharpe 公式、相关性估计、权重、止损、cooloff 或总暴露。先用包含精确 Parent 参数集的
+开发网格建立因果对照；若纯日频基线可行，再将最终提交网格收敛为 rebalance_every=1 的小型配置。
+若机械日频带来不必要换手，后续轮次才可基于触发日志逐轮研究一个因果的换仓确认机制，但仍须每日
+生成完整目标，不得重新引入多日静默锁定。候选仍须先满足硬约束，并在 Development 中显示相对
+Parent 的可解释 Sharpe 改善，才值得提交 Gate。除聚合指标外，提交前还要检查改善是否分布在多个
+验证折、日频配置是否在训练折中稳定可行、参数是否集中于单个边界点、相邻参数是否方向一致；
+不得只凭全区间回测、最佳参数点、响应速度本身或少数可行折送 Gate。
 
 优先研究以下互斥 idea，每轮最多选择一个，不要求按顺序全部实现：
 
-1. Sharpe 信号本身的估计稳健性。可仅稳健化滚动 Sharpe 的收益率分子，例如因果均值收缩、
-   预先声明的 EWMA 或短长窗一致性惩罚，同时保持 15 日波动率分母、准入阈值、相关分散、
-   槽位权重和退出状态机不变。必须量化排序变化与跨折效果，并区别于已拒绝的 rank persistence、
-   downside z 惩罚、单纯改变 sharpe_window 或波动率分母。
-2. 准入置信度。可仅把固定 Sharpe>0.25 准入改为使用截至信号日样本量和估计误差的确定性
-   下置信界，或加入一个因果的双窗口一致性条件；排序和持仓逻辑保持 Parent 不变。候选须事先
-   说明它如何同时处理低收益和回撤绑定，而不是简单增加空仓，并保留精确 Parent 锚点。
-3. 相关性缺样本的不确定性处理。当前观测感知路径对不足 min_pair_observations 的 pair 给出
-   缺失相关，并在 soft-correlation 选择中等效为零惩罚。可仅研究一个因果、确定的保守先验或
-   向截面相关水平收缩的缺样本处理；保持 min_pair=40、median mix、corr_window、corr_lambda、
-   rank factor 和持仓惯性不变，并重点量化新上市 ETF 的资格、惩罚和最终持仓变化。
-4. 只有在新 Run 诊断仍明确显示 annual_return 与 max_drawdown 同时绑定时，才考虑一个连续、
-   有上下界且完全因果的横截面 breadth 暴露刻度；不得使用二元 risk-off、未来市场状态或单独
-   扩大 max_gross。该方向必须只改变总暴露，不得同时改排名、相关选择和退出逻辑，并证明不是
-   通过普遍增持或普遍持现来机械移动单一约束。
+1. 纯日频再评估基线。只把 Parent 的 rebalance_every={5,10} 改为 1，保持其余 Parent 参数、信号、
+   排序、相关分散、权重、止损和 cooloff 状态机不变。开发对照网格包含精确 Parent 与日频镜像；
+   拟提交版本只保留日频配置。必须量化提前换仓事件、响应延迟、换手增量和跨折 Sharpe。
+2. 日频入场/退出分带。仅在每日完整重评之后，为在持仓和候选使用不同但预声明的分数边界；
+   准入失败与止损仍即时退出。分带必须基于当日因果分数，不能退化为固定持有天数。
+3. 日频换仓优势阈值。仅当新候选相对被替换持仓达到小型、确定的分数优势才换仓；必须记录每天
+   被阈值拦截的目标变化及后续结果，用以证明它过滤边际抖动而非掩盖响应迟钝。
+4. 日频部分更新。每日生成完整目标组合，但每个交易日最多替换确定数量的最低质量持仓；准入失败
+   和止损不受数量限制。须比较完整日频与部分更新的决策延迟、遗漏机会、回撤和换手。
+5. 日频转折确认。只有纯日频基线证明存在大量单日反转噪声时，才研究一个截至 t 日连续更新的
+   确认分数或连续两日条件；确认后必须立即行动，不得使用未来收益或重新引入日历锁定。
 
 既往已拒绝、放弃或未形成有效证据的路径包括：逆波动率持仓权重、max_new_names 换手帽、
 downside z 惩罚、名称级 trailing drawdown、max_hold_days、rank persistence、较短
